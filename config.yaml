@@ -1,0 +1,4 @@
+log_level: ${LOG_LEVEL:-INFO}
+input_path: ${INPUT_PATH:-input}
+output_dir: ${OUTPUT_DIR:-output}
+log_dir: ${LOG_DIR:-log}

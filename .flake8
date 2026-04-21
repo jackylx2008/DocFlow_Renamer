@@ -1,0 +1,17 @@
+[flake8]
+# 设置最大行长度
+max-line-length = 120
+
+# 忽略以下检查:
+# E501 - 行长度检查
+# B001 - 不要使用裸露的 except:
+# B008 - 不要在函数调用中执行函数调用
+# BLE001 - 不要捕获通用异常 Exception
+# W503 - 二元运算符前换行（与 W504 冲突）
+# W504 - 二元运算符后换行（与 W503 冲突）
+ignore = BLE001,W503,W504,E203
+
+# 或者使用 per-file-ignores 针对特定文件忽略
+# per-file-ignores =
+#     dxf_extractor.py:BLE001
+#     dwg_extractor.py:BLE001
