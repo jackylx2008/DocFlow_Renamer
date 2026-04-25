@@ -31,6 +31,7 @@ SINGLE_DATE_RE = re.compile(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日")
 INVALID_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]+')
 WHITESPACE_RE = re.compile(r"\s+")
 WORK_TYPES = ["动火作业", "有限空间作业", "5米以上高处作业", "危大工程", "配电室接电"]
+JPG_SUFFIXES = {".jpg", ".jpeg"}
 
 
 @dataclass
@@ -54,6 +55,7 @@ class Record:
     新文件名: str
     文件路径: str
     申请单文件链接: str
+    申请单附图链接: str
     附件目录: str
     附件目录链接: str
     处理状态: str
@@ -105,7 +107,7 @@ def sanitize_filename_part(value: str) -> str:
 
 
 def read_first_form_text(docx_path: Path) -> str:
-    document = Document(docx_path)
+    document = Document(str(docx_path))
     if not document.tables:
         raise ValueError("Word 文档中未找到表格")
     table = document.tables[0]
@@ -250,6 +252,39 @@ def detect_attachment_dir(docx_path: Path) -> Path | None:
     return None
 
 
+def collect_jpg_files(directory: Path | None) -> tuple[Path, ...]:
+    if not directory or not directory.is_dir():
+        return ()
+    return tuple(
+        sorted(
+            (
+                path
+                for path in directory.iterdir()
+                if path.is_file() and path.suffix.lower() in JPG_SUFFIXES
+            ),
+            key=lambda path: path.name.lower(),
+        )
+    )
+
+
+def detect_application_image(
+    current_docx_path: Path,
+    original_docx_path: Path,
+    attachment_dir: Path | None,
+) -> Path | None:
+    candidates: list[Path] = []
+    for docx_path in (current_docx_path, original_docx_path):
+        for suffix in JPG_SUFFIXES:
+            candidates.append(docx_path.with_suffix(suffix))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    jpg_files = collect_jpg_files(attachment_dir)
+    return jpg_files[0] if jpg_files else None
+
+
 def build_target_name(start_date: str, work_content: str) -> str:
     if not start_date or not work_content:
         raise ValueError("缺少施工开始时间或施工内容，无法生成新文件名")
@@ -290,9 +325,11 @@ def parse_document(docx_path: Path) -> dict[str, Any]:
     }
 
 
-def export_excel(records: list[Record], output_path: Path) -> None:
+def export_excel(records: list[Record], output_path: Path) -> Path:
     workbook = Workbook()
     summary_sheet = workbook.active
+    if summary_sheet is None:
+        raise RuntimeError("Excel 工作簿未创建默认工作表")
     summary_sheet.title = "汇总"
 
     headers = [
@@ -312,6 +349,7 @@ def export_excel(records: list[Record], output_path: Path) -> None:
         "影响、堵塞应急疏散通道",
         "危险作业",
         "申请单文件",
+        "申请单附图",
         "附件目录",
         "原文件名",
         "新文件名",
@@ -339,6 +377,7 @@ def export_excel(records: list[Record], output_path: Path) -> None:
                 record.影响堵塞应急疏散通道,
                 record.危险作业,
                 "打开文件" if record.申请单文件链接 else "",
+                Path(record.申请单附图链接).name if record.申请单附图链接 else "",
                 "打开目录" if record.附件目录链接 else "",
                 record.原文件名,
                 record.新文件名,
@@ -356,26 +395,37 @@ def export_excel(records: list[Record], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         workbook.save(output_path)
+        return output_path
     except PermissionError:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         fallback_path = output_path.with_name(
             f"{output_path.stem}_{timestamp}{output_path.suffix}"
         )
         workbook.save(fallback_path)
+        return fallback_path
 
 
 def apply_summary_styles(summary_sheet: Any) -> None:
     thin_black = Side(style="thin", color="000000")
-    border = Border(top=thin_black, bottom=thin_black, left=thin_black, right=thin_black)
+    border = Border(
+        top=thin_black,
+        bottom=thin_black,
+        left=thin_black,
+        right=thin_black,
+    )
     header_fill = PatternFill(fill_type="solid", fgColor="5B6F84")
     band_fill = PatternFill(fill_type="solid", fgColor="D9E5F3")
     plain_fill = PatternFill(fill_type=None)
     header_font = Font(bold=True, color="FFFFFF")
     hyperlink_font = Font(color="0563C1", underline="single")
-    centered = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    centered = Alignment(
+        horizontal="center",
+        vertical="center",
+        wrap_text=True,
+    )
     wrapped = Alignment(vertical="center", wrap_text=True)
 
-    column_widths = {
+    base_column_widths = {
         1: 16,
         2: 16,
         3: 16,
@@ -392,17 +442,26 @@ def apply_summary_styles(summary_sheet: Any) -> None:
         14: 18,
         15: 24,
         16: 12,
-        17: 12,
-        18: 28,
-        19: 32,
-        20: 40,
-        21: 12,
+        17: 20,
     }
-    for col_idx, width in column_widths.items():
+    header_widths = {
+        "附件目录": 12,
+        "原文件名": 28,
+        "新文件名": 32,
+        "文件路径": 40,
+        "处理状态": 12,
+    }
+    for col_idx, width in base_column_widths.items():
+        summary_sheet.column_dimensions[get_column_letter(col_idx)].width = width
+    for col_idx in range(17, summary_sheet.max_column + 1):
+        header = summary_sheet.cell(row=1, column=col_idx).value
+        width = base_column_widths.get(col_idx) or header_widths.get(header, 12)
         summary_sheet.column_dimensions[get_column_letter(col_idx)].width = width
 
     summary_sheet.freeze_panes = "A2"
-    summary_sheet.auto_filter.ref = f"A1:{get_column_letter(summary_sheet.max_column)}{summary_sheet.max_row}"
+    summary_sheet.auto_filter.ref = (
+        f"A1:{get_column_letter(summary_sheet.max_column)}{summary_sheet.max_row}"
+    )
     summary_sheet.sheet_view.showGridLines = False
     summary_sheet.row_dimensions[1].height = 24
 
@@ -414,10 +473,10 @@ def apply_summary_styles(summary_sheet: Any) -> None:
 
     for row_idx, row in enumerate(
         summary_sheet.iter_rows(
-        min_row=2,
-        max_row=summary_sheet.max_row,
-        min_col=1,
-        max_col=summary_sheet.max_column,
+            min_row=2,
+            max_row=summary_sheet.max_row,
+            min_col=1,
+            max_col=summary_sheet.max_column,
         ),
         start=2,
     ):
@@ -428,8 +487,10 @@ def apply_summary_styles(summary_sheet: Any) -> None:
             cell.alignment = wrapped
             cell.border = border
             cell.fill = fill
-        row[15].font = hyperlink_font
-        row[16].font = hyperlink_font
+        for cell in row:
+            header = summary_sheet.cell(row=1, column=cell.column).value
+            if header in {"申请单文件", "申请单附图", "附件目录"}:
+                cell.font = hyperlink_font
 
     for row_idx in range(2, summary_sheet.max_row + 1):
         summary_sheet[f"G{row_idx}"].number_format = "yyyy-mm-dd"
@@ -439,11 +500,26 @@ def apply_summary_styles(summary_sheet: Any) -> None:
 
 
 def fill_summary_hyperlinks(summary_sheet: Any, records: list[Record]) -> None:
+    header_columns = {
+        summary_sheet.cell(row=1, column=col_idx).value: col_idx
+        for col_idx in range(1, summary_sheet.max_column + 1)
+    }
+    docx_col = header_columns.get("申请单文件")
+    image_col = header_columns.get("申请单附图")
+    attachment_col = header_columns.get("附件目录")
     for row_idx, record in enumerate(records, start=2):
-        if record.申请单文件链接:
-            summary_sheet[f"P{row_idx}"].hyperlink = record.申请单文件链接
-        if record.附件目录链接:
-            summary_sheet[f"Q{row_idx}"].hyperlink = record.附件目录链接
+        if record.申请单文件链接 and docx_col:
+            summary_sheet.cell(row=row_idx, column=docx_col).hyperlink = (
+                record.申请单文件链接
+            )
+        if record.申请单附图链接 and image_col:
+            summary_sheet.cell(row=row_idx, column=image_col).hyperlink = (
+                record.申请单附图链接
+            )
+        if record.附件目录链接 and attachment_col:
+            summary_sheet.cell(row=row_idx, column=attachment_col).hyperlink = (
+                record.附件目录链接
+            )
 
 
 def build_note_sheet(
@@ -455,15 +531,16 @@ def build_note_sheet(
         ["文档总数", len(records)],
         ["重命名数量", sum(1 for record in records if record.处理状态 == "已重命名")],
         ["汇总文件", workbook_name],
-        ["说明", "申请单文件和附件目录列可直接点击打开本地文件或目录。"],
+        ["说明", "申请单文件、申请单附图和附件目录列可直接点击打开本地文件或目录。"],
     ]
     for row in rows:
         note_sheet.append(row)
 
     thin_black = Side(style="thin", color="000000")
-    border = Border(top=thin_black, bottom=thin_black, left=thin_black, right=thin_black)
+    border = Border(
+        top=thin_black, bottom=thin_black, left=thin_black, right=thin_black
+    )
     header_fill = PatternFill(fill_type="solid", fgColor="5B6F84")
-    header_font = Font(bold=True, color="000000")
     wrapped = Alignment(vertical="center", wrap_text=True)
 
     note_sheet.column_dimensions["A"].width = 18
@@ -506,7 +583,12 @@ def process_documents(input_dir: Path) -> list[Record]:
                 current_path = target_path
                 status = "已重命名"
 
-        attachment_dir = detect_attachment_dir(current_path)
+        attachment_dir = detect_attachment_dir(current_path) or detect_attachment_dir(
+            docx_path
+        )
+        application_image = detect_application_image(
+            current_path, docx_path, attachment_dir
+        )
         records.append(
             Record(
                 项目名称=parsed["项目名称"],
@@ -528,6 +610,7 @@ def process_documents(input_dir: Path) -> list[Record]:
                 新文件名=current_path.name,
                 文件路径=str(current_path),
                 申请单文件链接=str(current_path),
+                申请单附图链接=str(application_image) if application_image else "",
                 附件目录=str(attachment_dir) if attachment_dir else "",
                 附件目录链接=str(attachment_dir) if attachment_dir else "",
                 处理状态=status,
@@ -570,13 +653,13 @@ def main() -> int:
 
     records = process_documents(input_dir)
     output_path = input_dir / "质保作业申请汇总.xlsx"
-    export_excel(records, output_path)
+    saved_path = export_excel(records, output_path)
 
     summary = {
         "input_dir": str(input_dir),
         "total_docs": len(records),
         "renamed_docs": sum(1 for record in records if record.处理状态 == "已重命名"),
-        "excel_path": str(output_path),
+        "excel_path": str(saved_path),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
