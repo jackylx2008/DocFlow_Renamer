@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from dataclasses import dataclass
@@ -11,9 +12,11 @@ from typing import Any
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
+import fitz
+import numpy as np
 import yaml
 from docx import Document
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -25,13 +28,23 @@ TARGET_NAME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}_.+_质保作业申请单\.docx$", re.IGNORECASE
 )
 DATE_RANGE_RE = re.compile(
-    r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日\s*[~～\-至到]+\s*(?:(\d{4})年\s*)?(\d{1,2})月\s*(\d{1,2})日"
+    r"(\d{4})\s*(?:年|[./．])\s*(\d{1,2})\s*(?:月|[./．])\s*(\d{1,2})\s*(?:日)?"
+    r"\s*[~～\-—–－至到]+\s*"
+    r"(?:(\d{4})\s*(?:年|[./．])\s*)?(\d{1,2})\s*(?:月|[./．])\s*(\d{1,2})\s*(?:日)?"
 )
-SINGLE_DATE_RE = re.compile(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日")
+SINGLE_DATE_RE = re.compile(
+    r"(\d{4})\s*(?:年|[./．])\s*(\d{1,2})\s*(?:月|[./．])\s*(\d{1,2})\s*(?:日)?"
+)
 INVALID_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]+')
 WHITESPACE_RE = re.compile(r"\s+")
 WORK_TYPES = ["动火作业", "有限空间作业", "5米以上高处作业", "危大工程", "配电室接电"]
 JPG_SUFFIXES = {".jpg", ".jpeg"}
+PDF_SUFFIX = ".pdf"
+MIN_PLAIN_PDF_CJK_CHARS = 10
+OCR_PAGE_LIMIT = 2
+PDF_MATCH_SEPARATOR = "；"
+SUMMARY_EXCEL_NAME = "质保作业申请汇总.xlsx"
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -58,6 +71,8 @@ class Record:
     申请单附图链接: str
     附件目录: str
     附件目录链接: str
+    匹配PDF文件名: str
+    匹配PDF文件链接: str
     处理状态: str
 
 
@@ -98,6 +113,37 @@ def resolve_setting(
 
 def normalize_whitespace(value: str) -> str:
     return WHITESPACE_RE.sub(" ", value or "").strip()
+
+
+def normalize_match_text(value: str) -> str:
+    normalized = WHITESPACE_RE.sub("", value or "").strip().lower()
+    return (
+        normalized.replace("～", "~")
+        .replace("—", "~")
+        .replace("–", "~")
+        .replace("－", "~")
+        .replace("-", "~")
+        .replace("（", "(")
+        .replace("）", ")")
+        .replace("，", ",")
+        .replace("、", ",")
+    )
+
+
+def count_cjk_chars(value: str) -> int:
+    return len(re.findall(r"[\u4e00-\u9fff]", value or ""))
+
+
+def split_name_list(value: str) -> list[str]:
+    return [
+        item.strip()
+        for item in re.split(r"[,，；;]", value or "")
+        if item and item.strip()
+    ]
+
+
+def split_pdf_names(value: str) -> list[str]:
+    return split_name_list(value)
 
 
 def sanitize_filename_part(value: str) -> str:
@@ -267,6 +313,165 @@ def collect_jpg_files(directory: Path | None) -> tuple[Path, ...]:
     )
 
 
+def collect_pdf_files(
+    input_dir: Path, skipped_pdf_names: set[str] | None = None
+) -> list[Path]:
+    skipped_pdf_names = skipped_pdf_names or set()
+    return sorted(
+        (
+            path
+            for path in input_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() == PDF_SUFFIX
+            and path.name not in skipped_pdf_names
+        ),
+        key=lambda path: str(path).lower(),
+    )
+
+
+def build_pdf_path_index(
+    input_dir: Path, skipped_pdf_names: set[str] | None = None
+) -> dict[str, Path]:
+    return {
+        pdf_path.name: pdf_path
+        for pdf_path in collect_pdf_files(input_dir, skipped_pdf_names)
+    }
+
+
+def read_pdf_plain_text(pdf_path: Path) -> str:
+    document = fitz.open(pdf_path)
+    page_texts: list[str] = []
+    try:
+        for page in document:
+            page_texts.append(page.get_text() or "")
+    finally:
+        document.close()
+    return "\n".join(page_texts)
+
+
+def create_ocr_engine() -> Any:
+    from rapidocr_onnxruntime import RapidOCR
+
+    return RapidOCR()
+
+
+def read_pdf_ocr_text(pdf_path: Path, ocr_engine: Any) -> str:
+    document = fitz.open(pdf_path)
+    page_texts: list[str] = []
+    try:
+        page_count = min(len(document), OCR_PAGE_LIMIT)
+        for page_index in range(page_count):
+            page = document[page_index]
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+                pixmap.height,
+                pixmap.width,
+                pixmap.n,
+            )
+            result, _ = ocr_engine(image)
+            page_texts.extend(item[1] for item in result or [])
+    finally:
+        document.close()
+    return "\n".join(page_texts)
+
+
+def read_pdf_text(pdf_path: Path, ocr_engine: Any | None) -> str:
+    plain_text = read_pdf_plain_text(pdf_path)
+    if count_cjk_chars(plain_text) >= MIN_PLAIN_PDF_CJK_CHARS:
+        return normalize_match_text(plain_text)
+    if ocr_engine is None:
+        return normalize_match_text(plain_text)
+    return normalize_match_text(read_pdf_ocr_text(pdf_path, ocr_engine))
+
+
+def build_pdf_text_index(
+    input_dir: Path,
+    excluded_pdf_names: set[str] | None = None,
+    skipped_pdf_names: set[str] | None = None,
+) -> dict[Path, str]:
+    pdf_texts: dict[Path, str] = {}
+    ocr_engine: Any | None = None
+    excluded_pdf_names = excluded_pdf_names or set()
+    skipped_pdf_names = skipped_pdf_names or set()
+    pdf_files = [
+        pdf_path
+        for pdf_path in collect_pdf_files(input_dir, skipped_pdf_names)
+        if pdf_path.name not in excluded_pdf_names
+    ]
+    if skipped_pdf_names:
+        LOGGER.info("跳过 %s 个 env 配置排除的 PDF", len(skipped_pdf_names))
+    if excluded_pdf_names:
+        LOGGER.info("跳过 %s 个已有匹配结果的 PDF", len(excluded_pdf_names))
+    LOGGER.info("发现 %s 个 PDF，开始建立匹配索引", len(pdf_files))
+    for index, pdf_path in enumerate(pdf_files, start=1):
+        LOGGER.info("读取 PDF %s/%s: %s", index, len(pdf_files), pdf_path.name)
+        try:
+            plain_text = read_pdf_plain_text(pdf_path)
+            if count_cjk_chars(plain_text) >= MIN_PLAIN_PDF_CJK_CHARS:
+                pdf_texts[pdf_path] = normalize_match_text(plain_text)
+                LOGGER.info("PDF 文本提取完成: %s", pdf_path.name)
+                continue
+
+            if ocr_engine is None:
+                LOGGER.info("普通文本不可用，初始化 OCR 引擎")
+                ocr_engine = create_ocr_engine()
+            LOGGER.info("开始 OCR 识别: %s", pdf_path.name)
+            pdf_texts[pdf_path] = normalize_match_text(
+                read_pdf_ocr_text(pdf_path, ocr_engine)
+            )
+            LOGGER.info("OCR 识别完成: %s", pdf_path.name)
+        except Exception as exc:
+            pdf_texts[pdf_path] = ""
+            LOGGER.warning("PDF 读取失败，已跳过: %s (%s)", pdf_path, exc)
+    return pdf_texts
+
+
+def find_matching_pdf_paths(
+    construction_area: str,
+    work_content: str,
+    pdf_texts: dict[Path, str],
+    construction_start_date: str = "",
+) -> list[Path]:
+    area_key = normalize_match_text(construction_area)
+    content_key = normalize_match_text(work_content)
+    if not area_key or not content_key:
+        return []
+
+    content_keys = [content_key]
+    if content_key.startswith(area_key):
+        short_content_key = content_key[len(area_key) :]
+        if short_content_key:
+            content_keys.append(short_content_key)
+
+    matched_paths = [
+        pdf_path
+        for pdf_path, pdf_text in pdf_texts.items()
+        if area_key in pdf_text and any(key in pdf_text for key in content_keys)
+    ]
+    date_key = normalize_match_text(construction_start_date)
+    if len(matched_paths) > 1 and date_key:
+        date_matched_paths = [
+            pdf_path for pdf_path in matched_paths if date_key in pdf_texts[pdf_path]
+        ]
+        if date_matched_paths:
+            return date_matched_paths
+    return matched_paths
+
+
+def find_matching_pdf_names(
+    construction_area: str,
+    work_content: str,
+    pdf_texts: dict[Path, str],
+    construction_start_date: str = "",
+) -> str:
+    matched_names = [
+        pdf_path.name
+        for pdf_path in find_matching_pdf_paths(
+            construction_area, work_content, pdf_texts, construction_start_date
+        )
+    ]
+    return "；".join(matched_names)
+
+
 def detect_application_image(
     current_docx_path: Path,
     original_docx_path: Path,
@@ -351,6 +556,7 @@ def export_excel(records: list[Record], output_path: Path) -> Path:
         "申请单文件",
         "申请单附图",
         "附件目录",
+        "匹配PDF文件名",
         "原文件名",
         "新文件名",
         "文件路径",
@@ -379,6 +585,7 @@ def export_excel(records: list[Record], output_path: Path) -> Path:
                 "打开文件" if record.申请单文件链接 else "",
                 Path(record.申请单附图链接).name if record.申请单附图链接 else "",
                 "打开目录" if record.附件目录链接 else "",
+                record.匹配PDF文件名,
                 record.原文件名,
                 record.新文件名,
                 record.文件路径,
@@ -446,6 +653,7 @@ def apply_summary_styles(summary_sheet: Any) -> None:
     }
     header_widths = {
         "附件目录": 12,
+        "匹配PDF文件名": 32,
         "原文件名": 28,
         "新文件名": 32,
         "文件路径": 40,
@@ -489,7 +697,12 @@ def apply_summary_styles(summary_sheet: Any) -> None:
             cell.fill = fill
         for cell in row:
             header = summary_sheet.cell(row=1, column=cell.column).value
-            if header in {"申请单文件", "申请单附图", "附件目录"}:
+            if header in {
+                "申请单文件",
+                "申请单附图",
+                "附件目录",
+                "匹配PDF文件名",
+            }:
                 cell.font = hyperlink_font
 
     for row_idx in range(2, summary_sheet.max_row + 1):
@@ -507,6 +720,7 @@ def fill_summary_hyperlinks(summary_sheet: Any, records: list[Record]) -> None:
     docx_col = header_columns.get("申请单文件")
     image_col = header_columns.get("申请单附图")
     attachment_col = header_columns.get("附件目录")
+    pdf_col = header_columns.get("匹配PDF文件名")
     for row_idx, record in enumerate(records, start=2):
         if record.申请单文件链接 and docx_col:
             summary_sheet.cell(row=row_idx, column=docx_col).hyperlink = (
@@ -520,6 +734,10 @@ def fill_summary_hyperlinks(summary_sheet: Any, records: list[Record]) -> None:
             summary_sheet.cell(row=row_idx, column=attachment_col).hyperlink = (
                 record.附件目录链接
             )
+        if record.匹配PDF文件链接 and pdf_col:
+            summary_sheet.cell(row=row_idx, column=pdf_col).hyperlink = (
+                record.匹配PDF文件链接
+            )
 
 
 def build_note_sheet(
@@ -531,7 +749,10 @@ def build_note_sheet(
         ["文档总数", len(records)],
         ["重命名数量", sum(1 for record in records if record.处理状态 == "已重命名")],
         ["汇总文件", workbook_name],
-        ["说明", "申请单文件、申请单附图和附件目录列可直接点击打开本地文件或目录。"],
+        [
+            "说明",
+            "申请单文件、申请单附图和附件目录列可直接点击打开本地文件或目录；匹配PDF文件名列按施工区域和施工内容匹配。",
+        ],
     ]
     for row in rows:
         note_sheet.append(row)
@@ -564,10 +785,83 @@ def collect_docx_files(input_dir: Path) -> list[Path]:
     return sorted(path for path in input_dir.glob("*.docx") if path.is_file())
 
 
-def process_documents(input_dir: Path) -> list[Record]:
-    records: list[Record] = []
+def pdf_match_cache_key(
+    construction_area: str, work_content: str, construction_start_date: str = ""
+) -> str:
+    return (
+        f"{normalize_match_text(construction_start_date)}|"
+        f"{normalize_match_text(construction_area)}|"
+        f"{normalize_match_text(work_content)}"
+    )
 
-    for docx_path in collect_docx_files(input_dir):
+
+def load_existing_pdf_match_cache(excel_path: Path) -> dict[str, str]:
+    if not excel_path.is_file():
+        LOGGER.info("未找到已有汇总表，PDF 匹配缓存为空: %s", excel_path)
+        return {}
+
+    LOGGER.info("读取已有 PDF 匹配缓存: %s", excel_path)
+    workbook = load_workbook(excel_path, read_only=False, data_only=True)
+    try:
+        sheet = workbook["汇总"] if "汇总" in workbook.sheetnames else workbook.active
+        headers = {
+            sheet.cell(row=1, column=col_idx).value: col_idx
+            for col_idx in range(1, sheet.max_column + 1)
+        }
+        area_col = headers.get("施工区域")
+        start_date_col = headers.get("施工开始时间")
+        content_col = headers.get("施工内容")
+        pdf_col = headers.get("匹配PDF文件名")
+        if not area_col or not start_date_col or not content_col or not pdf_col:
+            LOGGER.info("已有汇总表缺少匹配缓存所需列")
+            return {}
+
+        cache: dict[str, str] = {}
+        for row_idx in range(2, sheet.max_row + 1):
+            pdf_names = normalize_whitespace(
+                str(sheet.cell(row=row_idx, column=pdf_col).value or "")
+            )
+            if not pdf_names:
+                continue
+            cache[
+                pdf_match_cache_key(
+                    str(sheet.cell(row=row_idx, column=area_col).value or ""),
+                    str(sheet.cell(row=row_idx, column=content_col).value or ""),
+                    str(sheet.cell(row=row_idx, column=start_date_col).value or ""),
+                )
+            ] = pdf_names
+        LOGGER.info("已读取 %s 条 PDF 匹配缓存", len(cache))
+        return cache
+    finally:
+        workbook.close()
+
+
+def resolve_pdf_link(pdf_names: str, pdf_path_index: dict[str, Path]) -> str:
+    for pdf_name in split_pdf_names(pdf_names):
+        pdf_path = pdf_path_index.get(pdf_name)
+        if pdf_path:
+            return str(pdf_path)
+    return ""
+
+
+def process_documents(
+    input_dir: Path,
+    existing_excel_path: Path,
+    skipped_pdf_names: set[str] | None = None,
+) -> list[Record]:
+    records: list[Record] = []
+    skipped_pdf_names = skipped_pdf_names or set()
+    docx_files = collect_docx_files(input_dir)
+    pdf_match_cache = load_existing_pdf_match_cache(existing_excel_path)
+    pdf_path_index = build_pdf_path_index(input_dir, skipped_pdf_names)
+    pdf_texts: dict[Path, str] | None = None
+    if skipped_pdf_names:
+        LOGGER.info("env 配置排除 PDF: %s", "；".join(sorted(skipped_pdf_names)))
+
+    LOGGER.info("发现 %s 个 Word 申请单，开始处理", len(docx_files))
+
+    for doc_index, docx_path in enumerate(docx_files, start=1):
+        LOGGER.info("处理申请单 %s/%s: %s", doc_index, len(docx_files), docx_path.name)
         original_name = docx_path.name
         parsed = parse_document(docx_path)
         target_name = build_target_name(parsed["施工开始时间"], parsed["施工内容"])
@@ -581,6 +875,7 @@ def process_documents(input_dir: Path) -> list[Record]:
             if target_path.name != docx_path.name:
                 docx_path.rename(target_path)
                 current_path = target_path
+                current_path.touch()
                 status = "已重命名"
 
         attachment_dir = detect_attachment_dir(current_path) or detect_attachment_dir(
@@ -589,6 +884,34 @@ def process_documents(input_dir: Path) -> list[Record]:
         application_image = detect_application_image(
             current_path, docx_path, attachment_dir
         )
+        cache_key = pdf_match_cache_key(
+            parsed["施工区域"], parsed["施工内容"], parsed["施工开始时间"]
+        )
+        matched_pdf_names = pdf_match_cache.get(cache_key, "")
+        if matched_pdf_names:
+            matched_pdf_link = resolve_pdf_link(matched_pdf_names, pdf_path_index)
+            LOGGER.info("使用已有 PDF 匹配结果: %s -> %s", current_path.name, matched_pdf_names)
+        else:
+            if pdf_texts is None:
+                pdf_texts = build_pdf_text_index(
+                    input_dir,
+                    set(),
+                    skipped_pdf_names,
+                )
+            matched_pdf_paths = find_matching_pdf_paths(
+                parsed["施工区域"],
+                parsed["施工内容"],
+                pdf_texts,
+                parsed["施工开始时间"],
+            )
+            matched_pdf_names = PDF_MATCH_SEPARATOR.join(
+                pdf_path.name for pdf_path in matched_pdf_paths
+            )
+            matched_pdf_link = str(matched_pdf_paths[0]) if matched_pdf_paths else ""
+            if matched_pdf_names:
+                LOGGER.info("匹配到 PDF: %s -> %s", current_path.name, matched_pdf_names)
+            else:
+                LOGGER.info("未匹配到 PDF: %s", current_path.name)
         records.append(
             Record(
                 项目名称=parsed["项目名称"],
@@ -613,6 +936,8 @@ def process_documents(input_dir: Path) -> list[Record]:
                 申请单附图链接=str(application_image) if application_image else "",
                 附件目录=str(attachment_dir) if attachment_dir else "",
                 附件目录链接=str(attachment_dir) if attachment_dir else "",
+                匹配PDF文件名=matched_pdf_names,
+                匹配PDF文件链接=matched_pdf_link,
                 处理状态=status,
             )
         )
@@ -632,7 +957,23 @@ def resolve_input_dir(repo_root: Path) -> Path:
     return input_dir
 
 
+def resolve_skipped_pdf_names(repo_root: Path) -> set[str]:
+    env_values = load_env_file(repo_root / "common.env")
+    return set(split_name_list(env_values.get("SKIP_PDF_FILES", "")))
+
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
+
+
 def main() -> int:
+    setup_logging()
     parser = argparse.ArgumentParser(
         description="重命名质保作业申请单并导出 Excel 汇总"
     )
@@ -651,9 +992,13 @@ def main() -> int:
     if not input_dir.exists():
         raise FileNotFoundError(f"输入目录不存在: {input_dir}")
 
-    records = process_documents(input_dir)
-    output_path = input_dir / "质保作业申请汇总.xlsx"
+    LOGGER.info("输入目录: %s", input_dir)
+    skipped_pdf_names = resolve_skipped_pdf_names(repo_root)
+    output_path = input_dir / SUMMARY_EXCEL_NAME
+    records = process_documents(input_dir, output_path, skipped_pdf_names)
+    LOGGER.info("开始导出 Excel: %s", output_path)
     saved_path = export_excel(records, output_path)
+    LOGGER.info("Excel 导出完成: %s", saved_path)
 
     summary = {
         "input_dir": str(input_dir),
