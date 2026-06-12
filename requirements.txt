@@ -2,6 +2,3 @@ PyYAML
 python-docx
 openpyxl
 PyMuPDF
-numpy
-rapidocr-onnxruntime
-onnxruntime

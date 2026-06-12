@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
+import os
 import re
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 import fitz
-import numpy as np
 import yaml
 from docx import Document
 from openpyxl import Workbook, load_workbook
@@ -39,12 +45,40 @@ INVALID_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|]+')
 WHITESPACE_RE = re.compile(r"\s+")
 WORK_TYPES = ["动火作业", "有限空间作业", "5米以上高处作业", "危大工程", "配电室接电"]
 JPG_SUFFIXES = {".jpg", ".jpeg"}
+AI_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+WORD_CONTENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_([^_]+)_.+\.docx$", re.IGNORECASE)
 PDF_SUFFIX = ".pdf"
 MIN_PLAIN_PDF_CJK_CHARS = 10
 OCR_PAGE_LIMIT = 2
 PDF_MATCH_SEPARATOR = "；"
 SUMMARY_EXCEL_NAME = "质保作业申请汇总.xlsx"
+IMAGE_TEXT_PROMPT = "请识别这张图片里的所有可见中文文字。只输出识别到的文字，不要解释，不要总结。"
+PDF_PAGE_TEXT_PROMPT = (
+    "请识别这页 PDF 截图里的所有可见中文文字。"
+    "尽量保留原文中的日期、编号、施工内容、区域和单位名称。"
+    "只输出识别到的文字，不要解释，不要总结。"
+)
 LOGGER = logging.getLogger(__name__)
+
+
+class TeeStream:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+        self.encoding = getattr(streams[0], "encoding", "utf-8")
+        self.errors = getattr(streams[0], "errors", "replace")
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self.streams)
 
 
 @dataclass
@@ -74,6 +108,255 @@ class Record:
     匹配PDF文件名: str
     匹配PDF文件链接: str
     处理状态: str
+
+
+@dataclass
+class LlamaCppConfig:
+    base_url: str
+    model: str
+    autostart: bool
+    server_path: str
+    model_path: str
+    mmproj_path: str
+    extra_dll_dirs: list[str]
+    n_gpu_layers: str
+    ctx_size: str
+    reasoning: str
+    reasoning_budget: str
+
+    @classmethod
+    def from_repo(cls, repo_root: Path) -> "LlamaCppConfig":
+        env_values = load_env_file(repo_root / "common.env")
+        yaml_config = load_yaml_config(repo_root / "config.yaml")
+
+        def value(key: str, fallback: str = "") -> str:
+            return resolve_setting(
+                env_values.get(key) or yaml_config.get(key.lower()),
+                env_values,
+                fallback,
+            )
+
+        return cls(
+            base_url=value("LLAMACPP_BASE_URL", "http://127.0.0.1:8080/v1").rstrip("/"),
+            model=value("LLAMACPP_MODEL", "local-model"),
+            autostart=value("LLAMACPP_AUTOSTART", "true").strip().lower()
+            in {"1", "true", "yes", "on"},
+            server_path=value("LLAMACPP_SERVER_PATH"),
+            model_path=value("LLAMACPP_MODEL_PATH"),
+            mmproj_path=value("LLAMACPP_MMPROJ_PATH"),
+            extra_dll_dirs=split_name_list(value("LLAMACPP_EXTRA_DLL_DIRS", "./vendor/cuda12")),
+            n_gpu_layers=value("LLAMACPP_N_GPU_LAYERS", "999"),
+            ctx_size=value("LLAMACPP_CTX_SIZE", "8192"),
+            reasoning=value("LLAMACPP_REASONING", "off"),
+            reasoning_budget=value("LLAMACPP_REASONING_BUDGET", "0"),
+        )
+
+
+class LlamaCppClient:
+    def __init__(self, config: LlamaCppConfig, repo_root: Path) -> None:
+        self.config = config
+        self.repo_root = repo_root
+        self._process: subprocess.Popen[Any] | None = None
+        self._log_handles: list[Any] = []
+
+    @property
+    def server_root_url(self) -> str:
+        parsed = urlparse(self.config.base_url)
+        path = parsed.path.rstrip("/")
+        if path.endswith("/v1"):
+            path = path[:-3].rstrip("/")
+        return f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+
+    @property
+    def api_base_url(self) -> str:
+        parsed = urlparse(self.config.base_url)
+        if parsed.path.rstrip("/").endswith("/v1"):
+            return self.config.base_url
+        return f"{self.server_root_url}/v1"
+
+    @property
+    def chat_url(self) -> str:
+        return f"{self.api_base_url}/chat/completions"
+
+    @property
+    def models_url(self) -> str:
+        return f"{self.api_base_url}/models"
+
+    @property
+    def health_url(self) -> str:
+        return f"{self.server_root_url}/health"
+
+    def _get_json(self, url: str, timeout: float = 5) -> Any:
+        with urlopen(url, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _post_json(self, url: str, payload: dict[str, Any], timeout: float = 180) -> Any:
+        request = Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def is_server_available(self) -> bool:
+        try:
+            self._get_json(self.health_url, timeout=3)
+            return True
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError):
+            return False
+
+    def ensure_server(self) -> None:
+        if self.is_server_available():
+            return
+        if not self.config.autostart:
+            raise RuntimeError("本地 AI 服务不可用，且 LLAMACPP_AUTOSTART 未开启")
+        self.start_server()
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            if self.is_server_available():
+                return
+            time.sleep(2)
+        raise RuntimeError("等待本地 AI 服务启动超时")
+
+    def start_server(self) -> None:
+        server_path = Path(self.config.server_path)
+        model_path = Path(self.config.model_path)
+        mmproj_path = Path(self.config.mmproj_path) if self.config.mmproj_path else None
+        if not server_path.is_file():
+            raise FileNotFoundError(f"LLAMACPP_SERVER_PATH 不存在: {server_path}")
+        if not model_path.is_file():
+            raise FileNotFoundError(f"LLAMACPP_MODEL_PATH 不存在: {model_path}")
+        if mmproj_path and not mmproj_path.is_file():
+            raise FileNotFoundError(f"LLAMACPP_MMPROJ_PATH 不存在: {mmproj_path}")
+
+        parsed = urlparse(self.server_root_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = str(parsed.port or 8080)
+        command = [
+            str(server_path),
+            "-m",
+            str(model_path),
+            "--alias",
+            self.config.model,
+            "-c",
+            self.config.ctx_size,
+            "-ngl",
+            self.config.n_gpu_layers,
+            "--reasoning",
+            self.config.reasoning,
+            "--reasoning-budget",
+            self.config.reasoning_budget,
+            "--host",
+            host,
+            "--port",
+            port,
+        ]
+        if mmproj_path:
+            command[3:3] = ["--mmproj", str(mmproj_path)]
+
+        log_dir = self.repo_root / "log"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_handle = (log_dir / "llama_server.out.log").open("a", encoding="utf-8")
+        stderr_handle = (log_dir / "llama_server.err.log").open("a", encoding="utf-8")
+        self._log_handles.extend([stdout_handle, stderr_handle])
+
+        env = os.environ.copy()
+        dll_dirs = [server_path.parent]
+        for raw_dir in self.config.extra_dll_dirs:
+            dll_dir = Path(raw_dir)
+            if not dll_dir.is_absolute():
+                dll_dir = self.repo_root / dll_dir
+            dll_dirs.append(dll_dir)
+        env["PATH"] = os.pathsep.join(str(path) for path in dll_dirs) + os.pathsep + env.get("PATH", "")
+
+        self._process = subprocess.Popen(
+            command,
+            cwd=str(server_path.parent),
+            env=env,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def assert_model_available(self) -> None:
+        models = self._get_json(self.models_url, timeout=10)
+        model_ids = [
+            item.get("id")
+            for item in models.get("data", [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if self.config.model not in model_ids:
+            raise RuntimeError(
+                f"本地 AI 模型不可用: {self.config.model}; 当前模型: {', '.join(model_ids)}"
+            )
+
+    def extract_image_bytes_text(
+        self,
+        image_bytes: bytes,
+        mime_type: str,
+        prompt: str = IMAGE_TEXT_PROMPT,
+        max_tokens: int = 512,
+    ) -> str:
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        payload = {
+            "model": self.config.model,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{image_b64}",
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+        response = self._post_json(self.chat_url, payload)
+        choices = response.get("choices") or []
+        if not choices:
+            return ""
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            return "\n".join(
+                str(item.get("text", "")) for item in content if isinstance(item, dict)
+            )
+        return str(content or "")
+
+    def extract_image_text(self, image_path: Path) -> str:
+        mime_type = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+        return self.extract_image_bytes_text(
+            image_path.read_bytes(),
+            mime_type,
+            IMAGE_TEXT_PROMPT,
+            max_tokens=512,
+        )
+
+    def shutdown_server(self) -> None:
+        if self._process is not None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=10)
+            self._process = None
+        for handle in self._log_handles:
+            try:
+                handle.close()
+            except OSError:
+                pass
+        self._log_handles.clear()
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -135,9 +418,15 @@ def count_cjk_chars(value: str) -> int:
 
 
 def split_name_list(value: str) -> list[str]:
+    raw_value = (value or "").strip()
+    if raw_value.startswith("[") and raw_value.endswith("]"):
+        parsed = yaml.safe_load(raw_value)
+        if isinstance(parsed, list):
+            return [normalize_whitespace(str(item)) for item in parsed if str(item).strip()]
+
     return [
         item.strip()
-        for item in re.split(r"[,，；;]", value or "")
+        for item in re.split(r"[,，；;]", raw_value)
         if item and item.strip()
     ]
 
@@ -348,13 +637,7 @@ def read_pdf_plain_text(pdf_path: Path) -> str:
     return "\n".join(page_texts)
 
 
-def create_ocr_engine() -> Any:
-    from rapidocr_onnxruntime import RapidOCR
-
-    return RapidOCR()
-
-
-def read_pdf_ocr_text(pdf_path: Path, ocr_engine: Any) -> str:
+def read_pdf_ai_ocr_text(pdf_path: Path, client: LlamaCppClient) -> str:
     document = fitz.open(pdf_path)
     page_texts: list[str] = []
     try:
@@ -362,36 +645,39 @@ def read_pdf_ocr_text(pdf_path: Path, ocr_engine: Any) -> str:
         for page_index in range(page_count):
             page = document[page_index]
             pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-            image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
-                pixmap.height,
-                pixmap.width,
-                pixmap.n,
+            page_texts.append(
+                client.extract_image_bytes_text(
+                    pixmap.tobytes("png"),
+                    "image/png",
+                    PDF_PAGE_TEXT_PROMPT,
+                    max_tokens=768,
+                )
             )
-            result, _ = ocr_engine(image)
-            page_texts.extend(item[1] for item in result or [])
     finally:
         document.close()
     return "\n".join(page_texts)
 
 
-def read_pdf_text(pdf_path: Path, ocr_engine: Any | None) -> str:
+def read_pdf_text(pdf_path: Path, client: LlamaCppClient | None) -> str:
     plain_text = read_pdf_plain_text(pdf_path)
     if count_cjk_chars(plain_text) >= MIN_PLAIN_PDF_CJK_CHARS:
         return normalize_match_text(plain_text)
-    if ocr_engine is None:
+    if client is None:
         return normalize_match_text(plain_text)
-    return normalize_match_text(read_pdf_ocr_text(pdf_path, ocr_engine))
+    return normalize_match_text(read_pdf_ai_ocr_text(pdf_path, client))
 
 
 def build_pdf_text_index(
     input_dir: Path,
     excluded_pdf_names: set[str] | None = None,
     skipped_pdf_names: set[str] | None = None,
+    repo_root: Path | None = None,
 ) -> dict[Path, str]:
     pdf_texts: dict[Path, str] = {}
-    ocr_engine: Any | None = None
+    ai_client: LlamaCppClient | None = None
     excluded_pdf_names = excluded_pdf_names or set()
     skipped_pdf_names = skipped_pdf_names or set()
+    repo_root = repo_root or Path(__file__).resolve().parent
     pdf_files = [
         pdf_path
         for pdf_path in collect_pdf_files(input_dir, skipped_pdf_names)
@@ -402,26 +688,35 @@ def build_pdf_text_index(
     if excluded_pdf_names:
         LOGGER.info("跳过 %s 个已有匹配结果的 PDF", len(excluded_pdf_names))
     LOGGER.info("发现 %s 个 PDF，开始建立匹配索引", len(pdf_files))
-    for index, pdf_path in enumerate(pdf_files, start=1):
-        LOGGER.info("读取 PDF %s/%s: %s", index, len(pdf_files), pdf_path.name)
-        try:
-            plain_text = read_pdf_plain_text(pdf_path)
-            if count_cjk_chars(plain_text) >= MIN_PLAIN_PDF_CJK_CHARS:
-                pdf_texts[pdf_path] = normalize_match_text(plain_text)
-                LOGGER.info("PDF 文本提取完成: %s", pdf_path.name)
-                continue
+    try:
+        for index, pdf_path in enumerate(pdf_files, start=1):
+            LOGGER.info("读取 PDF %s/%s: %s", index, len(pdf_files), pdf_path.name)
+            try:
+                plain_text = read_pdf_plain_text(pdf_path)
+                if count_cjk_chars(plain_text) >= MIN_PLAIN_PDF_CJK_CHARS:
+                    pdf_texts[pdf_path] = normalize_match_text(plain_text)
+                    LOGGER.info("PDF 文本提取完成: %s", pdf_path.name)
+                    continue
 
-            if ocr_engine is None:
-                LOGGER.info("普通文本不可用，初始化 OCR 引擎")
-                ocr_engine = create_ocr_engine()
-            LOGGER.info("开始 OCR 识别: %s", pdf_path.name)
-            pdf_texts[pdf_path] = normalize_match_text(
-                read_pdf_ocr_text(pdf_path, ocr_engine)
-            )
-            LOGGER.info("OCR 识别完成: %s", pdf_path.name)
-        except Exception as exc:
-            pdf_texts[pdf_path] = ""
-            LOGGER.warning("PDF 读取失败，已跳过: %s (%s)", pdf_path, exc)
+                if ai_client is None:
+                    LOGGER.info("普通文本不可用，初始化本地 AI PDF OCR")
+                    ai_client = LlamaCppClient(
+                        LlamaCppConfig.from_repo(repo_root),
+                        repo_root,
+                    )
+                    ai_client.ensure_server()
+                    ai_client.assert_model_available()
+                LOGGER.info("开始本地 AI OCR 识别 PDF: %s", pdf_path.name)
+                pdf_texts[pdf_path] = normalize_match_text(
+                    read_pdf_ai_ocr_text(pdf_path, ai_client)
+                )
+                LOGGER.info("本地 AI OCR 识别完成: %s", pdf_path.name)
+            except Exception as exc:
+                pdf_texts[pdf_path] = ""
+                LOGGER.warning("PDF 读取失败，已跳过: %s (%s)", pdf_path, exc)
+    finally:
+        if ai_client is not None:
+            ai_client.shutdown_server()
     return pdf_texts
 
 
@@ -785,6 +1080,132 @@ def collect_docx_files(input_dir: Path) -> list[Path]:
     return sorted(path for path in input_dir.glob("*.docx") if path.is_file())
 
 
+def collect_ai_candidate_images(input_dir: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in input_dir.glob("*")
+            if path.is_file()
+            and path.suffix.lower() in AI_IMAGE_SUFFIXES
+            and not DATE_PREFIX_RE.match(path.name)
+        ),
+        key=lambda path: path.name.lower(),
+    )
+
+
+def word_content_from_name(word_name: str) -> str:
+    match = WORD_CONTENT_NAME_RE.fullmatch(word_name)
+    return match.group(2) if match else ""
+
+
+def word_date_from_name(word_name: str) -> date | None:
+    match = WORD_CONTENT_NAME_RE.fullmatch(word_name)
+    if not match:
+        return None
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+
+
+def build_recent_word_image_match_index(
+    records: list[Record],
+    run_date: date | None = None,
+    lookback_days: int = 2,
+    lookahead_days: int = 14,
+) -> list[tuple[Record, str, str]]:
+    run_date = run_date or date.today()
+    earliest_date = run_date - timedelta(days=lookback_days)
+    latest_date = run_date + timedelta(days=lookahead_days)
+    candidates: list[tuple[Record, str, str]] = []
+    for record in records:
+        word_date = word_date_from_name(record.新文件名)
+        if word_date is None or word_date < earliest_date or word_date > latest_date:
+            continue
+        content = word_content_from_name(record.新文件名)
+        content_key = normalize_match_text(content)
+        if content_key:
+            candidates.append((record, content, content_key))
+    return candidates
+
+
+def find_best_word_image_match(
+    image_text: str, candidates: list[tuple[Record, str, str]]
+) -> tuple[Record, str] | None:
+    text_key = normalize_match_text(image_text)
+    if not text_key:
+        return None
+    matches = [
+        (record, content)
+        for record, content, content_key in candidates
+        if content_key and content_key in text_key
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: len(normalize_match_text(item[1])))
+
+
+def rename_matched_images_by_local_ai(
+    input_dir: Path, records: list[Record], repo_root: Path
+) -> int:
+    images = collect_ai_candidate_images(input_dir)
+    candidates = build_recent_word_image_match_index(records)
+    if not images:
+        LOGGER.info("未发现需要本地 AI 识别重命名的图片")
+        return 0
+    if not candidates:
+        LOGGER.info("未发现运行日前 2 天至后 14 天内可用于图片匹配的 Word 文件名")
+        return 0
+    LOGGER.info("图片匹配 Word 候选限定为运行日前 2 天至后 14 天内: %s 个", len(candidates))
+
+    config = LlamaCppConfig.from_repo(repo_root)
+    client = LlamaCppClient(config, repo_root)
+    renamed_count = 0
+    try:
+        if not config.mmproj_path and not client.is_server_available():
+            LOGGER.warning(
+                "未配置 LLAMACPP_MMPROJ_PATH，且本地 AI 服务未运行，跳过图片识别重命名"
+            )
+            return 0
+        LOGGER.info("发现 %s 个待识别图片，开始调用本地 AI", len(images))
+        client.ensure_server()
+        client.assert_model_available()
+
+        for index, image_path in enumerate(images, start=1):
+            LOGGER.info("识别图片 %s/%s: %s", index, len(images), image_path.name)
+            try:
+                image_text = client.extract_image_text(image_path)
+            except Exception as exc:
+                LOGGER.warning("图片识别失败，已跳过: %s (%s)", image_path.name, exc)
+                continue
+
+            match = find_best_word_image_match(image_text, candidates)
+            if not match:
+                LOGGER.info("图片未匹配到 Word 文件名内容: %s", image_path.name)
+                continue
+
+            record, content = match
+            target_path = input_dir / f"{Path(record.新文件名).stem}{image_path.suffix.lower()}"
+            if target_path.exists() and target_path.resolve() != image_path.resolve():
+                LOGGER.warning(
+                    "图片目标文件已存在，跳过重命名: %s -> %s",
+                    image_path.name,
+                    target_path.name,
+                )
+                continue
+
+            image_path.rename(target_path)
+            target_path.touch()
+            record.申请单附图链接 = str(target_path)
+            LOGGER.info("图片匹配成功: %s -> %s (%s)", image_path.name, target_path.name, content)
+            renamed_count += 1
+    except Exception as exc:
+        LOGGER.warning("本地 AI 图片重命名不可用，已跳过剩余图片: %s", exc)
+    finally:
+        client.shutdown_server()
+    return renamed_count
+
+
 def pdf_match_cache_key(
     construction_area: str, work_content: str, construction_start_date: str = ""
 ) -> str:
@@ -793,6 +1214,21 @@ def pdf_match_cache_key(
         f"{normalize_match_text(construction_area)}|"
         f"{normalize_match_text(work_content)}"
     )
+
+
+def normalize_excel_cache_value(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return normalize_whitespace(str(value or ""))
+
+
+def collect_cached_pdf_names(pdf_match_cache: dict[str, str]) -> set[str]:
+    cached_pdf_names: set[str] = set()
+    for pdf_names in pdf_match_cache.values():
+        cached_pdf_names.update(split_pdf_names(pdf_names))
+    return cached_pdf_names
 
 
 def load_existing_pdf_match_cache(excel_path: Path) -> dict[str, str]:
@@ -825,9 +1261,15 @@ def load_existing_pdf_match_cache(excel_path: Path) -> dict[str, str]:
                 continue
             cache[
                 pdf_match_cache_key(
-                    str(sheet.cell(row=row_idx, column=area_col).value or ""),
-                    str(sheet.cell(row=row_idx, column=content_col).value or ""),
-                    str(sheet.cell(row=row_idx, column=start_date_col).value or ""),
+                    normalize_excel_cache_value(
+                        sheet.cell(row=row_idx, column=area_col).value
+                    ),
+                    normalize_excel_cache_value(
+                        sheet.cell(row=row_idx, column=content_col).value
+                    ),
+                    normalize_excel_cache_value(
+                        sheet.cell(row=row_idx, column=start_date_col).value
+                    ),
                 )
             ] = pdf_names
         LOGGER.info("已读取 %s 条 PDF 匹配缓存", len(cache))
@@ -848,15 +1290,23 @@ def process_documents(
     input_dir: Path,
     existing_excel_path: Path,
     skipped_pdf_names: set[str] | None = None,
+    repo_root: Path | None = None,
 ) -> list[Record]:
     records: list[Record] = []
     skipped_pdf_names = skipped_pdf_names or set()
+    repo_root = repo_root or Path(__file__).resolve().parent
     docx_files = collect_docx_files(input_dir)
     pdf_match_cache = load_existing_pdf_match_cache(existing_excel_path)
+    cached_pdf_names = collect_cached_pdf_names(pdf_match_cache)
     pdf_path_index = build_pdf_path_index(input_dir, skipped_pdf_names)
     pdf_texts: dict[Path, str] | None = None
     if skipped_pdf_names:
         LOGGER.info("env 配置排除 PDF: %s", "；".join(sorted(skipped_pdf_names)))
+    if cached_pdf_names:
+        LOGGER.info(
+            "已有 Excel 匹配结果中的 PDF 将跳过重新识别: %s",
+            "；".join(sorted(cached_pdf_names)),
+        )
 
     LOGGER.info("发现 %s 个 Word 申请单，开始处理", len(docx_files))
 
@@ -895,8 +1345,9 @@ def process_documents(
             if pdf_texts is None:
                 pdf_texts = build_pdf_text_index(
                     input_dir,
-                    set(),
+                    cached_pdf_names,
                     skipped_pdf_names,
+                    repo_root,
                 )
             matched_pdf_paths = find_matching_pdf_paths(
                 parsed["施工区域"],
@@ -962,7 +1413,25 @@ def resolve_skipped_pdf_names(repo_root: Path) -> set[str]:
     return set(split_name_list(env_values.get("SKIP_PDF_FILES", "")))
 
 
-def setup_logging() -> None:
+def resolve_log_dir(repo_root: Path) -> Path:
+    env_values = load_env_file(repo_root / "common.env")
+    yaml_config = load_yaml_config(repo_root / "config.yaml")
+    raw_log_dir = env_values.get("LOG_DIR") or resolve_setting(
+        yaml_config.get("log_dir"), env_values, "log"
+    )
+    log_dir = Path(raw_log_dir)
+    if not log_dir.is_absolute():
+        log_dir = repo_root / log_dir
+    return log_dir
+
+
+def setup_logging(repo_root: Path) -> Path:
+    log_dir = resolve_log_dir(repo_root)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"docflow_renamer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_handle = log_path.open("a", encoding="utf-8")
+    sys.stdout = TeeStream(sys.stdout, log_handle)  # type: ignore[assignment]
+    sys.stderr = TeeStream(sys.stderr, log_handle)  # type: ignore[assignment]
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -970,10 +1439,12 @@ def setup_logging() -> None:
         stream=sys.stdout,
         force=True,
     )
+    return log_path
 
 
 def main() -> int:
-    setup_logging()
+    repo_root = Path(__file__).resolve().parent
+    log_path = setup_logging(repo_root)
     parser = argparse.ArgumentParser(
         description="重命名质保作业申请单并导出 Excel 汇总"
     )
@@ -984,7 +1455,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parent
+    LOGGER.info("终端输出日志: %s", log_path)
     input_dir = (
         args.input_dir.resolve() if args.input_dir else resolve_input_dir(repo_root)
     )
@@ -995,7 +1466,8 @@ def main() -> int:
     LOGGER.info("输入目录: %s", input_dir)
     skipped_pdf_names = resolve_skipped_pdf_names(repo_root)
     output_path = input_dir / SUMMARY_EXCEL_NAME
-    records = process_documents(input_dir, output_path, skipped_pdf_names)
+    records = process_documents(input_dir, output_path, skipped_pdf_names, repo_root)
+    image_renamed_count = rename_matched_images_by_local_ai(input_dir, records, repo_root)
     LOGGER.info("开始导出 Excel: %s", output_path)
     saved_path = export_excel(records, output_path)
     LOGGER.info("Excel 导出完成: %s", saved_path)
@@ -1004,6 +1476,7 @@ def main() -> int:
         "input_dir": str(input_dir),
         "total_docs": len(records),
         "renamed_docs": sum(1 for record in records if record.处理状态 == "已重命名"),
+        "renamed_images": image_renamed_count,
         "excel_path": str(saved_path),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))

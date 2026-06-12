@@ -7,9 +7,11 @@
 - 解析 Word 申请单中的项目名称、质保单位、施工区域、施工日期、施工内容、负责人、危险作业等字段。
 - 将申请单重命名为 `YYYY-MM-DD_施工内容_质保作业申请单.docx`。
 - 自动关联同名或同目录下的申请单图片、附件目录。
+- 对随机文件名的申请单图片调用本地 LLAMACPP 多模态模型识别文字，并按匹配到的申请单复制/重命名为同名图片。
+- 将同日期的 `YYYY-MM-DD_人员名单.jpg` 或 `YYYY-MM-DD_工人名单.jpg` 复制为各申请单对应的 `YYYY-MM-DD_施工内容_质保作业申请单_工人名单.jpg`。
 - 导出 `质保作业申请汇总.xlsx`，如果目标文件已存在，会生成带时间戳的新汇总文件。
 - 匹配工程类主体质保施工 PDF，并在 Excel 的 `匹配PDF文件名` 列写入结果和本地链接。
-- 普通 PDF 文本不可用时自动使用 OCR 识别。
+- 普通 PDF 文本不可用时自动使用本地 LLAMACPP 多模态模型识别。
 
 ## 安装
 
@@ -25,10 +27,10 @@ pip install -r requirements.txt
 
 ```env
 INPUT_PATH=D:\path\to\质保作业申请单
-SKIP_PDF_FILES=01 安全生产及消防安全协议（建工）.pdf
+SKIP_PDF_FILES=["01 安全生产及消防安全协议（建工）.pdf"]
 ```
 
-`INPUT_PATH` 指向申请单、图片、附件和 PDF 所在目录。`SKIP_PDF_FILES` 可用逗号、分号或中文分隔符配置需要排除匹配的 PDF 文件名。
+`INPUT_PATH` 指向申请单、图片、附件和 PDF 所在目录。`SKIP_PDF_FILES` 使用一行列表配置需要排除匹配的 PDF 文件名；旧的逗号、分号或中文分隔符写法仍兼容。
 
 也可以通过命令行指定输入目录：
 
@@ -42,11 +44,40 @@ python docflow_renamer.py --input-dir "D:\path\to\质保作业申请单"
 python docflow_renamer.py
 ```
 
-运行完成后会输出 JSON 摘要，包含输入目录、处理数量和生成的 Excel 路径。
+运行完成后会输出 JSON 摘要，包含输入目录、处理数量、图片重命名数量和生成的 Excel 路径。
+
+### 复制工人名单图片
+
+如果输入目录下存在按日期命名的人员/工人名单图片：
+
+```text
+YYYY-MM-DD_人员名单.jpg
+YYYY-MM-DD_工人名单.jpg
+```
+
+可以运行：
+
+```powershell
+python copy_worker_list_images.py
+```
+
+脚本会读取 `INPUT_PATH`，按同日期匹配所有 `YYYY-MM-DD_施工内容_质保作业申请单.docx`，并复制生成：
+
+```text
+YYYY-MM-DD_施工内容_质保作业申请单_工人名单.jpg
+```
+
+如果目标图片已存在，脚本会记录日志并跳过，不覆盖已有文件。
+
+## 图片匹配规则
+
+`docflow_renamer.py` 会扫描输入目录第一层中尚未按日期命名的 `.jpg`、`.jpeg`、`.png` 图片，调用本地 LLAMACPP 多模态模型识别图片文字，再用识别文本中的施工内容匹配近期申请单文件名。
+
+申请单候选默认限定为运行日前 2 天至后 14 天，适合提前制作未来日期申请单的场景，同时避免历史文件过多导致误匹配。
 
 ## PDF 匹配规则
 
-PDF 匹配会先建立输入目录下所有 PDF 的文本索引。对中文文本提取失败的 PDF，脚本会使用 `rapidocr-onnxruntime` 做 OCR。
+PDF 匹配会先建立输入目录下所有 PDF 的文本索引。对中文文本提取失败的 PDF，脚本会将 PDF 前两页渲染为图片，并通过本地 LLAMACPP 多模态模型识别文字。
 
 匹配时会对文本做归一化处理：
 
