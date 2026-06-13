@@ -283,9 +283,11 @@ class LlamaCppClient:
     def assert_model_available(self) -> None:
         models = self._get_json(self.models_url, timeout=10)
         model_ids = [
-            item.get("id")
+            model_id
             for item in models.get("data", [])
-            if isinstance(item, dict) and item.get("id")
+            if isinstance(item, dict)
+            for model_id in [item.get("id")]
+            if isinstance(model_id, str) and model_id
         ]
         if self.config.model not in model_ids:
             raise RuntimeError(
@@ -631,7 +633,7 @@ def read_pdf_plain_text(pdf_path: Path) -> str:
     page_texts: list[str] = []
     try:
         for page in document:
-            page_texts.append(page.get_text() or "")
+            page_texts.append(str(page.get_text("text") or ""))
     finally:
         document.close()
     return "\n".join(page_texts)
@@ -1240,6 +1242,9 @@ def load_existing_pdf_match_cache(excel_path: Path) -> dict[str, str]:
     workbook = load_workbook(excel_path, read_only=False, data_only=True)
     try:
         sheet = workbook["汇总"] if "汇总" in workbook.sheetnames else workbook.active
+        if sheet is None:
+            LOGGER.info("已有汇总表没有可读取的工作表")
+            return {}
         headers = {
             sheet.cell(row=1, column=col_idx).value: col_idx
             for col_idx in range(1, sheet.max_column + 1)
@@ -1425,10 +1430,12 @@ def resolve_log_dir(repo_root: Path) -> Path:
     return log_dir
 
 
-def setup_logging(repo_root: Path) -> Path:
+def setup_logging(repo_root: Path, script_name: str | None = None) -> Path:
     log_dir = resolve_log_dir(repo_root)
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"docflow_renamer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_stem = script_name or Path(sys.argv[0]).stem or Path(__file__).stem
+    log_stem = re.sub(r'[\\/:*?"<>|]+', "_", log_stem)
+    log_path = log_dir / f"{log_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     log_handle = log_path.open("a", encoding="utf-8")
     sys.stdout = TeeStream(sys.stdout, log_handle)  # type: ignore[assignment]
     sys.stderr = TeeStream(sys.stderr, log_handle)  # type: ignore[assignment]

@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from docflow_renamer import setup_logging
+
 
 DATE_WORKER_LIST_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})_(?:人员|工人)名单\.jpe?g$", re.IGNORECASE
@@ -153,6 +155,7 @@ def copy_worker_list_images(plans: list[PlannedCopy]) -> tuple[int, int]:
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parent
+    log_path = setup_logging(repo_root)
     parser = argparse.ArgumentParser(
         description="将日期人员名单图片复制重命名为同日期申请单工人名单图片"
     )
@@ -163,16 +166,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
     input_dir = args.input_dir.resolve() if args.input_dir else resolve_input_dir(repo_root)
     if not input_dir.exists():
         raise FileNotFoundError(f"输入目录不存在: {input_dir}")
 
+    LOGGER.info("终端输出日志: %s", log_path)
     LOGGER.info("输入目录: %s", input_dir)
     LOGGER.info("扫描源图片规则: YYYY-MM-DD_人员名单.jpg 或 YYYY-MM-DD_工人名单.jpg")
     LOGGER.info("目标命名规则: YYYY-MM-DD_施工内容_质保作业申请单_工人名单.jpg")
