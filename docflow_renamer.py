@@ -49,6 +49,8 @@ AI_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 WORD_CONTENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_([^_]+)_.+\.docx$", re.IGNORECASE)
 PDF_SUFFIX = ".pdf"
+PDF_TWELVE_DIGIT_RE = re.compile(r"\d{12}")
+PDF_TARGET_NAME_PREFIX = "工程类-主体质保施工_编号："
 MIN_PLAIN_PDF_CJK_CHARS = 10
 OCR_PAGE_LIMIT = 2
 PDF_MATCH_SEPARATOR = "；"
@@ -435,6 +437,58 @@ def split_name_list(value: str) -> list[str]:
 
 def split_pdf_names(value: str) -> list[str]:
     return split_name_list(value)
+
+
+def normalize_digits(value: str) -> str:
+    return value.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+
+def extract_pdf_application_no_from_name(pdf_name: str) -> str:
+    stem = normalize_digits(Path(pdf_name).stem)
+    if PDF_TWELVE_DIGIT_RE.fullmatch(stem):
+        return stem
+    if "编号" not in stem:
+        return ""
+    compact_digits = re.sub(r"\D", "", stem)
+    match = PDF_TWELVE_DIGIT_RE.search(compact_digits)
+    return match.group(0) if match else ""
+
+
+def build_pdf_name_by_application_no(pdf_path_index: dict[str, Path]) -> dict[str, str]:
+    pdf_name_by_application_no: dict[str, str] = {}
+    for pdf_name in pdf_path_index:
+        application_no = extract_pdf_application_no_from_name(pdf_name)
+        if not application_no:
+            continue
+        existing_name = pdf_name_by_application_no.get(application_no)
+        if not existing_name or pdf_name.startswith(PDF_TARGET_NAME_PREFIX):
+            pdf_name_by_application_no[application_no] = pdf_name
+    return pdf_name_by_application_no
+
+
+def normalize_pdf_match_cache_names(
+    pdf_match_cache: dict[str, str],
+    pdf_path_index: dict[str, Path],
+) -> dict[str, str]:
+    pdf_name_by_application_no = build_pdf_name_by_application_no(pdf_path_index)
+    if not pdf_name_by_application_no:
+        return pdf_match_cache
+
+    normalized_cache: dict[str, str] = {}
+    renamed_count = 0
+    for cache_key, pdf_names in pdf_match_cache.items():
+        normalized_pdf_names: list[str] = []
+        for pdf_name in split_pdf_names(pdf_names):
+            application_no = extract_pdf_application_no_from_name(pdf_name)
+            normalized_pdf_name = pdf_name_by_application_no.get(application_no, pdf_name)
+            if normalized_pdf_name != pdf_name:
+                renamed_count += 1
+            normalized_pdf_names.append(normalized_pdf_name)
+        normalized_cache[cache_key] = PDF_MATCH_SEPARATOR.join(normalized_pdf_names)
+
+    if renamed_count:
+        LOGGER.info("已规范化 %s 个已有 PDF 匹配缓存文件名", renamed_count)
+    return normalized_cache
 
 
 def sanitize_filename_part(value: str) -> str:
@@ -1302,8 +1356,9 @@ def process_documents(
     repo_root = repo_root or Path(__file__).resolve().parent
     docx_files = collect_docx_files(input_dir)
     pdf_match_cache = load_existing_pdf_match_cache(existing_excel_path)
-    cached_pdf_names = collect_cached_pdf_names(pdf_match_cache)
     pdf_path_index = build_pdf_path_index(input_dir, skipped_pdf_names)
+    pdf_match_cache = normalize_pdf_match_cache_names(pdf_match_cache, pdf_path_index)
+    cached_pdf_names = collect_cached_pdf_names(pdf_match_cache)
     pdf_texts: dict[Path, str] | None = None
     if skipped_pdf_names:
         LOGGER.info("env 配置排除 PDF: %s", "；".join(sorted(skipped_pdf_names)))
