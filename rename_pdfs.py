@@ -19,7 +19,11 @@ from docflow_renamer import (
 
 LOGGER = logging.getLogger(__name__)
 
-SOURCE_NAME_RE = re.compile(r"^\d+\.pdf$", re.IGNORECASE)
+SOURCE_DIGIT_NAME_RE = re.compile(r"^\d+\.pdf$", re.IGNORECASE)
+SOURCE_APPLICATION_NAME_RE = re.compile(
+    r"^申请\s*编号\s*[:：]?\s*[0-9０-９][0-9０-９\s\-—–－]{10,30}[0-9０-９]\.pdf$",
+    re.IGNORECASE,
+)
 APPLICATION_NO_RE = re.compile(r"申请\s*编号\s*[:：]?\s*([0-9０-９][0-9０-９\s\-—–－]{10,30}[0-9０-９])")
 TWELVE_DIGIT_RE = re.compile(r"\d{12}")
 TARGET_NAME_TEMPLATE = "工程类-主体质保施工_编号：{application_no}.pdf"
@@ -54,6 +58,14 @@ def extract_application_no(text: str) -> str:
     return fallback_match.group(1) if fallback_match else ""
 
 
+def extract_application_no_from_filename(pdf_path: Path) -> str:
+    if TWELVE_DIGIT_RE.fullmatch(pdf_path.stem):
+        return pdf_path.stem
+    if SOURCE_APPLICATION_NAME_RE.fullmatch(pdf_path.name):
+        return extract_application_no(pdf_path.stem)
+    return ""
+
+
 def extract_application_no_with_ai(pdf_path: Path, client: LlamaCppClient, page_limit: int) -> str:
     document = fitz.open(pdf_path)
     try:
@@ -82,7 +94,11 @@ def collect_source_pdfs(input_dir: Path) -> list[Path]:
     return sorted(
         path
         for path in input_dir.iterdir()
-        if path.is_file() and SOURCE_NAME_RE.fullmatch(path.name)
+        if path.is_file()
+        and (
+            SOURCE_DIGIT_NAME_RE.fullmatch(path.name)
+            or SOURCE_APPLICATION_NAME_RE.fullmatch(path.name)
+        )
     )
 
 
@@ -90,8 +106,12 @@ def build_target_path(input_dir: Path, application_no: str) -> Path:
     return input_dir / TARGET_NAME_TEMPLATE.format(application_no=application_no)
 
 
-def rename_pdf(pdf_path: Path, input_dir: Path, client: LlamaCppClient, page_limit: int) -> RenameResult:
-    application_no = extract_application_no_with_ai(pdf_path, client, page_limit)
+def rename_pdf(pdf_path: Path, input_dir: Path, client: LlamaCppClient | None, page_limit: int) -> RenameResult:
+    application_no = extract_application_no_from_filename(pdf_path)
+    if not application_no:
+        if client is None:
+            raise RuntimeError("需要本地 AI 识别，但服务未初始化")
+        application_no = extract_application_no_with_ai(pdf_path, client, page_limit)
     if not application_no:
         return RenameResult(pdf_path, None, "", "未识别到申请编号")
 
@@ -111,17 +131,26 @@ def process_pdfs(input_dir: Path, repo_root: Path, page_limit: int) -> list[Rena
     if not pdf_files:
         return []
 
-    client = LlamaCppClient(LlamaCppConfig.from_repo(repo_root), repo_root)
-    try:
-        LOGGER.info("初始化本地 AI 服务")
-        client.ensure_server()
-        client.assert_model_available()
+    client: LlamaCppClient | None = None
 
+    def ensure_client() -> LlamaCppClient:
+        nonlocal client
+        if client is None:
+            client = LlamaCppClient(LlamaCppConfig.from_repo(repo_root), repo_root)
+            LOGGER.info("初始化本地 AI 服务")
+            client.ensure_server()
+            client.assert_model_available()
+        return client
+
+    try:
         results: list[RenameResult] = []
         for index, pdf_path in enumerate(pdf_files, start=1):
             LOGGER.info("处理 PDF %s/%s: %s", index, len(pdf_files), pdf_path.name)
             try:
-                result = rename_pdf(pdf_path, input_dir, client, page_limit)
+                pdf_client = None
+                if not extract_application_no_from_filename(pdf_path):
+                    pdf_client = ensure_client()
+                result = rename_pdf(pdf_path, input_dir, pdf_client, page_limit)
             except Exception as exc:
                 LOGGER.warning("处理失败: %s (%s)", pdf_path, exc)
                 result = RenameResult(pdf_path, None, "", f"处理失败: {exc}")
@@ -136,14 +165,15 @@ def process_pdfs(input_dir: Path, repo_root: Path, page_limit: int) -> list[Rena
             )
         return results
     finally:
-        client.shutdown_server()
+        if client is not None:
+            client.shutdown_server()
 
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parent
     log_path = setup_logging(repo_root)
     parser = argparse.ArgumentParser(
-        description="识别 INPUT_PATH 下 数字.pdf 的申请编号并重命名"
+        description="识别 INPUT_PATH 下 数字.pdf 或 申请编号.pdf 的申请编号并重命名"
     )
     parser.add_argument(
         "--input-dir",
