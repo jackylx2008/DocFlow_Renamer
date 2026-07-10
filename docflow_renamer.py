@@ -46,15 +46,21 @@ WHITESPACE_RE = re.compile(r"\s+")
 WORK_TYPES = ["动火作业", "有限空间作业", "5米以上高处作业", "危大工程", "配电室接电"]
 JPG_SUFFIXES = {".jpg", ".jpeg"}
 AI_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
+WORKER_LIST_IMAGE_SUFFIX = "_工人名单"
 DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 WORD_CONTENT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_([^_]+)_.+\.docx$", re.IGNORECASE)
 PDF_SUFFIX = ".pdf"
 PDF_TWELVE_DIGIT_RE = re.compile(r"\d{12}")
+PDF_APPLICATION_NO_RE = re.compile(r"申请\s*编号\s*[:：]\s*([0-9０-９]{12})")
+PDF_TARGET_NAME_RE = re.compile(
+    r"^工程类-主体质保施工_编号：[0-9０-９]{12}\.pdf$", re.IGNORECASE
+)
 PDF_TARGET_NAME_PREFIX = "工程类-主体质保施工_编号："
 MIN_PLAIN_PDF_CJK_CHARS = 10
 OCR_PAGE_LIMIT = 2
 PDF_MATCH_SEPARATOR = "；"
 SUMMARY_EXCEL_NAME = "质保作业申请汇总.xlsx"
+MANUAL_MATCH_ENV_NAME = "manual_matches.env"
 IMAGE_TEXT_PROMPT = "请识别这张图片里的所有可见中文文字。只输出识别到的文字，不要解释，不要总结。"
 PDF_PAGE_TEXT_PROMPT = (
     "请识别这页 PDF 截图里的所有可见中文文字。"
@@ -723,6 +729,90 @@ def read_pdf_text(pdf_path: Path, client: LlamaCppClient | None) -> str:
     return normalize_match_text(read_pdf_ai_ocr_text(pdf_path, client))
 
 
+def is_target_pdf_name(pdf_name: str) -> bool:
+    return PDF_TARGET_NAME_RE.fullmatch(normalize_digits(pdf_name)) is not None
+
+
+def build_pdf_target_path(pdf_path: Path, application_no: str) -> Path:
+    return pdf_path.with_name(f"{PDF_TARGET_NAME_PREFIX}{application_no}.pdf")
+
+
+def extract_pdf_rename_application_no(pdf_text: str) -> str:
+    normalized = normalize_digits(pdf_text or "")
+    compact_text = re.sub(r"\s+", "", normalized)
+    if normalize_match_text("工程类-主体质保施工") not in normalize_match_text(normalized):
+        return ""
+
+    match = PDF_APPLICATION_NO_RE.search(compact_text)
+    return match.group(1) if match else ""
+
+
+def rename_pdf_by_application_no(pdf_path: Path, application_no: str) -> bool:
+    target_path = build_pdf_target_path(pdf_path, application_no)
+    if pdf_path.resolve() == target_path.resolve():
+        LOGGER.info("PDF 已符合命名规则，跳过: %s", pdf_path.name)
+        return False
+    if target_path.exists():
+        LOGGER.warning(
+            "PDF 目标文件已存在，跳过重命名: %s -> %s",
+            pdf_path.name,
+            target_path.name,
+        )
+        return False
+
+    pdf_path.rename(target_path)
+    target_path.touch()
+    LOGGER.info("PDF 重命名成功: %s -> %s", pdf_path.name, target_path.name)
+    return True
+
+
+def rename_subject_warranty_pdfs_by_local_ai(
+    input_dir: Path,
+    repo_root: Path,
+    skipped_pdf_names: set[str] | None = None,
+) -> int:
+    skipped_pdf_names = skipped_pdf_names or set()
+    pdf_files = [
+        pdf_path
+        for pdf_path in collect_pdf_files(input_dir, skipped_pdf_names)
+        if not is_target_pdf_name(pdf_path.name)
+    ]
+    if not pdf_files:
+        LOGGER.info("未发现需要本地 AI 识别重命名的 PDF")
+        return 0
+
+    config = LlamaCppConfig.from_repo(repo_root)
+    client = LlamaCppClient(config, repo_root)
+    renamed_count = 0
+    try:
+        if not config.mmproj_path and not client.is_server_available():
+            LOGGER.warning(
+                "未配置 LLAMACPP_MMPROJ_PATH，且本地 AI 服务未运行，跳过 PDF 识别重命名"
+            )
+            return 0
+        LOGGER.info("发现 %s 个待识别 PDF，开始调用本地 AI", len(pdf_files))
+        client.ensure_server()
+        client.assert_model_available()
+
+        for index, pdf_path in enumerate(pdf_files, start=1):
+            LOGGER.info("识别 PDF %s/%s: %s", index, len(pdf_files), pdf_path.name)
+            try:
+                pdf_text = read_pdf_ai_ocr_text(pdf_path, client)
+                application_no = extract_pdf_rename_application_no(pdf_text)
+                if not application_no:
+                    LOGGER.info("PDF 未匹配主体质保施工申请编号规则: %s", pdf_path.name)
+                    continue
+                if rename_pdf_by_application_no(pdf_path, application_no):
+                    renamed_count += 1
+            except Exception as exc:
+                LOGGER.warning("PDF 识别重命名失败，已跳过: %s (%s)", pdf_path.name, exc)
+    except Exception as exc:
+        LOGGER.warning("本地 AI PDF 重命名不可用，已跳过剩余 PDF: %s", exc)
+    finally:
+        client.shutdown_server()
+    return renamed_count
+
+
 def build_pdf_text_index(
     input_dir: Path,
     excluded_pdf_names: set[str] | None = None,
@@ -1201,6 +1291,36 @@ def find_best_word_image_match(
     return max(matches, key=lambda item: len(normalize_match_text(item[1])))
 
 
+def is_worker_list_image_text(image_text: str) -> bool:
+    text_key = normalize_match_text(image_text)
+    return all(field in text_key for field in ("姓名", "电话", "性别"))
+
+
+def build_worker_list_image_target(image_path: Path) -> Path:
+    if image_path.stem.endswith(WORKER_LIST_IMAGE_SUFFIX):
+        return image_path
+    return image_path.with_name(
+        f"{image_path.stem}{WORKER_LIST_IMAGE_SUFFIX}{image_path.suffix}"
+    )
+
+
+def rename_image_file(image_path: Path, target_path: Path, log_label: str) -> bool:
+    if target_path == image_path:
+        LOGGER.info("图片已符合%s命名规则: %s", log_label, image_path.name)
+        return False
+    if target_path.exists() and target_path.resolve() != image_path.resolve():
+        LOGGER.warning(
+            "图片目标文件已存在，跳过重命名: %s -> %s",
+            image_path.name,
+            target_path.name,
+        )
+        return False
+
+    image_path.rename(target_path)
+    target_path.touch()
+    return True
+
+
 def rename_matched_images_by_local_ai(
     input_dir: Path, records: list[Record], repo_root: Path
 ) -> int:
@@ -1209,10 +1329,10 @@ def rename_matched_images_by_local_ai(
     if not images:
         LOGGER.info("未发现需要本地 AI 识别重命名的图片")
         return 0
-    if not candidates:
+    if candidates:
+        LOGGER.info("图片匹配 Word 候选限定为运行日前 2 天至后 14 天内: %s 个", len(candidates))
+    else:
         LOGGER.info("未发现运行日前 2 天至后 14 天内可用于图片匹配的 Word 文件名")
-        return 0
-    LOGGER.info("图片匹配 Word 候选限定为运行日前 2 天至后 14 天内: %s 个", len(candidates))
 
     config = LlamaCppConfig.from_repo(repo_root)
     client = LlamaCppClient(config, repo_root)
@@ -1235,23 +1355,32 @@ def rename_matched_images_by_local_ai(
                 LOGGER.warning("图片识别失败，已跳过: %s (%s)", image_path.name, exc)
                 continue
 
+            is_worker_list = is_worker_list_image_text(image_text)
             match = find_best_word_image_match(image_text, candidates)
             if not match:
+                if is_worker_list:
+                    target_path = build_worker_list_image_target(image_path)
+                    if rename_image_file(image_path, target_path, "工人名单"):
+                        LOGGER.info(
+                            "图片识别为工人名单: %s -> %s",
+                            image_path.name,
+                            target_path.name,
+                        )
+                        renamed_count += 1
+                    continue
                 LOGGER.info("图片未匹配到 Word 文件名内容: %s", image_path.name)
                 continue
 
             record, content = match
-            target_path = input_dir / f"{Path(record.新文件名).stem}{image_path.suffix.lower()}"
-            if target_path.exists() and target_path.resolve() != image_path.resolve():
-                LOGGER.warning(
-                    "图片目标文件已存在，跳过重命名: %s -> %s",
-                    image_path.name,
-                    target_path.name,
-                )
+            target_stem = Path(record.新文件名).stem
+            target_suffix = image_path.suffix.lower()
+            if is_worker_list:
+                target_stem = f"{target_stem}{WORKER_LIST_IMAGE_SUFFIX}"
+                target_suffix = image_path.suffix
+            target_path = input_dir / f"{target_stem}{target_suffix}"
+            if not rename_image_file(image_path, target_path, "Word 匹配图片"):
                 continue
 
-            image_path.rename(target_path)
-            target_path.touch()
             record.申请单附图链接 = str(target_path)
             LOGGER.info("图片匹配成功: %s -> %s (%s)", image_path.name, target_path.name, content)
             renamed_count += 1
@@ -1343,6 +1472,128 @@ def resolve_pdf_link(pdf_names: str, pdf_path_index: dict[str, Path]) -> str:
         if pdf_path:
             return str(pdf_path)
     return ""
+
+
+def load_manual_pdf_matches(repo_root: Path) -> list[dict[str, str]]:
+    env_values = load_env_file(repo_root / MANUAL_MATCH_ENV_NAME)
+    raw_matches = env_values.get("MANUAL_PDF_MATCHES", "")
+    if not raw_matches:
+        return []
+
+    parsed = yaml.safe_load(raw_matches)
+    if not isinstance(parsed, list):
+        raise ValueError(f"{MANUAL_MATCH_ENV_NAME} 中 MANUAL_PDF_MATCHES 必须是列表")
+
+    matches: list[dict[str, str]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            raise ValueError(f"{MANUAL_MATCH_ENV_NAME} 中 MANUAL_PDF_MATCHES 条目必须是对象")
+        application_image = normalize_whitespace(str(item.get("application_image") or ""))
+        pdf = normalize_whitespace(str(item.get("pdf") or ""))
+        if not application_image or not pdf:
+            raise ValueError(
+                f"{MANUAL_MATCH_ENV_NAME} 中每个特例必须包含 application_image 和 pdf"
+            )
+        matches.append({"application_image": application_image, "pdf": pdf})
+    return matches
+
+
+def build_file_name_index(input_dir: Path) -> dict[str, Path]:
+    file_index: dict[str, Path] = {}
+    for path in input_dir.rglob("*"):
+        if path.is_file() and path.name not in file_index:
+            file_index[path.name] = path
+    return file_index
+
+
+def resolve_manual_file_path(
+    file_name: str,
+    file_index: dict[str, Path],
+    suffix_fallbacks: tuple[str, ...] = (),
+) -> Path | None:
+    matched_path = file_index.get(file_name)
+    if matched_path:
+        return matched_path
+
+    source_path = Path(file_name)
+    for suffix in suffix_fallbacks:
+        fallback_name = f"{source_path.stem}{suffix}"
+        matched_path = file_index.get(fallback_name)
+        if matched_path:
+            LOGGER.info("手工匹配文件名修正: %s -> %s", file_name, fallback_name)
+            return matched_path
+    return None
+
+
+def normalize_manual_match_key(value: str) -> str:
+    stem = Path(value).stem
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", normalize_digits(stem)).lower()
+
+
+def find_manual_match_record(
+    records: list[Record],
+    application_image_name: str,
+    application_image_path: Path | None,
+) -> Record | None:
+    image_names = [application_image_name]
+    if application_image_path:
+        image_names.append(application_image_path.name)
+
+    image_keys = {normalize_manual_match_key(name) for name in image_names}
+    for record in records:
+        if record.申请单附图链接 and Path(record.申请单附图链接).name in image_names:
+            return record
+
+    for record in records:
+        record_keys = {
+            normalize_manual_match_key(record.新文件名),
+            normalize_manual_match_key(record.原文件名),
+        }
+        if image_keys & record_keys:
+            return record
+    return None
+
+
+def apply_manual_pdf_matches(
+    records: list[Record],
+    input_dir: Path,
+    repo_root: Path,
+) -> int:
+    manual_matches = load_manual_pdf_matches(repo_root)
+    if not manual_matches:
+        LOGGER.info("未配置手工 PDF 匹配特例")
+        return 0
+
+    file_index = build_file_name_index(input_dir)
+    applied_count = 0
+    for item in manual_matches:
+        image_name = item["application_image"]
+        pdf_name = item["pdf"]
+        image_path = resolve_manual_file_path(
+            image_name, file_index, (".jpg", ".jpeg", ".png")
+        )
+        pdf_path = resolve_manual_file_path(pdf_name, file_index)
+        if not pdf_path:
+            LOGGER.warning("手工匹配 PDF 文件不存在，已跳过: %s", pdf_name)
+            continue
+
+        record = find_manual_match_record(records, image_name, image_path)
+        if not record:
+            LOGGER.warning("手工匹配未找到对应申请单记录，已跳过: %s", image_name)
+            continue
+
+        if image_path:
+            record.申请单附图链接 = str(image_path)
+        record.匹配PDF文件名 = pdf_path.name
+        record.匹配PDF文件链接 = str(pdf_path)
+        applied_count += 1
+        LOGGER.info(
+            "已应用手工 PDF 匹配: %s -> %s",
+            image_path.name if image_path else image_name,
+            pdf_path.name,
+        )
+
+    return applied_count
 
 
 def process_documents(
@@ -1528,8 +1779,12 @@ def main() -> int:
     LOGGER.info("输入目录: %s", input_dir)
     skipped_pdf_names = resolve_skipped_pdf_names(repo_root)
     output_path = input_dir / SUMMARY_EXCEL_NAME
+    pdf_renamed_count = rename_subject_warranty_pdfs_by_local_ai(
+        input_dir, repo_root, skipped_pdf_names
+    )
     records = process_documents(input_dir, output_path, skipped_pdf_names, repo_root)
     image_renamed_count = rename_matched_images_by_local_ai(input_dir, records, repo_root)
+    manual_pdf_match_count = apply_manual_pdf_matches(records, input_dir, repo_root)
     LOGGER.info("开始导出 Excel: %s", output_path)
     saved_path = export_excel(records, output_path)
     LOGGER.info("Excel 导出完成: %s", saved_path)
@@ -1538,7 +1793,9 @@ def main() -> int:
         "input_dir": str(input_dir),
         "total_docs": len(records),
         "renamed_docs": sum(1 for record in records if record.处理状态 == "已重命名"),
+        "renamed_pdfs": pdf_renamed_count,
         "renamed_images": image_renamed_count,
+        "manual_pdf_matches": manual_pdf_match_count,
         "excel_path": str(saved_path),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
