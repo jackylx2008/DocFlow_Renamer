@@ -22,6 +22,7 @@ from .constants import (
     APPROVAL_REVIEW_DATA_FILE_NAME,
     APPROVAL_REVIEW_EXCEL_FILE_NAME,
     APPROVAL_REVIEW_SCHEMA_VERSION,
+    INBOX_DIR_NAME,
 )
 from .file_utils import atomic_replace_text, ensure_within, sha256_file
 from .migration import CASE_NAMESPACE
@@ -251,6 +252,20 @@ def _review_id(pdf_hash: str, case_id: str) -> str:
     )
 
 
+def _direct_inbox_pdf(root: Path, item: dict[str, Any]) -> Path | None:
+    try:
+        path = ensure_within(
+            root / Path(str(item.get("path") or "")),
+            root,
+        )
+    except ValueError:
+        return None
+    inbox = (root / INBOX_DIR_NAME).resolve()
+    if path.parent != inbox or path.suffix.lower() != ".pdf":
+        return None
+    return path
+
+
 def build_approval_review(
     dataset: dict[str, Any],
     root: Path,
@@ -275,11 +290,8 @@ def build_approval_review(
         for pdf_item in dataset.get("unmatched_files") or []:
             if pdf_item.get("role") != APPROVAL_PDF_ROLE:
                 continue
-            pdf_path = ensure_within(
-                root / Path(str(pdf_item.get("path") or "")),
-                root,
-            )
-            if not pdf_path.is_file():
+            pdf_path = _direct_inbox_pdf(root, pdf_item)
+            if pdf_path is None or not pdf_path.is_file():
                 continue
             pdf_hash = sha256_file(pdf_path)
             text = recognition.pdf_text(pdf_path)
@@ -641,7 +653,10 @@ def apply_review_decisions(
     unmatched = {
         str(item.get("sha256") or ""): item
         for item in dataset.get("unmatched_files") or []
-        if item.get("role") == APPROVAL_PDF_ROLE
+        if (
+            item.get("role") == APPROVAL_PDF_ROLE
+            and _direct_inbox_pdf(root.resolve(), item) is not None
+        )
     }
     for item in confirmed:
         pdf_hash = str((item.get("pdf") or {}).get("sha256") or "")

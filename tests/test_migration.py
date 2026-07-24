@@ -290,6 +290,19 @@ class MigrationTest(unittest.TestCase):
                 ),
                 "method": "test",
             }
+            outside_inbox = primary / "历史未匹配审批.pdf"
+            outside_inbox.write_bytes(b"outside inbox")
+            outside_record = file_record(
+                outside_inbox,
+                outside_inbox,
+                primary,
+                "approval_pdf",
+            )
+            dataset["unmatched_files"].append(outside_record)
+            dataset["recognition_cache"][sha256_file(outside_inbox)] = {
+                "text": "施工区域冷却塔施工内容维修冷塔",
+                "method": "test",
+            }
 
             review = build_approval_review(
                 dataset,
@@ -326,7 +339,11 @@ class MigrationTest(unittest.TestCase):
                 application["approval"]["match_source"],
                 "human_review",
             )
-            self.assertEqual(dataset["unmatched_files"], [])
+            self.assertEqual(len(dataset["unmatched_files"]), 1)
+            self.assertEqual(
+                dataset["unmatched_files"][0]["path"],
+                "历史未匹配审批.pdf",
+            )
             self.assertFalse(source.exists())
             self.assertTrue(
                 (
