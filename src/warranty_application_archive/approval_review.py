@@ -518,7 +518,11 @@ def export_approval_review_excel(
         ["1", "同一个审批 PDF 会列出多条候选案卷，并按候选评分从高到低排列。"],
         ["2", "只修改黄色的“审核结果”和“人工备注”列。"],
         ["3", "每个审批 PDF 最多只能有一行选择“确认匹配”；不可能的候选可选“排除”。"],
-        ["4", "保存并关闭 Excel 后，运行：python docflow_renamer.py apply-approval-review"],
+        [
+            "4",
+            "保存并关闭 Excel 后，运行："
+            "python warranty_application_archive.py apply-approval-review",
+        ],
         ["5", "命令先保存审核决定，再更新正式 JSON，并从正式 JSON 重建正式汇总 Excel。"],
         ["正式数据版本", review.get("source_dataset_revision", 0)],
         ["生成时间", review.get("generated_at", "")],

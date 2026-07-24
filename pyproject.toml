@@ -1,6 +1,6 @@
 [project]
-name = "docflow-renamer"
-version = "0.2.0"
+name = "warranty-application-archive"
+version = "0.3.0"
 description = "质保作业申请案卷归档与人工审查数据生成"
 requires-python = ">=3.11"
 dependencies = [
@@ -11,11 +11,11 @@ dependencies = [
 ]
 
 [project.scripts]
-docflow-renamer = "docflow_renamer.cli:main"
+warranty-application-archive = "warranty_application_archive.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["docflow_renamer*"]
+include = ["warranty_application_archive*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

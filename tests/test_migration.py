@@ -6,27 +6,27 @@ from unittest.mock import patch
 
 from openpyxl import load_workbook
 
-from src.docflow_renamer.approval_review import (
+from src.warranty_application_archive.approval_review import (
     apply_review_decisions,
     build_approval_review,
     export_approval_review_excel,
     import_excel_decisions,
 )
-from src.docflow_renamer.constants import (
+from src.warranty_application_archive.constants import (
     APPROVAL_REVIEW_EXCEL_FILE_NAME,
     DATA_FILE_NAME,
     TEMPLATE_FILE_NAME,
 )
-from src.docflow_renamer.excel_export import export_excel
-from src.docflow_renamer.file_utils import sha256_file
-from src.docflow_renamer.migration import (
+from src.warranty_application_archive.excel_export import export_excel
+from src.warranty_application_archive.file_utils import sha256_file
+from src.warranty_application_archive.migration import (
     apply_migration_plan,
     build_migration_plan,
     file_record,
     verify_backup,
 )
-from src.docflow_renamer.repository import JsonRepository
-from src.docflow_renamer.workflows import (
+from src.warranty_application_archive.repository import JsonRepository
+from src.warranty_application_archive.workflows import (
     intake_applications,
     ingest_approval_pdfs,
     ingest_worker_lists,
@@ -64,7 +64,7 @@ class MigrationTest(unittest.TestCase):
         (primary / f"{stem}_工人名单.jpg").write_bytes(b"workers")
         (primary / TEMPLATE_FILE_NAME).write_bytes(b"agreement")
         with patch(
-            "src.docflow_renamer.migration.legacy.parse_document",
+            "src.warranty_application_archive.migration.legacy.parse_document",
             return_value=PARSED_APPLICATION,
         ):
             plan = build_migration_plan(primary)
@@ -85,7 +85,7 @@ class MigrationTest(unittest.TestCase):
 
             verify_backup(primary, backup)
             with patch(
-                "src.docflow_renamer.migration.legacy.parse_document",
+                "src.warranty_application_archive.migration.legacy.parse_document",
                 return_value=PARSED_APPLICATION,
             ):
                 plan = build_migration_plan(primary)
@@ -188,7 +188,8 @@ class MigrationTest(unittest.TestCase):
                 "施工结束时间：2026年7月24日"
             )
             with patch(
-                "src.docflow_renamer.workflows.RecognitionService.pdf_text",
+                "src.warranty_application_archive.workflows."
+                "RecognitionService.pdf_text",
                 return_value=recognized_text,
             ):
                 approval_count = ingest_approval_pdfs(
@@ -229,7 +230,8 @@ class MigrationTest(unittest.TestCase):
             }
 
             with patch(
-                "src.docflow_renamer.workflows.legacy.parse_document",
+                "src.warranty_application_archive.workflows."
+                "legacy.parse_document",
                 return_value=parsed,
             ):
                 count = intake_applications(

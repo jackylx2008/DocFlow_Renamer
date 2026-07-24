@@ -1,4 +1,4 @@
-# DocFlow Renamer
+# Warranty Application Archive
 
 质保作业申请案卷归档工具。项目以一份质保申请为一个案卷，完成申报材料入库、统一命名、审批 PDF 回传、JSON 归档和 Excel 人工审查视图生成。
 
@@ -94,7 +94,7 @@ INPUT_PATH=D:\path\to\质保作业申请单
 也可以使用 `--input-dir` 指定：
 
 ```powershell
-python docflow_renamer.py --input-dir "D:\path\to\质保作业申请单" status
+python warranty_application_archive.py --input-dir "D:\path\to\质保作业申请单" status
 ```
 
 ## 旧目录迁移
@@ -102,13 +102,13 @@ python docflow_renamer.py --input-dir "D:\path\to\质保作业申请单" status
 旧版平铺目录必须先演练。演练只生成计划，不移动资料：
 
 ```powershell
-python docflow_renamer.py migrate
+python warranty_application_archive.py migrate
 ```
 
 确认计划后，执行迁移时必须提供内容一致的备份目录：
 
 ```powershell
-python docflow_renamer.py migrate `
+python warranty_application_archive.py migrate `
   --apply `
   --backup-dir "D:\path\to\质保作业申请单_backup"
 ```
@@ -122,27 +122,27 @@ python docflow_renamer.py migrate `
 执行完整增量流程：
 
 ```powershell
-python docflow_renamer.py run
+python warranty_application_archive.py run
 ```
 
 单独执行支流程：
 
 ```powershell
-python docflow_renamer.py applications
-python docflow_renamer.py worker-lists
-python docflow_renamer.py approval-pdfs
+python warranty_application_archive.py applications
+python warranty_application_archive.py worker-lists
+python warranty_application_archive.py approval-pdfs
 ```
 
 `approval-pdfs` 会自动刷新未匹配 PDF 的独立审核 JSON/Excel。也可以单独重新生成：
 
 ```powershell
-python docflow_renamer.py approval-review
+python warranty_application_archive.py approval-review
 ```
 
 人工填写并关闭 `审批PDF匹配审核.xlsx` 后，应用审核结果：
 
 ```powershell
-python docflow_renamer.py apply-approval-review
+python warranty_application_archive.py apply-approval-review
 ```
 
 如果正式 JSON 在审核 Excel 生成后发生过版本变化，应用命令会拒绝过期结果，须先重新生成审核文件。
@@ -150,14 +150,14 @@ python docflow_renamer.py apply-approval-review
 仅从 JSON 重新生成 Excel：
 
 ```powershell
-python docflow_renamer.py export
+python warranty_application_archive.py export
 ```
 
 查看状态及进行完整校验：
 
 ```powershell
-python docflow_renamer.py status
-python docflow_renamer.py validate
+python warranty_application_archive.py status
+python warranty_application_archive.py validate
 ```
 
 `validate` 会检查：
@@ -186,24 +186,21 @@ python docflow_renamer.py validate
 - `已处理决定`：从审核 JSON 输出的历史确认和排除记录。
 - `说明`：操作步骤、正式数据版本和候选数量。
 
-## 兼容入口
+## 统一入口
 
-以下脚本仅保留为薄入口，不再包含业务代码：
+项目根目录只保留一个 Python 入口：
 
 ```powershell
-python rename_pdfs.py
-python copy_worker_list_images.py
+python warranty_application_archive.py <command>
 ```
 
-它们分别调用统一工作流中的审批 PDF 和人员名单支流程。
+审批 PDF、人员名单和申请材料均通过子命令进入统一工作流，不再维护独立兼容脚本。
 
 ## 项目结构
 
 ```text
-docflow_renamer.py                 # 主命令薄入口
-rename_pdfs.py                     # 审批 PDF 兼容入口
-copy_worker_list_images.py         # 人员名单兼容入口
-src/docflow_renamer/
+warranty_application_archive.py   # 唯一命令入口
+src/warranty_application_archive/
 ├─ cli.py                          # 命令编排
 ├─ config.py                       # 配置
 ├─ constants.py                    # 目录、状态和材料类型
@@ -221,7 +218,7 @@ src/docflow_renamer/
 ## 开发验证
 
 ```powershell
-python -m compileall -q docflow_renamer.py rename_pdfs.py copy_worker_list_images.py src tests
+python -m compileall -q warranty_application_archive.py src tests
 python -m unittest discover -s tests -v
-python -m flake8 src tests docflow_renamer.py rename_pdfs.py copy_worker_list_images.py
+python -m flake8 src tests warranty_application_archive.py
 ```

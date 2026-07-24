@@ -1,4 +1,4 @@
-from src.docflow_renamer.cli import main
+from src.warranty_application_archive.cli import main
 
 
 if __name__ == "__main__":
