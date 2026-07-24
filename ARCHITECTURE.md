@@ -13,6 +13,19 @@ All subworkflows operate on the same JSON repository and recognition cache.
 Excel is an output adapter and is never read after the one-time legacy
 migration.
 
+`_input` is the only user-facing drop zone. The input router moves Word and
+image files to the application-material workflow. It recognizes each PDF once,
+routes approval forms to approved-PDF intake, and marks other PDFs as
+application material so they cannot be consumed by the approval workflow.
+`_inbox` is an internal processing area.
+
+Unmatched approval PDFs use a separate staging repository,
+`待人工审核匹配PDF.json`. A local HTML review page writes only to that staging
+repository. The apply command validates the staged IDs, hashes and dataset
+revision before updating the authoritative dataset and rendering the formal
+Excel workbook. Human delete decisions are recoverable moves to `_trash`, not
+filesystem deletion.
+
 ## Data authority
 
 `质保作业申请数据.json` is the authoritative dataset. It contains:

@@ -11,12 +11,17 @@ from src.warranty_application_archive.approval_review import (
     ApprovalReviewRepository,
     apply_review_decisions,
     build_approval_review,
-    export_approval_review_excel,
-    import_excel_decisions,
+    import_json_decisions,
+)
+from src.warranty_application_archive.approval_review_web import (
+    export_approval_review_html,
+    save_review_payload,
 )
 from src.warranty_application_archive.constants import (
     APPROVAL_REVIEW_DATA_FILE_NAME,
-    APPROVAL_REVIEW_EXCEL_FILE_NAME,
+    APPROVAL_REVIEW_HTML_FILE_NAME,
+    APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
+    RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     DATA_FILE_NAME,
     TEMPLATE_FILE_NAME,
 )
@@ -33,6 +38,7 @@ from src.warranty_application_archive.workflows import (
     intake_applications,
     ingest_approval_pdfs,
     ingest_worker_lists,
+    route_input_files,
 )
 
 
@@ -215,6 +221,91 @@ class MigrationTest(unittest.TestCase):
                 "202607240001",
             )
 
+    def test_input_router_separates_approval_and_application_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            base = Path(temporary_dir)
+            primary, dataset, stem = self._migrated_fixture(base)
+            input_root = primary / "_input"
+            input_root.mkdir()
+            approval_pdf = (
+                input_root
+                / "工程类-主体质保施工_编号：202607240088.pdf"
+            )
+            material_pdf = input_root / f"{stem}_有限空间申请.pdf"
+            image = input_root / f"{stem}_补充图片.jpg"
+            word = input_root / "新增质保申请.docx"
+            approval_pdf.write_bytes(b"approval")
+            material_pdf.write_bytes(b"confined space")
+            image.write_bytes(b"image")
+            word.write_bytes(b"word")
+
+            def recognized_text(path: Path) -> str:
+                if path.name == approval_pdf.name:
+                    return (
+                        "工程类-主体质保施工 申请编号：202607240088 "
+                        "施工区域：冷却塔 施工内容：维修冷塔 "
+                        "施工开始时间：2026年7月24日 "
+                        "施工结束时间：2026年7月24日"
+                    )
+                return "有限空间作业申请 施工区域：冷却塔"
+
+            with patch(
+                "src.warranty_application_archive.workflows."
+                "RecognitionService.pdf_text",
+                side_effect=recognized_text,
+            ):
+                summary = route_input_files(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+                approval_count = ingest_approval_pdfs(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            self.assertEqual(summary["input_files_routed"], 4)
+            self.assertEqual(summary["approval_pdfs_routed"], 1)
+            self.assertEqual(summary["application_files_routed"], 3)
+            self.assertEqual(approval_count, 1)
+            self.assertFalse(any(input_root.iterdir()))
+            self.assertTrue((primary / "_inbox" / material_pdf.name).is_file())
+            self.assertTrue((primary / "_inbox" / image.name).is_file())
+            self.assertTrue((primary / "_inbox" / word.name).is_file())
+            self.assertFalse(
+                any(
+                    item.get("path", "").endswith(material_pdf.name)
+                    for item in dataset.get("unmatched_files") or []
+                )
+            )
+            route_kinds = {
+                item["sha256"]: item["kind"]
+                for item in dataset["input_routes"]
+            }
+            approval_route = next(
+                item
+                for item in dataset["input_routes"]
+                if item["kind"] == "approval_pdf"
+            )
+            self.assertEqual(
+                approval_route["recognition_method"],
+                "filename",
+            )
+            self.assertEqual(
+                route_kinds[sha256_file(primary / "_inbox" / material_pdf.name)],
+                "application_material",
+            )
+            archived_approval = (
+                primary
+                / "_cases"
+                / stem
+                / "工程类-主体质保施工_编号：202607240088.pdf"
+            )
+            self.assertTrue(archived_approval.is_file())
+
     def test_new_application_intake_creates_case(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             base = Path(temporary_dir)
@@ -321,24 +412,49 @@ class MigrationTest(unittest.TestCase):
             self.assertGreaterEqual(candidate["confidence"], 80)
             self.assertEqual(review["unresolved_pdfs"], [])
 
-            excel_path = export_approval_review_excel(review, primary)
-            workbook = load_workbook(excel_path)
-            try:
-                sheet = workbook["待审核"]
-                sheet["A2"] = "确认匹配"
-                sheet["C2"] = "人工核对施工内容与日期后确认"
-                workbook.save(excel_path)
-            finally:
-                workbook.close()
-
-            decisions = import_excel_decisions(review, primary)
+            html_path = export_approval_review_html(review, primary)
+            decision_payload = {
+                "source_dataset_revision": review[
+                    "source_dataset_revision"
+                ],
+                "decisions": [
+                    {
+                        "review_id": candidate["review_id"],
+                        "decision": "确认匹配",
+                        "review_note": "人工核对施工内容与日期后确认",
+                        "pdf_sha256": candidate["pdf"]["sha256"],
+                        "case_id": candidate["case"]["case_id"],
+                    }
+                ],
+            }
+            tampered_payload = deepcopy(decision_payload)
+            tampered_payload["decisions"][0]["pdf_sha256"] = "tampered"
+            with self.assertRaisesRegex(ValueError, "SHA-256"):
+                save_review_payload(
+                    review,
+                    tampered_payload,
+                    int(dataset.get("dataset_revision") or 0),
+                )
+            with self.assertRaisesRegex(ValueError, "正式数据已更新"):
+                save_review_payload(
+                    review,
+                    decision_payload,
+                    int(dataset.get("dataset_revision") or 0) + 1,
+                )
+            save_review_payload(
+                review,
+                decision_payload,
+                int(dataset.get("dataset_revision") or 0),
+            )
+            decisions = import_json_decisions(review)
             applied = apply_review_decisions(
                 dataset,
                 review,
                 decisions,
                 primary,
             )
-            self.assertEqual(applied, 1)
+            self.assertEqual(applied["confirmed"], 1)
+            self.assertEqual(applied["trashed"], 0)
             application = dataset["applications"][0]
             self.assertEqual(application["status"], "approved")
             self.assertEqual(
@@ -359,9 +475,7 @@ class MigrationTest(unittest.TestCase):
                     / "工程类-主体质保施工_编号：202607240099.pdf"
                 ).is_file()
             )
-            self.assertTrue(
-                (primary / APPROVAL_REVIEW_EXCEL_FILE_NAME).is_file()
-            )
+            self.assertTrue(html_path.is_file())
 
     def test_review_outputs_only_top_strict_candidate_per_inbox_pdf(
         self,
@@ -486,29 +600,79 @@ class MigrationTest(unittest.TestCase):
                 review_path.name,
                 APPROVAL_REVIEW_DATA_FILE_NAME,
             )
-            excel_path = export_approval_review_excel(review, primary)
-            self.assertEqual(
-                excel_path.name,
-                APPROVAL_REVIEW_EXCEL_FILE_NAME,
+            retired_excel = (
+                primary / RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME
             )
-            workbook = load_workbook(excel_path, data_only=False)
-            try:
-                self.assertEqual(
-                    workbook.sheetnames,
-                    ["待审核", "无严格候选", "已处理决定", "说明"],
+            retired_excel.write_bytes(b"retired workbook")
+            html_path = export_approval_review_html(review, primary)
+            self.assertEqual(
+                html_path.name,
+                APPROVAL_REVIEW_HTML_FILE_NAME,
+            )
+            html = html_path.read_text(encoding="utf-8")
+            self.assertIn("保存审核结果到 JSON", html)
+            self.assertNotIn("showOpenFilePicker", html)
+            self.assertIn("打开待人工审核匹配PDF.cmd", html)
+            self.assertIn("移至 _trash", html)
+            self.assertIn(matching_pdf.name, html)
+            self.assertIn(unresolved_pdf.name, html)
+            self.assertIn('"confidence": 98', html)
+            launcher = primary / APPROVAL_REVIEW_LAUNCHER_FILE_NAME
+            self.assertTrue(launcher.is_file())
+            self.assertIn(
+                "approval-review-server",
+                launcher.read_text(encoding="utf-8"),
+            )
+            self.assertFalse(retired_excel.exists())
+            self.assertTrue(
+                (
+                    primary
+                    / ".docflow"
+                    / "legacy"
+                    / RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME
+                ).is_file()
+            )
+
+            unresolved_item = review["unresolved_pdfs"][0]
+            save_review_payload(
+                review,
+                {
+                    "source_dataset_revision": review[
+                        "source_dataset_revision"
+                    ],
+                    "decisions": [
+                        {
+                            "review_id": unresolved_item["review_id"],
+                            "decision": "移至_trash",
+                            "review_note": "人工确认不是有效审批单",
+                            "pdf_sha256": unresolved_item["pdf"]["sha256"],
+                            "case_id": "",
+                        }
+                    ],
+                },
+                int(dataset.get("dataset_revision") or 0),
+            )
+            trash_result = apply_review_decisions(
+                dataset,
+                review,
+                import_json_decisions(review),
+                primary,
+            )
+            self.assertEqual(trash_result["confirmed"], 0)
+            self.assertEqual(trash_result["trashed"], 1)
+            self.assertFalse(unresolved_pdf.exists())
+            trashed_pdf = primary / "_trash" / unresolved_pdf.name
+            self.assertTrue(trashed_pdf.is_file())
+            self.assertEqual(
+                sha256_file(trashed_pdf),
+                unresolved_hash,
+            )
+            self.assertFalse(
+                any(
+                    item.get("sha256") == unresolved_hash
+                    for item in dataset.get("unmatched_files") or []
                 )
-                pending_sheet = workbook["待审核"]
-                self.assertEqual(pending_sheet.max_row, 2)
-                self.assertEqual(pending_sheet["D2"].value, 0.98)
-                self.assertIn("待人工审核", str(pending_sheet["B2"].value))
-                unresolved_sheet = workbook["无严格候选"]
-                self.assertEqual(unresolved_sheet.max_row, 2)
-                self.assertEqual(
-                    unresolved_sheet["C2"].value,
-                    unresolved_pdf.name,
-                )
-            finally:
-                workbook.close()
+            )
 
 
 if __name__ == "__main__":

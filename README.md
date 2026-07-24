@@ -7,9 +7,10 @@
 - `质保作业申请数据.json` 是唯一事实数据源。
 - `质保作业申请汇总.xlsx` 只用于人工调阅，由 JSON 单向生成。
 - 仅 `_inbox` 第一层中未自动匹配的审批 PDF 使用独立的
-  `待人工审核匹配PDF.json/.xlsx` 闭环处理。
+  `待人工审核匹配PDF.json/.html` 闭环处理。
 - 自动唯一匹配成功的审批 PDF 视为可信，直接归档，不进入人工审核。
-- 人工只编辑审核 Excel 的结果和备注；程序校验后先留存审核决定，再同步正式 JSON/Excel。
+- 人工在本地 HTML 页面填写审核结果和备注；页面只回写审核 JSON，
+  应用命令校验后再同步正式 JSON/Excel。
 - Word 申请单是案卷锚点，每份申请建立独立目录。
 - AI 客户端和识别缓存由所有支流程共享，同一内容不会重复识别。
 - 文件移动、复制和隔离均记录在 JSON 的 `changes` 中。
@@ -19,7 +20,9 @@
 
 ```text
 质保作业申请单/
-├─ _inbox/                  # 人工放入的新申请材料和飞书审批 PDF
+├─ _input/                  # 唯一人工投放入口
+├─ _inbox/                  # 程序分类后的内部待处理区
+├─ _trash/                  # 人工判定删除的 PDF，可恢复
 ├─ _templates/
 │  └─ 01 安全生产及消防安全协议（建工）.pdf
 ├─ _cases/
@@ -36,44 +39,49 @@
 ├─ 质保作业申请数据.json
 ├─ 质保作业申请汇总.xlsx
 ├─ 待人工审核匹配PDF.json
-└─ 待人工审核匹配PDF.xlsx
+├─ 待人工审核匹配PDF.html
+└─ 打开待人工审核匹配PDF.cmd
 ```
 
 ## 两阶段工作流
 
 ### 1. 申报材料入库
 
-1. 人工将 Word、手签图片、施工人员名单和专项作业材料放入 `_inbox`。
-2. 系统解析 Word 中的日期、施工内容、区域和危险作业。
-3. 创建独立案卷目录并统一文件名。
-4. 关联手签图片、人员名单和有限空间/高处作业材料。
-5. 从 `_templates` 复制每份申请必需的安全协议。
-6. 将案卷字段、文件路径、SHA-256、识别结果和缺失材料写入 JSON。
-7. 根据 JSON 更新 Excel，供人工审查和填报飞书。
+1. 人工将 Word、手签图片、施工人员名单和专项作业材料放入 `_input`。
+2. 程序将 Word、图片和非审批 PDF 分类为申请材料并转入内部 `_inbox`。
+3. 系统解析 Word 中的日期、施工内容、区域和危险作业。
+4. 创建独立案卷目录并统一文件名。
+5. 关联手签图片、人员名单和有限空间/高处作业材料。
+6. 从 `_templates` 复制每份申请必需的安全协议。
+7. 将案卷字段、文件路径、SHA-256、识别结果和缺失材料写入 JSON。
+8. 根据 JSON 更新 Excel，供人工审查和填报飞书。
 
 ### 2. 审批 PDF 回传
 
-1. 人工将飞书审批通过生成的 PDF 放入 `_inbox`。
-2. 系统优先读取 PDF 文本，必要时调用本地多模态模型 OCR。
-3. 按施工区域、内容、开始时间和结束时间匹配已有案卷。
-4. 提取申请编号，规范命名并移动到对应案卷目录。
-5. 更新 JSON 中的审批信息和案卷状态。
-6. 根据 JSON 更新 Excel。
+1. 人工将飞书审批通过生成的 PDF 放入 `_input`。
+2. 系统优先读取 PDF 文本，必要时调用本地多模态模型 OCR，判断是否为
+   “工程类-主体质保施工”审批 PDF。
+3. 审批 PDF 转入内部 `_inbox` 的审批归档流程；其他 PDF 标记为申请材料，
+   不会进入审批匹配。
+4. 按施工区域、内容、开始时间和结束时间匹配已有案卷。
+5. 提取申请编号，规范命名并移动到对应案卷目录。
+6. 更新 JSON 中的审批信息和案卷状态。
+7. 根据 JSON 更新 Excel。
 
 自动匹配要求唯一且证据完整；成功匹配的结果直接视为可信。只有 `_inbox` 第一层中仍未匹配的 PDF 才进入独立人工审核流程：
 
 1. 施工区域和施工内容必须同时通过严格文本匹配；日期不淘汰候选，
    只根据相差天数降低候选自身匹配度。
 2. 每个 PDF 只保留最高项；若存在第二名，再根据领先差值下调最终选择置信度。
-3. 没有严格候选的 PDF 写入 `unresolved_pdfs`，并在 Excel 的
-   `无严格候选` 工作表单独显示，不强行推荐案卷。
+3. 没有严格候选的 PDF 写入 `unresolved_pdfs`，并在 HTML 的
+   “无严格候选”页签单独显示，不强行推荐案卷。
 4. 结果写入 `待人工审核匹配PDF.json`，并生成
-   `待人工审核匹配PDF.xlsx`。
-5. 人工只在最高候选行选择 `确认匹配` 或 `排除`；排除后重新生成，
-   程序会从剩余严格候选中选择下一名。
+   `待人工审核匹配PDF.html`。
+5. 人工可选择 `确认匹配`、`排除`，或点击“移至 `_trash`”；决定先保存
+   到审核 JSON。
 6. 程序校验案卷不能重复绑定、隐藏 ID 和 SHA-256 未被修改。
-7. 审核决定写回审核 JSON，PDF 归档到案卷，正式 JSON 更新，
-   再由正式 JSON 重建正式汇总 Excel。
+7. 应用审核结果时，确认项归档到案卷，删除项移动到 `_trash`，正式 JSON
+   更新，再由正式 JSON 重建正式汇总 Excel。
 
 ## 案卷状态
 
@@ -132,6 +140,10 @@ python warranty_application_archive.py migrate `
 python warranty_application_archive.py run
 ```
 
+日常只需将文件放入 `_input` 第一层。程序不递归扫描子目录；支持 `.docx`、
+`.jpg`、`.jpeg`、`.png` 和 `.pdf`。PDF 分类结果保存在正式 JSON 的
+`input_routes` 中，识别文本按 SHA-256 缓存。
+
 单独执行支流程：
 
 ```powershell
@@ -140,19 +152,31 @@ python warranty_application_archive.py worker-lists
 python warranty_application_archive.py approval-pdfs
 ```
 
-`approval-pdfs` 会自动刷新未匹配 PDF 的独立审核 JSON/Excel。也可以单独重新生成：
+`approval-pdfs` 会自动刷新未匹配 PDF 的独立审核 JSON/HTML。也可以单独重新生成：
 
 ```powershell
 python warranty_application_archive.py approval-review
 ```
 
-人工填写并关闭 `待人工审核匹配PDF.xlsx` 后，应用审核结果：
+双击 `打开待人工审核匹配PDF.cmd` 启动审核。程序会自动在 Chrome 中打开
+HTML 页面；“保存审核结果到 JSON”固定写入同目录的
+`待人工审核匹配PDF.json`，不会询问保存位置。直接双击 HTML 只能预览，
+不能写入本地文件。
+
+也可以从命令行启动：
+
+```powershell
+python warranty_application_archive.py approval-review-server
+```
+
+页面保存成功后，在另一个终端应用审核结果：
 
 ```powershell
 python warranty_application_archive.py apply-approval-review
 ```
 
-如果正式 JSON 在审核 Excel 生成后发生过版本变化，应用命令会拒绝过期结果，须先重新生成审核文件。
+如果正式 JSON 在审核页面生成后发生过版本变化，页面保存和应用命令都会
+拒绝过期结果，须先重新生成审核文件。
 
 仅从 JSON 重新生成 Excel：
 
@@ -187,14 +211,17 @@ python warranty_application_archive.py validate
 
 正式 Excel 中的 Word、图片、协议、审批 PDF 和案卷目录均提供本地超链接。正式 Excel 不作为数据输入。
 
-独立的 `待人工审核匹配PDF.xlsx` 包含：
+独立的 `待人工审核匹配PDF.html` 包含：
 
-- `待审核`：每个审批 PDF 最多一行，只展示最高置信度严格候选；
-  黄色列允许人工填写。
-- `无严格候选`：区域和内容无法同时严格命中的 PDF，仅供人工查看，
-  不能直接确认归档。
-- `已处理决定`：从审核 JSON 输出的历史确认和排除记录及回写状态。
-- `说明`：匹配规则、置信度含义、操作步骤和数据版本。
+- `最高候选`：每个审批 PDF 最多一张卡片，对比 PDF 识别内容和推荐案卷，
+  可填写审核结果及备注，也可标记移至 `_trash`。
+- `无严格候选`：区域和内容无法同时严格命中的 PDF，可继续保留或标记移至
+  `_trash`。
+- `已处理记录`：从审核 JSON 展示历史确认、排除和移至 `_trash` 记录。
+- 页面会显示置信度、严格候选数、匹配依据和正式数据版本。
+
+原 `待人工审核匹配PDF.xlsx` 不再生成；首次生成 HTML 时会将已有文件移入
+`.docflow/legacy`，保留历史记录。
 
 置信度规则：
 
@@ -229,7 +256,8 @@ src/warranty_application_archive/
 ├─ recognition.py                  # 共享 AI/OCR 与缓存
 ├─ migration.py                    # 旧目录迁移计划与执行
 ├─ workflows.py                    # 申报、人员名单、审批 PDF 支流程
-├─ approval_review.py              # 未匹配审批 PDF 人工审核与回写
+├─ approval_review.py              # 未匹配审批 PDF 候选、决定与正式回写
+├─ approval_review_web.py          # 本地 HTML 审核页与审核 JSON 回写服务
 ├─ excel_export.py                 # JSON → Excel
 ├─ validation.py                   # 数据和成果校验
 └─ legacy.py                       # 迁移期间保留的解析/AI兼容层

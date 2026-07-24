@@ -14,6 +14,7 @@ from .constants import (
     CONFINED_SPACE_ROLE,
     HIGH_ALTITUDE_ROLE,
     IMAGE_SUFFIXES,
+    INPUT_DIR_NAME,
     INTERNAL_DIR_NAME,
     PDF_SUFFIX,
     QUARANTINE_DIR_NAME,
@@ -37,6 +38,9 @@ from .recognition import RecognitionService
 
 
 LOGGER = logging.getLogger(__name__)
+INPUT_ROUTE_VERSION = "input-router-v1"
+APPLICATION_MATERIAL_ROUTE = "application_material"
+APPROVAL_PDF_ROUTE = "approval_pdf"
 
 
 def _change(
@@ -175,6 +179,197 @@ def _classify_recognized_image(text: str) -> str:
     if "高处作业" in normalized or "高空作业" in normalized:
         return HIGH_ALTITUDE_ROLE
     return SIGNED_APPLICATION_ROLE
+
+
+def _is_approval_pdf(path: Path, text: str) -> tuple[bool, str]:
+    if approval_application_no(path.name):
+        return True, "文件名符合审批 PDF 编号格式"
+    normalized_name = legacy.normalize_match_text(path.stem)
+    if "工程类主体质保施工" in normalized_name:
+        return True, "文件名包含工程类主体质保施工"
+    normalized_text = legacy.normalize_match_text(text)
+    if "工程类主体质保施工" in normalized_text:
+        return True, "PDF 内容包含工程类主体质保施工"
+    if (
+        "主体质保施工" in normalized_text
+        and (
+            "申请编号" in normalized_text
+            or "审批编号" in normalized_text
+        )
+    ):
+        return True, "PDF 内容包含主体质保施工及审批编号"
+    return False, "未发现审批 PDF 标题或编号特征"
+
+
+def _unique_inbox_target(inbox: Path, source: Path) -> Path:
+    target = inbox / source.name
+    if not target.exists():
+        return target
+    index = 2
+    while True:
+        candidate = inbox / f"{source.stem}_{index:02d}{source.suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def _quarantine_input_duplicate(
+    source: Path,
+    root: Path,
+    changes: list[dict[str, Any]],
+) -> Path:
+    quarantine = (
+        root
+        / INTERNAL_DIR_NAME
+        / QUARANTINE_DIR_NAME
+        / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        / source.name
+    )
+    quarantine.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(quarantine))
+    changes.append(
+        _change(
+            "quarantine_input_duplicate",
+            source,
+            quarantine,
+            "input_file",
+        )
+    )
+    return quarantine
+
+
+def route_input_files(
+    dataset: dict[str, Any],
+    root: Path,
+    repo_root: Path,
+    checkpoint: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, int]:
+    """Classify the public _input drop zone before business workflows run."""
+    root = root.resolve()
+    input_root = root / INPUT_DIR_NAME
+    inbox = root / "_inbox"
+    input_root.mkdir(parents=True, exist_ok=True)
+    inbox.mkdir(parents=True, exist_ok=True)
+    sources = sorted(
+        path
+        for path in input_root.iterdir()
+        if path.is_file()
+        and not path.name.startswith("~$")
+        and path.suffix.lower()
+        in {*IMAGE_SUFFIXES, ".docx", PDF_SUFFIX}
+    )
+    summary = {
+        "input_files_routed": 0,
+        "approval_pdfs_routed": 0,
+        "application_files_routed": 0,
+        "input_duplicates_quarantined": 0,
+    }
+    if not sources:
+        return summary
+
+    routes = dataset.setdefault("input_routes", [])
+    changes = dataset.setdefault("changes", [])
+    with RecognitionService(dataset, repo_root) as recognition:
+        for source in sources:
+            fingerprint = sha256_file(source)
+            route_kind = APPLICATION_MATERIAL_ROUTE
+            reason = "Word 或图片进入申请材料流程"
+            recognition_method = ""
+            if source.suffix.lower() == PDF_SUFFIX:
+                LOGGER.info("开始判断 _input PDF 类型: %s", source.name)
+                is_approval, reason = _is_approval_pdf(source, "")
+                if is_approval:
+                    recognition_method = "filename"
+                else:
+                    try:
+                        text = recognition.pdf_text(source)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "_input PDF 类型识别失败，保留在 _input: %s (%s)",
+                            source.name,
+                            exc,
+                        )
+                        continue
+                    if checkpoint:
+                        checkpoint(dataset)
+                    is_approval, reason = _is_approval_pdf(
+                        source,
+                        text,
+                    )
+                    recognition_method = str(
+                        (
+                            (dataset.get("recognition_cache") or {})
+                            .get(fingerprint, {})
+                            .get("method", "unknown")
+                        )
+                    )
+                route_kind = (
+                    APPROVAL_PDF_ROUTE
+                    if is_approval
+                    else APPLICATION_MATERIAL_ROUTE
+                )
+                LOGGER.info(
+                    "_input PDF 分类完成: %s -> %s (%s)",
+                    source.name,
+                    (
+                        "审批 PDF 流程"
+                        if is_approval
+                        else "申请材料流程"
+                    ),
+                    reason,
+                )
+
+            existing_target = inbox / source.name
+            if (
+                existing_target.is_file()
+                and sha256_file(existing_target) == fingerprint
+            ):
+                target = _quarantine_input_duplicate(
+                    source,
+                    root,
+                    changes,
+                )
+                summary["input_duplicates_quarantined"] += 1
+                action = "quarantine_duplicate"
+            else:
+                target = _unique_inbox_target(inbox, source)
+                _move_verified(source, target, root)
+                changes.append(
+                    _change(
+                        "route_input",
+                        source,
+                        target,
+                        route_kind,
+                    )
+                )
+                summary["input_files_routed"] += 1
+                action = "routed"
+
+            routes.append(
+                {
+                    "route_version": INPUT_ROUTE_VERSION,
+                    "sha256": fingerprint,
+                    "source_path": relative_posix(
+                        input_root / source.name,
+                        root,
+                    ),
+                    "path": relative_posix(target, root),
+                    "kind": route_kind,
+                    "reason": reason,
+                    "recognition_method": recognition_method,
+                    "action": action,
+                    "routed_at": datetime.now().astimezone().isoformat(
+                        timespec="seconds"
+                    ),
+                }
+            )
+            if route_kind == APPROVAL_PDF_ROUTE:
+                summary["approval_pdfs_routed"] += 1
+            else:
+                summary["application_files_routed"] += 1
+            if checkpoint:
+                checkpoint(dataset)
+    return summary
 
 
 def intake_applications(
@@ -323,11 +518,11 @@ def intake_applications(
         for image in remaining_images:
             try:
                 text = recognition.image_text(image)
-                if checkpoint:
-                    checkpoint(dataset)
             except Exception as exc:
                 LOGGER.warning("新申请材料图片识别失败: %s (%s)", image.name, exc)
                 continue
+            if checkpoint:
+                checkpoint(dataset)
             candidates = [
                 application
                 for application in created
@@ -520,9 +715,20 @@ def ingest_approval_pdfs(
     applications = list(dataset.get("applications") or [])
     unmatched = list(dataset.get("unmatched_files") or [])
     known_paths = {str(item.get("path") or "") for item in unmatched}
+    application_material_pdf_hashes = {
+        str(item.get("sha256") or "")
+        for item in dataset.get("input_routes") or []
+        if item.get("kind") == APPLICATION_MATERIAL_ROUTE
+    }
     inbox = root / "_inbox"
     if inbox.is_dir():
         for path in sorted(inbox.glob("*.pdf")):
+            if sha256_file(path) in application_material_pdf_hashes:
+                LOGGER.info(
+                    "跳过已分类为申请材料的 PDF: %s",
+                    path.name,
+                )
+                continue
             relative = relative_posix(path, root)
             if relative in known_paths:
                 continue
@@ -546,13 +752,13 @@ def ingest_approval_pdfs(
                 continue
             try:
                 text = recognition.pdf_text(path)
-                if checkpoint:
-                    checkpoint(dataset)
             except Exception as exc:
                 item["review_reason"] = f"识别失败: {exc}"
                 retained.append(item)
                 LOGGER.warning("审批 PDF 识别失败: %s (%s)", path.name, exc)
                 continue
+            if checkpoint:
+                checkpoint(dataset)
             candidates = _approval_candidates(path, text, applications)
             if len(candidates) != 1:
                 item["review_reason"] = (

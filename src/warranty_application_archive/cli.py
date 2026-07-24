@@ -12,8 +12,11 @@ from .approval_review import (
     ApprovalReviewRepository,
     apply_review_decisions,
     build_approval_review,
-    export_approval_review_excel,
-    import_excel_decisions,
+    import_json_decisions,
+)
+from .approval_review_web import (
+    export_approval_review_html,
+    serve_approval_review,
 )
 from .config import AppConfig
 from .excel_export import export_excel
@@ -29,6 +32,7 @@ from .workflows import (
     intake_applications,
     ingest_approval_pdfs,
     ingest_worker_lists,
+    route_input_files,
 )
 
 
@@ -75,11 +79,31 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("approval-pdfs", help="处理待入库审批 PDF")
     subparsers.add_parser(
         "approval-review",
-        help="生成未匹配审批 PDF 的独立审核 JSON 和 Excel",
+        help="生成未匹配审批 PDF 的独立审核 JSON 和 HTML",
+    )
+    review_server_parser = subparsers.add_parser(
+        "approval-review-server",
+        help="启动可回写审核 JSON 的本地人工审核页面",
+    )
+    review_server_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="监听地址（默认 127.0.0.1）",
+    )
+    review_server_parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="监听端口（默认 8765）",
+    )
+    review_server_parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="启动后不自动打开浏览器",
     )
     subparsers.add_parser(
         "apply-approval-review",
-        help="读取人工填写的审核 Excel 并同步正式 JSON/Excel",
+        help="读取审核 JSON 中的人工决定并同步正式 JSON/Excel",
     )
     subparsers.add_parser("worker-lists", help="处理待入库施工人员名单")
     subparsers.add_parser("run", help="执行完整增量工作流")
@@ -210,7 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         repository.save(data)
         review_path = review_repository.save(review)
-        review_excel = export_approval_review_excel(
+        review_html = export_approval_review_html(
             review, config.data_root
         )
         print(
@@ -224,11 +248,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                         review.get("unresolved_pdfs") or []
                     ),
                     "review_json": str(review_path),
-                    "review_excel": str(review_excel),
+                    "review_html": str(review_html),
                 },
                 ensure_ascii=False,
                 indent=2,
             )
+        )
+        return 0
+
+    if command == "approval-review-server":
+        if not review_repository.path.is_file():
+            raise FileNotFoundError(
+                "尚未生成审核 JSON，请先运行 approval-review"
+            )
+        export_approval_review_html(
+            review_repository.load(),
+            config.data_root,
+        )
+        serve_approval_review(
+            config.data_root,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_open,
         )
         return 0
 
@@ -244,21 +285,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "审核文件对应的正式数据版本已过期，请先运行 "
                 "approval-review 重新生成审核文件"
             )
-        decisions = import_excel_decisions(review, config.data_root)
-        applied = apply_review_decisions(
+        decisions = import_json_decisions(review)
+        apply_result = apply_review_decisions(
             data,
             review,
             decisions,
             config.data_root,
         )
-        if applied:
+        if apply_result["confirmed"] or apply_result["trashed"]:
             data["dataset_revision"] = current_revision + 1
         append_run(
             data,
             command,
             {
                 "review_decisions_imported": len(decisions),
-                "approval_pdfs_human_confirmed": applied,
+                "approval_pdfs_human_confirmed": apply_result["confirmed"],
+                "approval_pdfs_moved_to_trash": apply_result["trashed"],
             },
         )
         repository.save(data)
@@ -270,7 +312,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             existing=review,
         )
         review_path = review_repository.save(refreshed_review)
-        review_excel = export_approval_review_excel(
+        review_html = export_approval_review_html(
             refreshed_review, config.data_root
         )
         print(
@@ -278,10 +320,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 {
                     **_status(repository),
                     "review_decisions_imported": len(decisions),
-                    "approval_pdfs_human_confirmed": applied,
+                    "approval_pdfs_human_confirmed": apply_result["confirmed"],
+                    "approval_pdfs_moved_to_trash": apply_result["trashed"],
                     "formal_excel": str(formal_excel),
                     "review_json": str(review_path),
-                    "review_excel": str(review_excel),
+                    "review_html": str(review_html),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -303,6 +346,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         approval_count = 0
         worker_list_count = 0
         application_count = 0
+        route_summary = route_input_files(
+            data,
+            config.data_root,
+            repo_root,
+            checkpoint=repository.save,
+        )
         if command in {"applications", "run"}:
             application_count = intake_applications(
                 data,
@@ -319,7 +368,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if command in {"worker-lists", "run"}:
             worker_list_count = ingest_worker_lists(data, config.data_root)
-        changed = application_count + approval_count + worker_list_count
+        changed = (
+            application_count
+            + approval_count
+            + worker_list_count
+            + route_summary["input_files_routed"]
+            + route_summary["input_duplicates_quarantined"]
+        )
         if changed:
             data["dataset_revision"] = int(
                 data.get("dataset_revision") or 0
@@ -331,12 +386,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "applications_ingested": application_count,
                 "approval_pdfs_ingested": approval_count,
                 "worker_lists_ingested": worker_list_count,
+                **route_summary,
             },
         )
         repository.save(data)
         excel_path = export_excel(data, config.data_root)
         review_path = ""
-        review_excel = ""
+        review_html = ""
         if command in {"approval-pdfs", "run"}:
             review = build_approval_review(
                 data,
@@ -346,8 +402,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             repository.save(data)
             review_path = str(review_repository.save(review))
-            review_excel = str(
-                export_approval_review_excel(review, config.data_root)
+            review_html = str(
+                export_approval_review_html(review, config.data_root)
             )
         print(
             json.dumps(
@@ -356,9 +412,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "applications_ingested": application_count,
                     "approval_pdfs_ingested": approval_count,
                     "worker_lists_ingested": worker_list_count,
+                    **route_summary,
                     "excel_file": str(excel_path),
                     "review_json": review_path,
-                    "review_excel": review_excel,
+                    "review_html": review_html,
                 },
                 ensure_ascii=False,
                 indent=2,

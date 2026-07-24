@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import uuid
@@ -9,24 +8,16 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Font, PatternFill, Protection
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.datavalidation import DataValidation
-from openpyxl.worksheet.table import Table, TableStyleInfo
-
 from . import legacy
 from .constants import (
     APPROVAL_PDF_ROLE,
     APPROVAL_REVIEW_DATA_FILE_NAME,
-    APPROVAL_REVIEW_EXCEL_FILE_NAME,
     APPROVAL_REVIEW_SCHEMA_VERSION,
     INBOX_DIR_NAME,
     INTERNAL_DIR_NAME,
     LEGACY_APPROVAL_REVIEW_DATA_FILE_NAME,
-    LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     LEGACY_DIR_NAME,
+    TRASH_DIR_NAME,
 )
 from .file_utils import atomic_replace_text, ensure_within, sha256_file
 from .migration import CASE_NAMESPACE
@@ -34,50 +25,7 @@ from .recognition import RecognitionService
 from .workflows import archive_reviewed_approval_pdf
 
 
-PENDING_HEADERS = [
-    "审核结果",
-    "审核处理状态",
-    "人工备注",
-    "匹配置信度",
-    "置信度等级",
-    "严格候选数",
-    "次高置信度",
-    "领先差值",
-    "匹配依据",
-    "识别方式",
-    "审批PDF文件",
-    "审批编号",
-    "审批施工区域",
-    "审批施工开始",
-    "审批施工结束",
-    "审批施工内容",
-    "候选案卷",
-    "案卷状态",
-    "案卷施工区域",
-    "案卷施工开始",
-    "案卷施工结束",
-    "案卷施工内容",
-    "PDF链接",
-    "案卷目录",
-    "审核ID",
-    "PDF SHA-256",
-    "案卷ID",
-]
-UNRESOLVED_HEADERS = [
-    "处理状态",
-    "未形成候选原因",
-    "审批PDF文件",
-    "审批编号",
-    "审批施工区域",
-    "审批施工开始",
-    "审批施工结束",
-    "审批施工内容",
-    "识别方式",
-    "PDF链接",
-    "PDF SHA-256",
-    "PDF相对路径",
-]
-DECISION_OPTIONS = ("待审核", "确认匹配", "排除")
+DECISION_OPTIONS = ("待审核", "确认匹配", "排除", "移至_trash")
 MATCH_RULE_VERSION = "strict-non-date-relaxed-date-v1"
 NON_DATE_CONFIDENCE = 80
 CASE_STATUS_LABELS = {
@@ -333,6 +281,15 @@ def _review_id(pdf_hash: str, case_id: str) -> str:
     )
 
 
+def _unresolved_review_id(pdf_hash: str) -> str:
+    return str(
+        uuid.uuid5(
+            CASE_NAMESPACE,
+            f"approval-review-unresolved:{pdf_hash}",
+        )
+    )
+
+
 def _direct_inbox_pdf(root: Path, item: dict[str, Any]) -> Path | None:
     try:
         path = ensure_within(
@@ -356,6 +313,14 @@ def build_approval_review(
     root = root.resolve()
     previous = existing or _empty_review(root)
     decisions = list(previous.get("decisions") or [])
+    previous_pending = {
+        str(item.get("review_id") or ""): item
+        for item in previous.get("pending_reviews") or []
+    }
+    previous_unresolved = {
+        str((item.get("pdf") or {}).get("sha256") or ""): item
+        for item in previous.get("unresolved_pdfs") or []
+    }
     excluded_ids = {
         str(item.get("review_id") or "")
         for item in decisions
@@ -457,6 +422,17 @@ def build_approval_review(
                     reason = "施工区域和施工内容未在同一案卷同时严格命中"
                 unresolved.append(
                     {
+                        "review_id": _unresolved_review_id(pdf_hash),
+                        "decision": str(
+                            previous_unresolved.get(pdf_hash, {}).get(
+                                "decision", "待审核"
+                            )
+                        ),
+                        "review_note": str(
+                            previous_unresolved.get(pdf_hash, {}).get(
+                                "review_note", ""
+                            )
+                        ),
                         "status": "无严格候选",
                         "reason": reason,
                         "pdf": pdf_payload,
@@ -496,8 +472,16 @@ def build_approval_review(
             pending.append(
                 {
                     "review_id": review_id,
-                    "decision": "待审核",
-                    "review_note": "",
+                    "decision": str(
+                        previous_pending.get(review_id, {}).get(
+                            "decision", "待审核"
+                        )
+                    ),
+                    "review_note": str(
+                        previous_pending.get(review_id, {}).get(
+                            "review_note", ""
+                        )
+                    ),
                     "confidence": confidence,
                     "candidate_match_confidence": candidate_confidence,
                     "confidence_level": _confidence_level(confidence),
@@ -537,430 +521,49 @@ def build_approval_review(
     }
 
 
-def _pending_row(item: dict[str, Any]) -> list[Any]:
-    pdf = item.get("pdf") or {}
-    case = item.get("case") or {}
-    runner_up = item.get("runner_up_confidence")
-    confidence_gap = item.get("confidence_gap")
-    return [
-        item.get("decision", "待审核"),
-        "待人工审核",
-        item.get("review_note", ""),
-        float(item.get("confidence", 0)) / 100,
-        item.get("confidence_level", ""),
-        item.get("strict_candidate_count", 0),
-        (
-            float(runner_up) / 100
-            if isinstance(runner_up, (int, float))
-            else ""
-        ),
-        (
-            float(confidence_gap) / 100
-            if isinstance(confidence_gap, (int, float))
-            else ""
-        ),
-        item.get("matching_evidence", ""),
-        pdf.get("recognition_method", ""),
-        pdf.get("file_name", ""),
-        pdf.get("application_no", ""),
-        pdf.get("area", ""),
-        pdf.get("start", ""),
-        pdf.get("end", ""),
-        pdf.get("content", ""),
-        case.get("case_name", ""),
-        CASE_STATUS_LABELS.get(
-            str(case.get("status") or ""),
-            case.get("status", ""),
-        ),
-        case.get("area", ""),
-        case.get("start", ""),
-        case.get("end", ""),
-        case.get("content", ""),
-        "打开审批PDF",
-        "打开案卷目录",
-        item.get("review_id", ""),
-        pdf.get("sha256", ""),
-        case.get("case_id", ""),
-    ]
-
-
-def _unresolved_row(item: dict[str, Any]) -> list[Any]:
-    pdf = item.get("pdf") or {}
-    return [
-        item.get("status", "无严格候选"),
-        item.get("reason", ""),
-        pdf.get("file_name", ""),
-        pdf.get("application_no", ""),
-        pdf.get("area", ""),
-        pdf.get("start", ""),
-        pdf.get("end", ""),
-        pdf.get("content", ""),
-        pdf.get("recognition_method", ""),
-        "打开审批PDF",
-        pdf.get("sha256", ""),
-        pdf.get("path", ""),
-    ]
-
-
-def _format_table_sheet(sheet: Any, rows: int, columns: int) -> None:
-    sheet.sheet_view.showGridLines = False
-    sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = (
-        f"A1:{get_column_letter(columns)}{max(2, rows + 1)}"
-    )
-    header_fill = PatternFill("solid", fgColor="44546A")
-    for cell in sheet[1]:
-        cell.fill = header_fill
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    for row in sheet.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-    sheet.row_dimensions[1].height = 28
-
-
-def export_approval_review_excel(
-    review: dict[str, Any], root: Path
-) -> Path:
-    root = root.resolve()
-    workbook = Workbook()
-    workbook.calculation.fullCalcOnLoad = True
-    workbook.calculation.forceFullCalc = True
-    sheet = workbook.active
-    sheet.title = "待审核"
-    sheet.append(PENDING_HEADERS)
-    pending = list(review.get("pending_reviews") or [])
-    for item in pending:
-        sheet.append(_pending_row(item))
-    _format_table_sheet(sheet, len(pending), len(PENDING_HEADERS))
-    if pending:
-        table = Table(
-            displayName="ApprovalReviewCandidates",
-            ref=(
-                f"A1:{get_column_letter(len(PENDING_HEADERS))}"
-                f"{len(pending) + 1}"
-            ),
-        )
-        table.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium2",
-            showRowStripes=True,
-            showFirstColumn=False,
-            showLastColumn=False,
-            showColumnStripes=False,
-        )
-        sheet.add_table(table)
-        validation = DataValidation(
-            type="list",
-            formula1='"待审核,确认匹配,排除"',
-            allow_blank=False,
-        )
-        validation.error = "请选择：待审核、确认匹配或排除"
-        validation.errorTitle = "审核结果无效"
-        sheet.add_data_validation(validation)
-        validation.add(f"A2:A{len(pending) + 1}")
-        sheet.conditional_formatting.add(
-            f"A2:A{len(pending) + 1}",
-            FormulaRule(
-                formula=['$A2="确认匹配"'],
-                fill=PatternFill("solid", fgColor="C6EFCE"),
-            ),
-        )
-        sheet.conditional_formatting.add(
-            f"A2:A{len(pending) + 1}",
-            FormulaRule(
-                formula=['$A2="排除"'],
-                fill=PatternFill("solid", fgColor="FFC7CE"),
-            ),
-        )
-        sheet.conditional_formatting.add(
-            f"D2:D{len(pending) + 1}",
-            FormulaRule(
-                formula=["$D2>=0.95"],
-                fill=PatternFill("solid", fgColor="C6EFCE"),
-            ),
-        )
-        sheet.conditional_formatting.add(
-            f"D2:D{len(pending) + 1}",
-            FormulaRule(
-                formula=['AND($D2>=0.85,$D2<0.95)'],
-                fill=PatternFill("solid", fgColor="FFF2CC"),
-            ),
-        )
-        sheet.conditional_formatting.add(
-            f"D2:D{len(pending) + 1}",
-            FormulaRule(
-                formula=["$D2<0.85"],
-                fill=PatternFill("solid", fgColor="FCE4D6"),
-            ),
-        )
-    editable_fill = PatternFill("solid", fgColor="FFF2CC")
-    for row_index in range(2, len(pending) + 2):
-        sheet.cell(row=row_index, column=2).value = (
-            f'=IF(A{row_index}="确认匹配","已确认匹配，待执行回写",'
-            f'IF(A{row_index}="排除","已排除，待执行回写","待人工审核"))'
-        )
-        for column_index in (1, 3):
-            sheet.cell(row=row_index, column=column_index).fill = editable_fill
-            sheet.cell(row=row_index, column=column_index).protection = Protection(
-                locked=False
-            )
-        item = pending[row_index - 2]
-        pdf_path = root / Path(str((item.get("pdf") or {}).get("path") or ""))
-        case_path = root / Path(
-            str((item.get("case") or {}).get("case_directory") or "")
-        )
-        sheet.cell(row=row_index, column=23).hyperlink = str(pdf_path.resolve())
-        sheet.cell(row=row_index, column=24).hyperlink = str(case_path.resolve())
-        for column_index in (23, 24):
-            sheet.cell(row=row_index, column=column_index).font = Font(
-                color="0563C1", underline="single"
-            )
-    widths = [
-        12, 24, 28, 12, 10, 12, 12, 10, 42, 12, 38, 16, 22, 13,
-        13, 32, 42, 24, 22, 13, 13, 32, 16, 16, 38, 68, 38,
-    ]
-    for index, width in enumerate(widths, start=1):
-        sheet.column_dimensions[get_column_letter(index)].width = width
-    for row_index in range(2, len(pending) + 2):
-        for column_index in (4, 7, 8):
-            sheet.cell(row=row_index, column=column_index).number_format = "0%"
-    for column_index in (25, 26, 27):
-        sheet.column_dimensions[get_column_letter(column_index)].hidden = True
-
-    unresolved = workbook.create_sheet("无严格候选")
-    unresolved.append(UNRESOLVED_HEADERS)
-    unresolved_items = list(review.get("unresolved_pdfs") or [])
-    for item in unresolved_items:
-        unresolved.append(_unresolved_row(item))
-    _format_table_sheet(
-        unresolved,
-        len(unresolved_items),
-        len(UNRESOLVED_HEADERS),
-    )
-    if unresolved_items:
-        unresolved_table = Table(
-            displayName="ApprovalReviewUnresolved",
-            ref=(
-                f"A1:{get_column_letter(len(UNRESOLVED_HEADERS))}"
-                f"{len(unresolved_items) + 1}"
-            ),
-        )
-        unresolved_table.tableStyleInfo = TableStyleInfo(
-            name="TableStyleMedium2",
-            showRowStripes=True,
-            showFirstColumn=False,
-            showLastColumn=False,
-            showColumnStripes=False,
-        )
-        unresolved.add_table(unresolved_table)
-    for row_index, item in enumerate(unresolved_items, start=2):
-        pdf_path = root / Path(str((item.get("pdf") or {}).get("path") or ""))
-        unresolved.cell(row=row_index, column=10).hyperlink = str(
-            pdf_path.resolve()
-        )
-        unresolved.cell(row=row_index, column=10).font = Font(
-            color="0563C1",
-            underline="single",
-        )
-        unresolved.cell(row=row_index, column=1).fill = PatternFill(
-            "solid",
-            fgColor="FCE4D6",
-        )
-    unresolved_widths = (
-        16, 38, 42, 16, 24, 13, 13, 32, 12, 16, 68, 48,
-    )
-    for index, width in enumerate(unresolved_widths, start=1):
-        unresolved.column_dimensions[get_column_letter(index)].width = width
-    for column_index in (11, 12):
-        unresolved.column_dimensions[get_column_letter(column_index)].hidden = True
-
-    history = workbook.create_sheet("已处理决定")
-    history_headers = [
-        "处理时间",
-        "审核结果",
-        "回写状态",
-        "人工备注",
-        "审批PDF文件",
-        "PDF SHA-256",
-        "候选案卷",
-        "案卷ID",
-        "审核ID",
-    ]
-    history.append(history_headers)
-    for item in review.get("decisions") or []:
-        history.append(
-            [
-                item.get("decided_at", ""),
-                item.get("decision", ""),
-                (
-                    "已归档，正式案卷状态已更新为审批完成"
-                    if item.get("decision") == "确认匹配"
-                    else "已记录排除"
-                ),
-                item.get("review_note", ""),
-                item.get("pdf_file_name", ""),
-                item.get("pdf_sha256", ""),
-                item.get("case_name", ""),
-                item.get("case_id", ""),
-                item.get("review_id", ""),
-            ]
-        )
-    _format_table_sheet(
-        history,
-        len(review.get("decisions") or []),
-        len(history_headers),
-    )
-    for column, width in zip(
-        "ABCDEFGHI", (22, 12, 38, 32, 42, 68, 42, 38, 38)
-    ):
-        history.column_dimensions[column].width = width
-
-    notes = workbook.create_sheet("说明")
-    notes.sheet_view.showGridLines = False
-    instructions = [
-        ["审批 PDF 人工匹配审核", ""],
-        [
-            "1",
-            "只处理 _inbox 第一层中尚未自动匹配的审批 PDF；"
-            "每个 PDF 在“待审核”中只显示置信度最高的一个严格候选。",
-        ],
-        [
-            "匹配规则",
-            "施工区域和施工内容必须同时严格文本命中；日期不淘汰候选，"
-            "只按相差天数降低置信度。",
-        ],
-        [
-            "置信度",
-            "非日期严格命中占 80%，开始和结束日期合计占 20%；"
-            "“严格候选数、次高置信度、领先差值”用于判断第一名是否稳定。",
-        ],
-        [
-            "无严格候选",
-            "没有通过区域和内容严格门槛的 PDF 单独列在“无严格候选”，"
-            "不会强行推荐案卷。",
-        ],
-        ["2", "只修改黄色的“审核结果”和“人工备注”列。"],
-        [
-            "3",
-            "选择“排除”后重新生成审核表，会在剩余严格候选中选择下一名。",
-        ],
-        [
-            "4",
-            "保存并关闭 Excel 后，运行："
-            "python warranty_application_archive.py apply-approval-review",
-        ],
-        ["5", "命令先保存审核决定，再更新正式 JSON，并从正式 JSON 重建正式汇总 Excel。"],
-        ["正式数据版本", review.get("source_dataset_revision", 0)],
-        ["生成时间", review.get("generated_at", "")],
-        ["匹配规则版本", review.get("match_rule_version", "")],
-        ["待审核 PDF", len(pending)],
-        ["无严格候选 PDF", len(unresolved_items)],
-    ]
-    for row in instructions:
-        notes.append(row)
-    notes.merge_cells("A1:B1")
-    notes["A1"].font = Font(size=16, bold=True, color="FFFFFF")
-    notes["A1"].fill = PatternFill("solid", fgColor="44546A")
-    notes["A1"].alignment = Alignment(horizontal="center")
-    notes.column_dimensions["A"].width = 18
-    notes.column_dimensions["B"].width = 100
-    for row in notes.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-
-    output = root / APPROVAL_REVIEW_EXCEL_FILE_NAME
-    temporary = root / f".{APPROVAL_REVIEW_EXCEL_FILE_NAME}.tmp.xlsx"
-    workbook.save(temporary)
-    try:
-        os.replace(temporary, output)
-    except PermissionError as exc:
-        temporary.unlink(missing_ok=True)
-        raise PermissionError(
-            f"审核 Excel 正在使用，请先关闭后重试: {output}"
-        ) from exc
-    _archive_legacy_artifact(
-        root,
-        root / LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME,
-    )
-    return output
-
-
-def import_excel_decisions(
-    review: dict[str, Any], root: Path
+def import_json_decisions(
+    review: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    path = root.resolve() / APPROVAL_REVIEW_EXCEL_FILE_NAME
-    if not path.is_file():
-        legacy_path = (
-            root.resolve() / LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME
-        )
-        path = legacy_path if legacy_path.is_file() else path
-    if not path.is_file():
-        raise FileNotFoundError(f"待人工审核匹配 PDF Excel 不存在: {path}")
-    workbook = load_workbook(path, read_only=False, data_only=False)
-    try:
-        if "待审核" not in workbook.sheetnames:
-            raise ValueError("审核 Excel 缺少“待审核”工作表")
-        sheet = workbook["待审核"]
-        headers = {
-            str(cell.value or "").strip(): cell.column
-            for cell in sheet[1]
-        }
-        missing = [header for header in PENDING_HEADERS if header not in headers]
-        if missing:
-            raise ValueError(f"审核 Excel 缺少列: {', '.join(missing)}")
-        expected = {
-            str(item.get("review_id") or ""): item
-            for item in review.get("pending_reviews") or []
-        }
-        imported: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        for row_index in range(2, sheet.max_row + 1):
-            review_id = str(
-                sheet.cell(row_index, headers["审核ID"]).value or ""
-            ).strip()
-            if not review_id:
-                continue
-            if review_id in seen_ids:
-                raise ValueError(f"审核 Excel 中审核ID重复: {review_id}")
-            seen_ids.add(review_id)
-            item = expected.get(review_id)
-            if item is None:
-                raise ValueError(
-                    f"审核 Excel 含有过期或未知审核ID: {review_id}"
-                )
-            decision = str(
-                sheet.cell(row_index, headers["审核结果"]).value or ""
-            ).strip()
-            if decision not in DECISION_OPTIONS:
-                raise ValueError(
-                    f"第 {row_index} 行审核结果无效: {decision}"
-                )
-            pdf_hash = str(
-                sheet.cell(row_index, headers["PDF SHA-256"]).value or ""
-            ).strip()
-            case_id = str(
-                sheet.cell(row_index, headers["案卷ID"]).value or ""
-            ).strip()
-            if pdf_hash != str((item.get("pdf") or {}).get("sha256") or ""):
-                raise ValueError(f"第 {row_index} 行 PDF SHA-256 被修改")
-            if case_id != str((item.get("case") or {}).get("case_id") or ""):
-                raise ValueError(f"第 {row_index} 行案卷ID被修改")
-            if decision != "待审核":
-                imported.append(
-                    {
-                        **item,
-                        "decision": decision,
-                        "review_note": str(
-                            sheet.cell(
-                                row_index, headers["人工备注"]
-                            ).value
-                            or ""
-                        ).strip(),
-                    }
-                )
-        return imported
-    finally:
-        workbook.close()
+    imported: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    review_items = [
+        *(review.get("pending_reviews") or []),
+        *(review.get("unresolved_pdfs") or []),
+    ]
+    unresolved_ids = {
+        str(item.get("review_id") or "")
+        for item in review.get("unresolved_pdfs") or []
+    }
+    for item in review_items:
+        review_id = str(item.get("review_id") or "").strip()
+        if not review_id:
+            raise ValueError("审核 JSON 中存在缺少审核ID的候选")
+        if review_id in seen_ids:
+            raise ValueError(f"审核 JSON 中审核ID重复: {review_id}")
+        seen_ids.add(review_id)
+        decision = str(item.get("decision") or "待审核").strip()
+        if decision not in DECISION_OPTIONS:
+            raise ValueError(
+                f"审核 JSON 中审核结果无效: {review_id}={decision}"
+            )
+        if (
+            review_id in unresolved_ids
+            and decision not in {"待审核", "移至_trash"}
+        ):
+            raise ValueError(
+                f"无严格候选 PDF 只允许待审核或移至_trash: {review_id}"
+            )
+        if decision != "待审核":
+            imported.append(
+                {
+                    **item,
+                    "decision": decision,
+                    "review_note": str(
+                        item.get("review_note") or ""
+                    ).strip(),
+                }
+            )
+    return imported
 
 
 def apply_review_decisions(
@@ -968,9 +571,12 @@ def apply_review_decisions(
     review: dict[str, Any],
     decisions: list[dict[str, Any]],
     root: Path,
-) -> int:
+) -> dict[str, int]:
     confirmed = [
         item for item in decisions if item.get("decision") == "确认匹配"
+    ]
+    trashed = [
+        item for item in decisions if item.get("decision") == "移至_trash"
     ]
     counts: dict[str, int] = {}
     selected_cases: set[str] = set()
@@ -999,12 +605,12 @@ def apply_review_decisions(
             and _direct_inbox_pdf(root.resolve(), item) is not None
         )
     }
-    for item in confirmed:
+    for item in [*confirmed, *trashed]:
         pdf_hash = str((item.get("pdf") or {}).get("sha256") or "")
         case_id = str((item.get("case") or {}).get("case_id") or "")
         if pdf_hash not in unmatched:
             raise ValueError(f"审批 PDF 已不在待匹配列表: {pdf_hash}")
-        if case_id not in applications:
+        if item.get("decision") == "确认匹配" and case_id not in applications:
             raise ValueError(f"案卷已不存在: {case_id}")
         path = ensure_within(
             root / Path(str(unmatched[pdf_hash].get("path") or "")),
@@ -1057,19 +663,73 @@ def apply_review_decisions(
         )
         applied_hashes.add(pdf_hash)
 
+    trashed_hashes: set[str] = set()
+    for item in trashed:
+        pdf_hash = str((item.get("pdf") or {}).get("sha256") or "")
+        unmatched_item = unmatched[pdf_hash]
+        source = ensure_within(
+            root / Path(str(unmatched_item.get("path") or "")),
+            root,
+        )
+        trash_root = ensure_within(root / TRASH_DIR_NAME, root)
+        trash_root.mkdir(parents=True, exist_ok=True)
+        target = trash_root / source.name
+        index = 2
+        while target.exists():
+            target = (
+                trash_root
+                / f"{source.stem}_{index:02d}{source.suffix}"
+            )
+            index += 1
+        shutil.move(str(source), str(target))
+        if sha256_file(target) != pdf_hash:
+            raise RuntimeError(f"PDF 移入 _trash 后哈希校验失败: {target}")
+        dataset.setdefault("changes", []).append(
+            {
+                "action": "move_to_trash_after_human_review",
+                "source": str(source),
+                "target": str(target),
+                "role": APPROVAL_PDF_ROLE,
+                "case_id": "",
+                "result": "completed",
+                "review_id": str(item.get("review_id") or ""),
+                "at": decided_at,
+            }
+        )
+        for history_item in reversed(decision_history):
+            if (
+                history_item.get("review_id") == item.get("review_id")
+                and history_item.get("decision") == "移至_trash"
+            ):
+                history_item["result_path"] = str(
+                    target.relative_to(root).as_posix()
+                )
+                break
+        trashed_hashes.add(pdf_hash)
+
+    if trashed_hashes:
+        dataset["unmatched_files"] = [
+            item
+            for item in dataset.get("unmatched_files") or []
+            if str(item.get("sha256") or "") not in trashed_hashes
+        ]
+
     excluded_ids = {
         str(item.get("review_id") or "")
         for item in decisions
-        if item.get("decision") == "排除"
+        if item.get("decision") in {"排除", "移至_trash"}
     }
     review["pending_reviews"] = [
         item
         for item in review.get("pending_reviews") or []
         if (
             str((item.get("pdf") or {}).get("sha256") or "")
-            not in applied_hashes
+            not in {*applied_hashes, *trashed_hashes}
             and str(item.get("review_id") or "") not in excluded_ids
         )
     ]
     review["last_applied_at"] = decided_at
-    return len(confirmed)
+    return {
+        "confirmed": len(confirmed),
+        "trashed": len(trashed),
+    }
