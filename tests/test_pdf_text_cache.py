@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import docflow_renamer
+from src.docflow_renamer import legacy as docflow_renamer
 
 
 class PdfTextCacheTest(unittest.TestCase):

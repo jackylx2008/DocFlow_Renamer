@@ -1,0 +1,21 @@
+[project]
+name = "docflow-renamer"
+version = "0.2.0"
+description = "质保作业申请案卷归档与人工审查数据生成"
+requires-python = ">=3.11"
+dependencies = [
+    "PyMuPDF",
+    "PyYAML",
+    "openpyxl",
+    "python-docx",
+]
+
+[project.scripts]
+docflow-renamer = "docflow_renamer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["docflow_renamer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

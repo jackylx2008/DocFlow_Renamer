@@ -1,22 +1,80 @@
 # DocFlow Renamer
 
-质保作业申请单批处理工具。脚本会读取输入目录中的 Word 申请单，解析表单字段，按日期和施工内容重命名文件，并导出 Excel 汇总表。汇总表还会按施工区域、施工内容、施工开始时间和施工结束时间匹配同目录下的工程类主体质保施工 PDF。
+质保作业申请案卷归档工具。项目以一份质保申请为一个案卷，完成申报材料入库、统一命名、审批 PDF 回传、JSON 归档和 Excel 人工审查视图生成。
 
-## 功能
+## 核心原则
 
-- 解析 Word 申请单中的项目名称、质保单位、施工区域、施工日期、施工内容、负责人、危险作业等字段。
-- 将申请单重命名为 `YYYY-MM-DD_施工内容_质保作业申请单.docx`。
-- 自动关联同名或同目录下的申请单图片、附件目录。
-- 对随机文件名的申请单图片调用本地 LLAMACPP 多模态模型识别文字，并按匹配到的申请单复制/重命名为同名图片。
-- 将文件名包含 `人员名单` 或 `工人名单` 的图片，按修改日期匹配同一天的申请单，复制生成为对应的申请单工人名单图片。
-- 导出 `质保作业申请汇总.xlsx`，如果目标文件已存在，会生成带时间戳的新汇总文件。
-- 匹配工程类主体质保施工 PDF，并在 Excel 的 `匹配PDF文件名` 列写入结果和本地链接。
-- 普通 PDF 文本不可用时自动使用本地 LLAMACPP 多模态模型识别。
-- 按 PDF 内容的 SHA-256 特征持久化文本提取和 OCR 结果，避免后续运行重复识别内容未变化的 PDF。
-- `docflow_renamer.py` 会自动识别包含 `工程类-主体质保施工` 和 `申请编号` 的 PDF，并重命名为 `工程类-主体质保施工_编号：12位编号.pdf`；已符合该命名规则的 PDF 会跳过识别。
-- 可通过 `manual_matches.env` 配置少量手工特例，直接指定 Excel 汇总中的申请单附图和匹配 PDF。
-- 可单独识别输入目录第一层的 `1.pdf`、`2.pdf` 等纯数字 PDF，提取 `申请编号` 后的 12 位编码，并重命名为 `工程类-主体质保施工_编号：申请编号.pdf`。
-- 脚本运行日志会写入 `log` 目录，日志文件名前缀与入口 Python 文件名一致。
+- `质保作业申请数据.json` 是唯一事实数据源。
+- `质保作业申请汇总.xlsx` 只用于人工调阅，由 JSON 单向生成。
+- 未自动匹配的审批 PDF 使用独立的 `审批PDF匹配审核.json/.xlsx` 闭环处理。
+- 人工只编辑审核 Excel 的结果和备注；程序校验后先留存审核决定，再同步正式 JSON/Excel。
+- Word 申请单是案卷锚点，每份申请建立独立目录。
+- AI 客户端和识别缓存由所有支流程共享，同一内容不会重复识别。
+- 文件移动、复制和隔离均记录在 JSON 的 `changes` 中。
+- 不直接删除重复文件；重复件和已处理的公共源文件进入 `.docflow/quarantine`。
+
+## 资料目录
+
+```text
+质保作业申请单/
+├─ _inbox/                  # 人工放入的新申请材料和飞书审批 PDF
+├─ _templates/
+│  └─ 01 安全生产及消防安全协议（建工）.pdf
+├─ _cases/
+│  └─ 2026-07-24_维修冷塔_质保作业申请单/
+│     ├─ 2026-07-24_维修冷塔_质保作业申请单.docx
+│     ├─ 2026-07-24_维修冷塔_质保作业申请单_手签_01.jpg
+│     ├─ 2026-07-24_维修冷塔_质保作业申请单_施工人员名单_01.jpg
+│     ├─ 2026-07-24_维修冷塔_质保作业申请单_有限空间申请_01.pdf
+│     ├─ 2026-07-24_维修冷塔_01 安全生产及消防安全协议（建工）.pdf
+│     └─ 工程类-主体质保施工_编号：202607240001.pdf
+├─ .docflow/
+│  ├─ legacy/               # 迁移前的旧版汇总表
+│  └─ quarantine/           # 可恢复的重复件和已处理公共源文件
+├─ 质保作业申请数据.json
+├─ 质保作业申请汇总.xlsx
+├─ 审批PDF匹配审核.json
+└─ 审批PDF匹配审核.xlsx
+```
+
+## 两阶段工作流
+
+### 1. 申报材料入库
+
+1. 人工将 Word、手签图片、施工人员名单和专项作业材料放入 `_inbox`。
+2. 系统解析 Word 中的日期、施工内容、区域和危险作业。
+3. 创建独立案卷目录并统一文件名。
+4. 关联手签图片、人员名单和有限空间/高处作业材料。
+5. 从 `_templates` 复制每份申请必需的安全协议。
+6. 将案卷字段、文件路径、SHA-256、识别结果和缺失材料写入 JSON。
+7. 根据 JSON 更新 Excel，供人工审查和填报飞书。
+
+### 2. 审批 PDF 回传
+
+1. 人工将飞书审批通过生成的 PDF 放入 `_inbox`。
+2. 系统优先读取 PDF 文本，必要时调用本地多模态模型 OCR。
+3. 按施工区域、内容、开始时间和结束时间匹配已有案卷。
+4. 提取申请编号，规范命名并移动到对应案卷目录。
+5. 更新 JSON 中的审批信息和案卷状态。
+6. 根据 JSON 更新 Excel。
+
+自动匹配要求唯一且证据完整。未自动匹配的 PDF 不使用宽松规则直接归档，而是进入独立人工审核流程：
+
+1. 系统为每个未匹配 PDF 和每个尚未归档审批单的案卷建立候选关系。
+2. 施工内容、施工区域及起止日期差异转成候选评分和可读匹配依据。
+3. 候选关系写入 `审批PDF匹配审核.json`，并生成 `审批PDF匹配审核.xlsx`。
+4. 人工在 Excel 中将唯一正确的一行改为 `确认匹配`，错误候选可标记为 `排除`。
+5. 程序校验同一 PDF 只能确认一个案卷、案卷不能重复绑定、隐藏 ID 和 SHA-256 未被修改。
+6. 审核决定写回审核 JSON，PDF 归档到案卷，正式 JSON 更新，再由正式 JSON 重建正式汇总 Excel。
+
+## 案卷状态
+
+- `materials_incomplete`：缺少必需申报材料。
+- `materials_ready`：材料齐全，等待人工填报或回传审批 PDF。
+- `approved`：审批 PDF 已匹配并归档。
+- `needs_review`：识别、匹配或文件状态需要人工确认。
+
+已审批案卷仍保留 `missing_material_types`，用于发现历史材料缺失。
 
 ## 安装
 
@@ -26,169 +84,143 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## 配置
-
-默认读取仓库根目录下的 `common.env`：
+默认从 `common.env` 读取资料目录：
 
 ```env
 INPUT_PATH=D:\path\to\质保作业申请单
-SKIP_PDF_FILES=["01 安全生产及消防安全协议（建工）.pdf"]
 ```
 
-`INPUT_PATH` 指向申请单、图片、附件和 PDF 所在目录。`SKIP_PDF_FILES` 使用一行列表配置需要排除匹配的 PDF 文件名；旧的逗号、分号或中文分隔符写法仍兼容。
-
-手工特例读取仓库根目录下的 `manual_matches.env`：
-
-```env
-MANUAL_PDF_MATCHES=[{"application_image":"2026-07-08刷漆质保作业申请单.ipg","pdf":"工程类-主体质保施工_编号：202607070599.pdf"}]
-```
-
-`application_image` 用于定位申请单记录，`pdf` 用于直接写入 Excel 的 `匹配PDF文件名` 并设置本地链接。配置中的图片扩展名如果写成 `.ipg`，脚本会自动尝试同名 `.jpg`、`.jpeg`、`.png` 文件。
-
-也可以通过命令行指定输入目录：
+也可以使用 `--input-dir` 指定：
 
 ```powershell
-python docflow_renamer.py --input-dir "D:\path\to\质保作业申请单"
+python docflow_renamer.py --input-dir "D:\path\to\质保作业申请单" status
 ```
 
-## 运行
+## 旧目录迁移
+
+旧版平铺目录必须先演练。演练只生成计划，不移动资料：
 
 ```powershell
-python docflow_renamer.py
+python docflow_renamer.py migrate
 ```
 
-运行完成后会输出 JSON 摘要，包含输入目录、处理数量、PDF 重命名数量、图片重命名数量、手工 PDF 匹配数量和生成的 Excel 路径。
-
-### 复制生成工人名单图片
-
-如果输入目录下存在文件名包含 `人员名单` 或 `工人名单` 的图片：
-
-```text
-人员名单.jpg
-工人名单.jpg
-现场人员名单.png
-```
-
-可以运行：
+确认计划后，执行迁移时必须提供内容一致的备份目录：
 
 ```powershell
-python copy_worker_list_images.py
+python docflow_renamer.py migrate `
+  --apply `
+  --backup-dir "D:\path\to\质保作业申请单_backup"
 ```
 
-脚本会读取 `INPUT_PATH`，按文件修改日期匹配同一天的 `YYYY-MM-DD_施工内容_质保作业申请单.docx`，并复制生成为：
+执行前会逐文件比较正式目录与备份的大小和 SHA-256。任何差异都会阻止迁移。迁移时还会在每次移动前后再次校验哈希。
 
-```text
-YYYY-MM-DD_施工内容_质保作业申请单_工人名单.源扩展名
+旧版 Excel 只在首次迁移时读取已有 PDF 对应关系，随后归档到 `.docflow/legacy`。迁移完成后 Excel 不再作为缓存或数据输入。
+
+## 日常命令
+
+执行完整增量流程：
+
+```powershell
+python docflow_renamer.py run
 ```
 
-同一天一张名单图片会复制生成给同一天所有申请单；如果同一天存在多张名单图片，脚本只使用按修改时间和文件名排序后的第一张。如果目标图片已存在，脚本会记录日志并跳过，不覆盖已有文件。确认该原始图片对应的所有目标图片都存在后，脚本会删除原始名单图片。
+单独执行支流程：
 
-### 重命名待规范 PDF
-
-如果输入目录第一层存在待识别的纯数字 PDF，或带 `申请编号` 前缀但尚未规范命名的 PDF：
-
-```text
-1.pdf
-2.pdf
-12.pdf
-申请编号： 202606300121.pdf
+```powershell
+python docflow_renamer.py applications
+python docflow_renamer.py worker-lists
+python docflow_renamer.py approval-pdfs
 ```
 
-可以运行：
+`approval-pdfs` 会自动刷新未匹配 PDF 的独立审核 JSON/Excel。也可以单独重新生成：
+
+```powershell
+python docflow_renamer.py approval-review
+```
+
+人工填写并关闭 `审批PDF匹配审核.xlsx` 后，应用审核结果：
+
+```powershell
+python docflow_renamer.py apply-approval-review
+```
+
+如果正式 JSON 在审核 Excel 生成后发生过版本变化，应用命令会拒绝过期结果，须先重新生成审核文件。
+
+仅从 JSON 重新生成 Excel：
+
+```powershell
+python docflow_renamer.py export
+```
+
+查看状态及进行完整校验：
+
+```powershell
+python docflow_renamer.py status
+python docflow_renamer.py validate
+```
+
+`validate` 会检查：
+
+- 案卷 ID 和文件 ID 是否重复。
+- JSON 中的目录和文件是否存在。
+- 文件大小和 SHA-256 是否一致。
+- Excel 工作表结构和汇总行数是否与 JSON 一致。
+
+## Excel 人工审查视图
+
+工作簿包含：
+
+- `申请汇总`
+- `待补材料`
+- `待审批PDF`
+- `已完成`
+- `本次变更`
+- `说明`
+
+正式 Excel 中的 Word、图片、协议、审批 PDF 和案卷目录均提供本地超链接。正式 Excel 不作为数据输入。
+
+独立的 `审批PDF匹配审核.xlsx` 包含：
+
+- `待审核`：一行代表一个“审批 PDF—候选案卷”关系，按评分降序排列；黄色列允许人工填写。
+- `已处理决定`：从审核 JSON 输出的历史确认和排除记录。
+- `说明`：操作步骤、正式数据版本和候选数量。
+
+## 兼容入口
+
+以下脚本仅保留为薄入口，不再包含业务代码：
 
 ```powershell
 python rename_pdfs.py
+python copy_worker_list_images.py
 ```
 
-脚本会调用本地 LLAMACPP 多模态模型识别纯数字 PDF 页面，提取 `申请编号:` 或 `申请编号：` 后面的 12 位数字编码，并重命名为：
+它们分别调用统一工作流中的审批 PDF 和人员名单支流程。
+
+## 项目结构
 
 ```text
-工程类-主体质保施工_编号：123456789012.pdf
+docflow_renamer.py                 # 主命令薄入口
+rename_pdfs.py                     # 审批 PDF 兼容入口
+copy_worker_list_images.py         # 人员名单兼容入口
+src/docflow_renamer/
+├─ cli.py                          # 命令编排
+├─ config.py                       # 配置
+├─ constants.py                    # 目录、状态和材料类型
+├─ repository.py                   # JSON 唯一数据源
+├─ naming.py                       # 案卷及材料命名
+├─ recognition.py                  # 共享 AI/OCR 与缓存
+├─ migration.py                    # 旧目录迁移计划与执行
+├─ workflows.py                    # 申报、人员名单、审批 PDF 支流程
+├─ approval_review.py              # 未匹配审批 PDF 人工审核与回写
+├─ excel_export.py                 # JSON → Excel
+├─ validation.py                   # 数据和成果校验
+└─ legacy.py                       # 迁移期间保留的解析/AI兼容层
 ```
 
-`申请编号： 202606300121.pdf` 这类文件会直接从文件名提取编号，不再调用 AI 识别。只扫描输入目录第一层的纯数字 PDF 和 `申请编号` 前缀 PDF；`d1.pdf`、`a1.pdf`、子目录内 PDF 不会处理。如果目标文件已存在，脚本会在日志中记录重名文件、保留文件和申请编号，保留已有的规范命名文件，并删除本次识别出的多余 PDF。
-
-默认识别每个 PDF 前 2 页，可以通过参数调整：
+## 开发验证
 
 ```powershell
-python rename_pdfs.py --page-limit 3
-python rename_pdfs.py --input-dir "D:\path\to\质保作业申请单"
-```
-
-## 图片匹配规则
-
-`docflow_renamer.py` 会扫描输入目录第一层中尚未按日期命名的 `.jpg`、`.jpeg`、`.png` 图片，调用本地 LLAMACPP 多模态模型识别图片文字，再用识别文本中的施工内容匹配近期申请单文件名。
-
-申请单候选默认限定为运行日前 2 天至后 14 天，适合提前制作未来日期申请单的场景，同时避免历史文件过多导致误匹配。
-
-## PDF 匹配规则
-
-`docflow_renamer.py` 会先处理待规范 PDF 文件名。对尚未命名为 `工程类-主体质保施工_编号：12位编号.pdf` 的 PDF，脚本会调用本地 LLAMACPP 多模态模型识别 PDF 前两页；识别文本同时包含 `工程类-主体质保施工` 和 `申请编号：12位数字` 或 `申请编号:12位数字` 时，会将 PDF 重命名为：
-
-```text
-工程类-主体质保施工_编号：123456789012.pdf
-```
-
-已经符合 `工程类-主体质保施工_编号：12位编号.pdf` 命名规则的 PDF 不会进入 AI 识别和重命名流程。
-
-如果 AI 识别出的目标文件名已经存在，脚本会在日志中显示重名来源、保留文件及申请编号；已有的规范命名 PDF 会被保留，本次识别出的多余 PDF 会被删除。
-
-PDF 匹配会先建立输入目录下所有 PDF 的文本索引。对中文文本提取失败的 PDF，脚本会将 PDF 前两页渲染为图片，并通过本地 LLAMACPP 多模态模型识别文字。
-
-PDF 文本提取或 AI OCR 成功后，会在输入目录的 `.docflow_pdf_text_cache.json` 中按文件内容的 SHA-256 特征保存文本。后续运行即使 PDF 没有匹配到 Word，或文件名发生变化，只要内容未改变就会直接复用缓存；PDF 内容变化后会生成新特征并重新识别。
-
-匹配时会对文本做归一化处理：
-
-- 移除空白并统一大小写。
-- 统一横线符号。
-- 统一全角/半角括号。
-- 统一中文逗号、顿号和英文逗号。
-
-候选 PDF 需要同时满足：
-
-- PDF 文本包含申请单的施工区域。
-- PDF 文本包含申请单的施工内容。
-
-如果申请单施工内容以施工区域开头，例如 `给水泵房、中水泵房除锈刷漆`，脚本会额外尝试去掉区域前缀后的内容 `除锈刷漆`，用于匹配 PDF 中单独填写的施工内容。
-
-候选 PDF 必须同时满足施工开始时间和施工结束时间与申请单汇总记录完全一致。时间是硬性匹配条件，不再只在出现多个候选 PDF 时用开始日期辅助筛选；任一时间缺失或不一致都不会自动匹配。
-
-已有汇总表中的非空 PDF 匹配结果会作为缓存读取，缓存键包含施工开始时间、施工结束时间、施工区域和施工内容。匹配规则升级后，未标记新规则版本的旧汇总缓存会自动失效并重新识别一次，避免沿用旧规则产生的错误匹配。
-
-### 手工 PDF 匹配特例
-
-少量无法通过严格匹配规则对应上的文件，可以写入 `manual_matches.env` 的 `MANUAL_PDF_MATCHES`。这些特例在 Excel 导出前应用，只覆盖汇总记录中的 `申请单附图`、`匹配PDF文件名` 和 `匹配PDF文件链接`，不会改变 AI 识别或严格匹配规则。
-
-当前内置特例：
-
-```text
-2026-07-08刷漆质保作业申请单.ipg -> 工程类-主体质保施工_编号：202607070599.pdf
-```
-
-## 日志
-
-默认日志目录为仓库根目录下的 `log`，也可以通过 `common.env` 的 `LOG_DIR` 或 `config.yaml` 的 `log_dir` 调整。
-
-日志文件名使用入口脚本名加时间戳：
-
-```text
-docflow_renamer_YYYYMMDD_HHMMSS.log
-copy_worker_list_images_YYYYMMDD_HHMMSS.log
-rename_pdfs_YYYYMMDD_HHMMSS.log
-```
-
-本地 llama.cpp 服务的 stdout/stderr 仍分别写入：
-
-```text
-llama_server.out.log
-llama_server.err.log
-```
-
-## 验证
-
-```powershell
-python -m py_compile docflow_renamer.py copy_worker_list_images.py rename_pdfs.py
+python -m compileall -q docflow_renamer.py rename_pdfs.py copy_worker_list_images.py src tests
 python -m unittest discover -s tests -v
-python -m flake8 docflow_renamer.py
-python docflow_renamer.py
+python -m flake8 src tests docflow_renamer.py rename_pdfs.py copy_worker_list_images.py
 ```
