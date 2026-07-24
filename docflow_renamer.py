@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -59,12 +60,17 @@ PDF_TARGET_NAME_PREFIX = "工程类-主体质保施工_编号："
 MIN_PLAIN_PDF_CJK_CHARS = 10
 OCR_PAGE_LIMIT = 2
 PDF_MATCH_SEPARATOR = "；"
+PDF_MATCH_CACHE_VERSION = "2"
+PDF_TEXT_CACHE_NAME = ".docflow_pdf_text_cache.json"
+PDF_TEXT_CACHE_VERSION = "1"
+PDF_FINGERPRINT_CHUNK_SIZE = 1024 * 1024
 SUMMARY_EXCEL_NAME = "质保作业申请汇总.xlsx"
 MANUAL_MATCH_ENV_NAME = "manual_matches.env"
 IMAGE_TEXT_PROMPT = "请识别这张图片里的所有可见中文文字。只输出识别到的文字，不要解释，不要总结。"
 PDF_PAGE_TEXT_PROMPT = (
     "请识别这页 PDF 截图里的所有可见中文文字。"
-    "尽量保留原文中的日期、编号、施工内容、区域和单位名称。"
+    "尽量保留原文中的日期、编号、施工内容、区域和单位名称，"
+    "特别要准确保留施工开始时间、施工结束时间及其字段标签。"
     "只输出识别到的文字，不要解释，不要总结。"
 )
 LOGGER = logging.getLogger(__name__)
@@ -720,6 +726,92 @@ def read_pdf_ai_ocr_text(pdf_path: Path, client: LlamaCppClient) -> str:
     return "\n".join(page_texts)
 
 
+def pdf_content_fingerprint(pdf_path: Path) -> str:
+    digest = hashlib.sha256()
+    with pdf_path.open("rb") as pdf_file:
+        while chunk := pdf_file.read(PDF_FINGERPRINT_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_pdf_text_cache(cache_path: Path) -> dict[str, dict[str, Any]]:
+    if not cache_path.is_file():
+        return {}
+
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("缓存根节点不是对象")
+        if payload.get("version") != PDF_TEXT_CACHE_VERSION:
+            LOGGER.info(
+                "PDF 文本缓存版本为 %s，当前版本为 %s，忽略旧缓存",
+                payload.get("version") or "未标记",
+                PDF_TEXT_CACHE_VERSION,
+            )
+            return {}
+        raw_entries = payload.get("entries")
+        if not isinstance(raw_entries, dict):
+            raise ValueError("entries 不是对象")
+        entries = {
+            fingerprint: entry
+            for fingerprint, entry in raw_entries.items()
+            if isinstance(fingerprint, str)
+            and isinstance(entry, dict)
+            and isinstance(entry.get("text"), str)
+        }
+        LOGGER.info("已读取 %s 条 PDF 文本特征缓存: %s", len(entries), cache_path)
+        return entries
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        LOGGER.warning("PDF 文本缓存读取失败，将重新识别: %s (%s)", cache_path, exc)
+        return {}
+
+
+def save_pdf_text_cache(
+    cache_path: Path, entries: dict[str, dict[str, Any]]
+) -> None:
+    payload = {
+        "version": PDF_TEXT_CACHE_VERSION,
+        "fingerprint": "sha256",
+        "entries": entries,
+    }
+    temporary_path = cache_path.with_name(f"{cache_path.name}.tmp")
+    try:
+        temporary_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary_path, cache_path)
+    except OSError as exc:
+        LOGGER.warning("PDF 文本缓存写入失败: %s (%s)", cache_path, exc)
+
+
+def cache_pdf_text(
+    cache_path: Path,
+    entries: dict[str, dict[str, Any]],
+    fingerprint: str,
+    pdf_path: Path,
+    text: str,
+    method: str,
+) -> None:
+    entries[fingerprint] = {
+        "text": text,
+        "method": method,
+        "file_name": pdf_path.name,
+        "file_size": pdf_path.stat().st_size,
+        "cached_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_pdf_text_cache(cache_path, entries)
+
+
+def get_cached_pdf_text(
+    entries: dict[str, dict[str, Any]], fingerprint: str
+) -> tuple[str | None, str]:
+    entry = entries.get(fingerprint)
+    if not entry or not isinstance(entry.get("text"), str):
+        return None, ""
+    return entry["text"], str(entry.get("method") or "unknown")
+
+
 def read_pdf_text(pdf_path: Path, client: LlamaCppClient | None) -> str:
     plain_text = read_pdf_plain_text(pdf_path)
     if count_cjk_chars(plain_text) >= MIN_PLAIN_PDF_CJK_CHARS:
@@ -753,10 +845,12 @@ def rename_pdf_by_application_no(pdf_path: Path, application_no: str) -> bool:
         LOGGER.info("PDF 已符合命名规则，跳过: %s", pdf_path.name)
         return False
     if target_path.exists():
+        pdf_path.unlink()
         LOGGER.warning(
-            "PDF 目标文件已存在，跳过重命名: %s -> %s",
-            pdf_path.name,
+            "AI 识别到重名 PDF，保留已有文件并删除多余文件: 保留=%s，删除=%s，申请编号=%s",
             target_path.name,
+            pdf_path.name,
+            application_no,
         )
         return False
 
@@ -781,23 +875,51 @@ def rename_subject_warranty_pdfs_by_local_ai(
         LOGGER.info("未发现需要本地 AI 识别重命名的 PDF")
         return 0
 
+    text_cache_path = input_dir / PDF_TEXT_CACHE_NAME
+    text_cache = load_pdf_text_cache(text_cache_path)
     config = LlamaCppConfig.from_repo(repo_root)
     client = LlamaCppClient(config, repo_root)
+    client_ready = False
     renamed_count = 0
     try:
-        if not config.mmproj_path and not client.is_server_available():
-            LOGGER.warning(
-                "未配置 LLAMACPP_MMPROJ_PATH，且本地 AI 服务未运行，跳过 PDF 识别重命名"
-            )
-            return 0
         LOGGER.info("发现 %s 个待识别 PDF，开始调用本地 AI", len(pdf_files))
-        client.ensure_server()
-        client.assert_model_available()
 
         for index, pdf_path in enumerate(pdf_files, start=1):
             LOGGER.info("识别 PDF %s/%s: %s", index, len(pdf_files), pdf_path.name)
             try:
-                pdf_text = read_pdf_ai_ocr_text(pdf_path, client)
+                fingerprint = pdf_content_fingerprint(pdf_path)
+                pdf_text, cache_method = get_cached_pdf_text(
+                    text_cache, fingerprint
+                )
+                if pdf_text is not None:
+                    LOGGER.info(
+                        "复用 PDF 文本特征缓存: %s (sha256=%s, 来源=%s)",
+                        pdf_path.name,
+                        fingerprint[:12],
+                        cache_method,
+                    )
+                else:
+                    if not client_ready:
+                        if not config.mmproj_path and not client.is_server_available():
+                            LOGGER.warning(
+                                "未配置 LLAMACPP_MMPROJ_PATH，且本地 AI 服务未运行，"
+                                "跳过剩余 PDF 识别重命名"
+                            )
+                            break
+                        client.ensure_server()
+                        client.assert_model_available()
+                        client_ready = True
+                    pdf_text = normalize_match_text(
+                        read_pdf_ai_ocr_text(pdf_path, client)
+                    )
+                    cache_pdf_text(
+                        text_cache_path,
+                        text_cache,
+                        fingerprint,
+                        pdf_path,
+                        pdf_text,
+                        "ocr",
+                    )
                 application_no = extract_pdf_rename_application_no(pdf_text)
                 if not application_no:
                     LOGGER.info("PDF 未匹配主体质保施工申请编号规则: %s", pdf_path.name)
@@ -824,6 +946,10 @@ def build_pdf_text_index(
     excluded_pdf_names = excluded_pdf_names or set()
     skipped_pdf_names = skipped_pdf_names or set()
     repo_root = repo_root or Path(__file__).resolve().parent
+    text_cache_path = input_dir / PDF_TEXT_CACHE_NAME
+    text_cache = load_pdf_text_cache(text_cache_path)
+    cache_hit_count = 0
+    cache_write_count = 0
     pdf_files = [
         pdf_path
         for pdf_path in collect_pdf_files(input_dir, skipped_pdf_names)
@@ -838,9 +964,33 @@ def build_pdf_text_index(
         for index, pdf_path in enumerate(pdf_files, start=1):
             LOGGER.info("读取 PDF %s/%s: %s", index, len(pdf_files), pdf_path.name)
             try:
+                fingerprint = pdf_content_fingerprint(pdf_path)
+                cached_text, cache_method = get_cached_pdf_text(
+                    text_cache, fingerprint
+                )
+                if cached_text is not None:
+                    pdf_texts[pdf_path] = cached_text
+                    cache_hit_count += 1
+                    LOGGER.info(
+                        "复用 PDF 文本特征缓存: %s (sha256=%s, 来源=%s)",
+                        pdf_path.name,
+                        fingerprint[:12],
+                        cache_method,
+                    )
+                    continue
+
                 plain_text = read_pdf_plain_text(pdf_path)
                 if count_cjk_chars(plain_text) >= MIN_PLAIN_PDF_CJK_CHARS:
                     pdf_texts[pdf_path] = normalize_match_text(plain_text)
+                    cache_pdf_text(
+                        text_cache_path,
+                        text_cache,
+                        fingerprint,
+                        pdf_path,
+                        pdf_texts[pdf_path],
+                        "plain",
+                    )
+                    cache_write_count += 1
                     LOGGER.info("PDF 文本提取完成: %s", pdf_path.name)
                     continue
 
@@ -856,6 +1006,15 @@ def build_pdf_text_index(
                 pdf_texts[pdf_path] = normalize_match_text(
                     read_pdf_ai_ocr_text(pdf_path, ai_client)
                 )
+                cache_pdf_text(
+                    text_cache_path,
+                    text_cache,
+                    fingerprint,
+                    pdf_path,
+                    pdf_texts[pdf_path],
+                    "ocr",
+                )
+                cache_write_count += 1
                 LOGGER.info("本地 AI OCR 识别完成: %s", pdf_path.name)
             except Exception as exc:
                 pdf_texts[pdf_path] = ""
@@ -863,7 +1022,76 @@ def build_pdf_text_index(
     finally:
         if ai_client is not None:
             ai_client.shutdown_server()
+    LOGGER.info(
+        "PDF 文本特征缓存统计: 命中 %s，新增 %s",
+        cache_hit_count,
+        cache_write_count,
+    )
     return pdf_texts
+
+
+PDF_DATE_TOKEN_PATTERN = (
+    r"(?<!\d)(\d{4})\s*(?:年|[./．/~\-—–－])\s*(\d{1,2})"
+    r"\s*(?:月|[./．/~\-—–－])\s*(\d{1,2})\s*(?:日)?(?!\d)"
+)
+PDF_DATE_TOKEN_RE = re.compile(PDF_DATE_TOKEN_PATTERN)
+PDF_COMPACT_DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
+PDF_START_DATE_RE = re.compile(
+    rf"施工开始(?:时间|日期)?\s*[:：]?\s*{PDF_DATE_TOKEN_PATTERN}"
+)
+PDF_END_DATE_RE = re.compile(
+    rf"施工结束(?:时间|日期)?\s*[:：]?\s*{PDF_DATE_TOKEN_PATTERN}"
+)
+
+
+def date_match_groups_to_iso(groups: tuple[str, str, str]) -> str:
+    try:
+        return date(*(int(value) for value in groups)).isoformat()
+    except ValueError:
+        return ""
+
+
+def normalize_date_for_pdf_match(value: str) -> str:
+    normalized = normalize_digits(str(value or ""))
+    match = PDF_DATE_TOKEN_RE.search(normalized) or PDF_COMPACT_DATE_RE.search(
+        normalized
+    )
+    return date_match_groups_to_iso(match.groups()) if match else ""
+
+
+def extract_pdf_dates(pdf_text: str) -> set[str]:
+    normalized = normalize_digits(pdf_text or "")
+    dates = {
+        date_match_groups_to_iso(match.groups())
+        for match in PDF_DATE_TOKEN_RE.finditer(normalized)
+    }
+    dates.update(
+        date_match_groups_to_iso(match.groups())
+        for match in PDF_COMPACT_DATE_RE.finditer(normalized)
+    )
+    dates.discard("")
+    return dates
+
+
+def pdf_construction_dates_match(
+    pdf_text: str, construction_start_date: str, construction_end_date: str
+) -> bool:
+    expected_start = normalize_date_for_pdf_match(construction_start_date)
+    expected_end = normalize_date_for_pdf_match(construction_end_date)
+    if not expected_start or not expected_end:
+        return False
+
+    normalized_pdf_text = normalize_digits(pdf_text or "")
+    start_match = PDF_START_DATE_RE.search(normalized_pdf_text)
+    end_match = PDF_END_DATE_RE.search(normalized_pdf_text)
+    if start_match and end_match:
+        actual_start = date_match_groups_to_iso(start_match.groups())
+        actual_end = date_match_groups_to_iso(end_match.groups())
+        return actual_start == expected_start and actual_end == expected_end
+
+    # OCR 偶尔会漏掉字段标签；此时仍要求 PDF 中同时出现申请单的起止日期。
+    pdf_dates = extract_pdf_dates(normalized_pdf_text)
+    return expected_start in pdf_dates and expected_end in pdf_dates
 
 
 def find_matching_pdf_paths(
@@ -871,6 +1099,7 @@ def find_matching_pdf_paths(
     work_content: str,
     pdf_texts: dict[Path, str],
     construction_start_date: str = "",
+    construction_end_date: str = "",
 ) -> list[Path]:
     area_key = normalize_match_text(construction_area)
     content_key = normalize_match_text(work_content)
@@ -887,14 +1116,10 @@ def find_matching_pdf_paths(
         pdf_path
         for pdf_path, pdf_text in pdf_texts.items()
         if area_key in pdf_text and any(key in pdf_text for key in content_keys)
+        and pdf_construction_dates_match(
+            pdf_text, construction_start_date, construction_end_date
+        )
     ]
-    date_key = normalize_match_text(construction_start_date)
-    if len(matched_paths) > 1 and date_key:
-        date_matched_paths = [
-            pdf_path for pdf_path in matched_paths if date_key in pdf_texts[pdf_path]
-        ]
-        if date_matched_paths:
-            return date_matched_paths
     return matched_paths
 
 
@@ -903,11 +1128,16 @@ def find_matching_pdf_names(
     work_content: str,
     pdf_texts: dict[Path, str],
     construction_start_date: str = "",
+    construction_end_date: str = "",
 ) -> str:
     matched_names = [
         pdf_path.name
         for pdf_path in find_matching_pdf_paths(
-            construction_area, work_content, pdf_texts, construction_start_date
+            construction_area,
+            work_content,
+            pdf_texts,
+            construction_start_date,
+            construction_end_date,
         )
     ]
     return "；".join(matched_names)
@@ -1190,9 +1420,10 @@ def build_note_sheet(
         ["文档总数", len(records)],
         ["重命名数量", sum(1 for record in records if record.处理状态 == "已重命名")],
         ["汇总文件", workbook_name],
+        ["PDF匹配规则版本", PDF_MATCH_CACHE_VERSION],
         [
             "说明",
-            "申请单文件、申请单附图和附件目录列可直接点击打开本地文件或目录；匹配PDF文件名列按施工区域和施工内容匹配。",
+            "申请单文件、申请单附图和附件目录列可直接点击打开本地文件或目录；匹配PDF文件名列按施工区域、施工内容、施工开始时间和施工结束时间匹配。",
         ],
     ]
     for row in rows:
@@ -1392,10 +1623,14 @@ def rename_matched_images_by_local_ai(
 
 
 def pdf_match_cache_key(
-    construction_area: str, work_content: str, construction_start_date: str = ""
+    construction_area: str,
+    work_content: str,
+    construction_start_date: str = "",
+    construction_end_date: str = "",
 ) -> str:
     return (
         f"{normalize_match_text(construction_start_date)}|"
+        f"{normalize_match_text(construction_end_date)}|"
         f"{normalize_match_text(construction_area)}|"
         f"{normalize_match_text(work_content)}"
     )
@@ -1424,6 +1659,26 @@ def load_existing_pdf_match_cache(excel_path: Path) -> dict[str, str]:
     LOGGER.info("读取已有 PDF 匹配缓存: %s", excel_path)
     workbook = load_workbook(excel_path, read_only=False, data_only=True)
     try:
+        if "说明" not in workbook.sheetnames:
+            LOGGER.info("已有汇总表没有 PDF 匹配规则版本，忽略旧缓存")
+            return {}
+        note_sheet = workbook["说明"]
+        cache_version = next(
+            (
+                normalize_whitespace(str(row[1].value or ""))
+                for row in note_sheet.iter_rows(min_col=1, max_col=2)
+                if row[0].value == "PDF匹配规则版本"
+            ),
+            "",
+        )
+        if cache_version != PDF_MATCH_CACHE_VERSION:
+            LOGGER.info(
+                "已有汇总表 PDF 匹配规则版本为 %s，当前版本为 %s，忽略旧缓存",
+                cache_version or "未标记",
+                PDF_MATCH_CACHE_VERSION,
+            )
+            return {}
+
         sheet = workbook["汇总"] if "汇总" in workbook.sheetnames else workbook.active
         if sheet is None:
             LOGGER.info("已有汇总表没有可读取的工作表")
@@ -1434,9 +1689,16 @@ def load_existing_pdf_match_cache(excel_path: Path) -> dict[str, str]:
         }
         area_col = headers.get("施工区域")
         start_date_col = headers.get("施工开始时间")
+        end_date_col = headers.get("施工结束时间")
         content_col = headers.get("施工内容")
         pdf_col = headers.get("匹配PDF文件名")
-        if not area_col or not start_date_col or not content_col or not pdf_col:
+        if (
+            not area_col
+            or not start_date_col
+            or not end_date_col
+            or not content_col
+            or not pdf_col
+        ):
             LOGGER.info("已有汇总表缺少匹配缓存所需列")
             return {}
 
@@ -1457,6 +1719,9 @@ def load_existing_pdf_match_cache(excel_path: Path) -> dict[str, str]:
                     ),
                     normalize_excel_cache_value(
                         sheet.cell(row=row_idx, column=start_date_col).value
+                    ),
+                    normalize_excel_cache_value(
+                        sheet.cell(row=row_idx, column=end_date_col).value
                     ),
                 )
             ] = pdf_names
@@ -1646,7 +1911,10 @@ def process_documents(
             current_path, docx_path, attachment_dir
         )
         cache_key = pdf_match_cache_key(
-            parsed["施工区域"], parsed["施工内容"], parsed["施工开始时间"]
+            parsed["施工区域"],
+            parsed["施工内容"],
+            parsed["施工开始时间"],
+            parsed["施工结束时间"],
         )
         matched_pdf_names = pdf_match_cache.get(cache_key, "")
         if matched_pdf_names:
@@ -1665,6 +1933,7 @@ def process_documents(
                 parsed["施工内容"],
                 pdf_texts,
                 parsed["施工开始时间"],
+                parsed["施工结束时间"],
             )
             matched_pdf_names = PDF_MATCH_SEPARATOR.join(
                 pdf_path.name for pdf_path in matched_pdf_paths

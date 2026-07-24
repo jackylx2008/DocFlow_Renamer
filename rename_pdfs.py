@@ -119,7 +119,14 @@ def rename_pdf(pdf_path: Path, input_dir: Path, client: LlamaCppClient | None, p
     if pdf_path.resolve() == target_path.resolve():
         return RenameResult(pdf_path, target_path, application_no, "已是目标文件名")
     if target_path.exists():
-        return RenameResult(pdf_path, target_path, application_no, "目标文件已存在，跳过")
+        pdf_path.unlink()
+        LOGGER.warning(
+            "识别到重名 PDF，保留已有文件并删除多余文件: 保留=%s，删除=%s，申请编号=%s",
+            target_path.name,
+            pdf_path.name,
+            application_no,
+        )
+        return RenameResult(pdf_path, target_path, application_no, "重名，已删除多余 PDF")
 
     pdf_path.rename(target_path)
     return RenameResult(pdf_path, target_path, application_no, "已重命名")
