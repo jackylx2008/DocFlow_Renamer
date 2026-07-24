@@ -220,6 +220,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "review_candidates": len(
                         review.get("pending_reviews") or []
                     ),
+                    "review_unresolved_pdfs": len(
+                        review.get("unresolved_pdfs") or []
+                    ),
                     "review_json": str(review_path),
                     "review_excel": str(review_excel),
                 },

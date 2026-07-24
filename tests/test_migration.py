@@ -1,18 +1,21 @@
 import shutil
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import load_workbook
 
 from src.warranty_application_archive.approval_review import (
+    ApprovalReviewRepository,
     apply_review_decisions,
     build_approval_review,
     export_approval_review_excel,
     import_excel_decisions,
 )
 from src.warranty_application_archive.constants import (
+    APPROVAL_REVIEW_DATA_FILE_NAME,
     APPROVAL_REVIEW_EXCEL_FILE_NAME,
     DATA_FILE_NAME,
     TEMPLATE_FILE_NAME,
@@ -315,14 +318,15 @@ class MigrationTest(unittest.TestCase):
             candidate = review["pending_reviews"][0]
             self.assertEqual(candidate["case"]["case_name"], stem)
             self.assertEqual(candidate["pdf"]["start"], "2026-07-23")
-            self.assertGreaterEqual(candidate["candidate_score"], 60)
+            self.assertGreaterEqual(candidate["confidence"], 80)
+            self.assertEqual(review["unresolved_pdfs"], [])
 
             excel_path = export_approval_review_excel(review, primary)
             workbook = load_workbook(excel_path)
             try:
                 sheet = workbook["待审核"]
                 sheet["A2"] = "确认匹配"
-                sheet["B2"] = "人工核对施工内容与日期后确认"
+                sheet["C2"] = "人工核对施工内容与日期后确认"
                 workbook.save(excel_path)
             finally:
                 workbook.close()
@@ -358,6 +362,153 @@ class MigrationTest(unittest.TestCase):
             self.assertTrue(
                 (primary / APPROVAL_REVIEW_EXCEL_FILE_NAME).is_file()
             )
+
+    def test_review_outputs_only_top_strict_candidate_per_inbox_pdf(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            base = Path(temporary_dir)
+            primary, dataset, _stem = self._migrated_fixture(base)
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+
+            first_application = dataset["applications"][0]
+            first_application["application"]["施工开始时间"] = "2026-01-01"
+            first_application["application"]["施工结束时间"] = "2026-01-02"
+            second_application = deepcopy(first_application)
+            second_application["case_id"] = "second-case"
+            second_application["case_name"] = (
+                "2026-08-18_维修冷塔_质保作业申请单"
+            )
+            second_application["case_directory"] = (
+                "_cases/2026-08-18_维修冷塔_质保作业申请单"
+            )
+            second_application["application"]["施工开始时间"] = "2026-08-18"
+            second_application["application"]["施工结束时间"] = "2026-08-20"
+            (
+                primary / second_application["case_directory"]
+            ).mkdir(parents=True)
+            dataset["applications"].append(second_application)
+
+            matching_pdf = inbox / "工程类-主体质保施工_编号：202608190001.pdf"
+            matching_pdf.write_bytes(b"top candidate")
+            dataset["unmatched_files"].append(
+                file_record(
+                    matching_pdf,
+                    matching_pdf,
+                    primary,
+                    "approval_pdf",
+                )
+            )
+            dataset["unmatched_files"].append(
+                deepcopy(dataset["unmatched_files"][-1])
+            )
+            matching_hash = sha256_file(matching_pdf)
+            dataset.setdefault("recognition_cache", {})[matching_hash] = {
+                "text": (
+                    "工程类主体质保施工申请编号202608190001"
+                    "施工区域冷却塔施工开始时间2026年8月19日"
+                    "施工结束时间2026年8月20日"
+                    "施工内容维修冷塔施工负责人测试人员"
+                ),
+                "method": "ocr",
+            }
+
+            unresolved_pdf = (
+                inbox / "工程类-主体质保施工_编号：202608190002.pdf"
+            )
+            unresolved_pdf.write_bytes(b"no strict candidate")
+            dataset["unmatched_files"].append(
+                file_record(
+                    unresolved_pdf,
+                    unresolved_pdf,
+                    primary,
+                    "approval_pdf",
+                )
+            )
+            unresolved_hash = sha256_file(unresolved_pdf)
+            dataset["recognition_cache"][unresolved_hash] = {
+                "text": (
+                    "工程类主体质保施工申请编号202608190002"
+                    "施工区域冷却塔施工开始时间2026年7月24日"
+                    "施工结束时间2026年7月24日"
+                    "施工内容更换UV灯管施工负责人测试人员"
+                ),
+                "method": "plain",
+            }
+
+            nested = inbox / "nested"
+            nested.mkdir()
+            nested_pdf = nested / "嵌套目录审批.pdf"
+            nested_pdf.write_bytes(b"nested")
+            dataset["unmatched_files"].append(
+                file_record(
+                    nested_pdf,
+                    nested_pdf,
+                    primary,
+                    "approval_pdf",
+                )
+            )
+            dataset["recognition_cache"][sha256_file(nested_pdf)] = {
+                "text": "施工区域冷却塔施工内容维修冷塔",
+                "method": "test",
+            }
+
+            review = build_approval_review(
+                dataset,
+                primary,
+                Path(__file__).resolve().parents[1],
+            )
+
+            self.assertEqual(len(review["pending_reviews"]), 1)
+            candidate = review["pending_reviews"][0]
+            self.assertEqual(candidate["pdf"]["sha256"], matching_hash)
+            self.assertEqual(
+                candidate["case"]["case_id"],
+                "second-case",
+            )
+            self.assertEqual(candidate["strict_candidate_count"], 2)
+            self.assertEqual(candidate["confidence"], 98)
+            self.assertEqual(candidate["runner_up_confidence"], 80)
+            self.assertEqual(candidate["confidence_gap"], 18)
+            self.assertEqual(len(review["unresolved_pdfs"]), 1)
+            self.assertEqual(
+                review["unresolved_pdfs"][0]["pdf"]["sha256"],
+                unresolved_hash,
+            )
+            self.assertIn(
+                "施工内容",
+                review["unresolved_pdfs"][0]["reason"],
+            )
+
+            review_path = ApprovalReviewRepository(primary).save(review)
+            self.assertEqual(
+                review_path.name,
+                APPROVAL_REVIEW_DATA_FILE_NAME,
+            )
+            excel_path = export_approval_review_excel(review, primary)
+            self.assertEqual(
+                excel_path.name,
+                APPROVAL_REVIEW_EXCEL_FILE_NAME,
+            )
+            workbook = load_workbook(excel_path, data_only=False)
+            try:
+                self.assertEqual(
+                    workbook.sheetnames,
+                    ["待审核", "无严格候选", "已处理决定", "说明"],
+                )
+                pending_sheet = workbook["待审核"]
+                self.assertEqual(pending_sheet.max_row, 2)
+                self.assertEqual(pending_sheet["D2"].value, 0.98)
+                self.assertIn("待人工审核", str(pending_sheet["B2"].value))
+                unresolved_sheet = workbook["无严格候选"]
+                self.assertEqual(unresolved_sheet.max_row, 2)
+                self.assertEqual(
+                    unresolved_sheet["C2"].value,
+                    unresolved_pdf.name,
+                )
+            finally:
+                workbook.close()
 
 
 if __name__ == "__main__":

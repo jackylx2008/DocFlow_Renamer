@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import uuid
 from datetime import date, datetime
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,10 @@ from .constants import (
     APPROVAL_REVIEW_EXCEL_FILE_NAME,
     APPROVAL_REVIEW_SCHEMA_VERSION,
     INBOX_DIR_NAME,
+    INTERNAL_DIR_NAME,
+    LEGACY_APPROVAL_REVIEW_DATA_FILE_NAME,
+    LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME,
+    LEGACY_DIR_NAME,
 )
 from .file_utils import atomic_replace_text, ensure_within, sha256_file
 from .migration import CASE_NAMESPACE
@@ -32,9 +36,15 @@ from .workflows import archive_reviewed_approval_pdf
 
 PENDING_HEADERS = [
     "审核结果",
+    "审核处理状态",
     "人工备注",
-    "候选评分",
+    "匹配置信度",
+    "置信度等级",
+    "严格候选数",
+    "次高置信度",
+    "领先差值",
     "匹配依据",
+    "识别方式",
     "审批PDF文件",
     "审批编号",
     "审批施工区域",
@@ -53,7 +63,30 @@ PENDING_HEADERS = [
     "PDF SHA-256",
     "案卷ID",
 ]
+UNRESOLVED_HEADERS = [
+    "处理状态",
+    "未形成候选原因",
+    "审批PDF文件",
+    "审批编号",
+    "审批施工区域",
+    "审批施工开始",
+    "审批施工结束",
+    "审批施工内容",
+    "识别方式",
+    "PDF链接",
+    "PDF SHA-256",
+    "PDF相对路径",
+]
 DECISION_OPTIONS = ("待审核", "确认匹配", "排除")
+MATCH_RULE_VERSION = "strict-non-date-relaxed-date-v1"
+NON_DATE_CONFIDENCE = 80
+CASE_STATUS_LABELS = {
+    "materials_incomplete": "材料待补充",
+    "materials_ready": "材料齐全，待审批PDF",
+    "approval_pdf_unmatched": "审批PDF待确认",
+    "approved": "审批完成",
+    "needs_review": "待人工确认",
+}
 CASE_NAME_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})_(?P<content>.+?)_质保作业申请单"
 )
@@ -69,7 +102,9 @@ def _empty_review(root: Path) -> dict[str, Any]:
         "data_root": str(root.resolve()),
         "source_dataset_revision": 0,
         "generated_at": _now(),
+        "match_rule_version": MATCH_RULE_VERSION,
         "pending_reviews": [],
+        "unresolved_pdfs": [],
         "decisions": [],
     }
 
@@ -78,16 +113,22 @@ class ApprovalReviewRepository:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.path = self.root / APPROVAL_REVIEW_DATA_FILE_NAME
+        self.legacy_path = (
+            self.root / LEGACY_APPROVAL_REVIEW_DATA_FILE_NAME
+        )
 
     def load(self) -> dict[str, Any]:
-        if not self.path.is_file():
+        source = self.path if self.path.is_file() else self.legacy_path
+        if not source.is_file():
             return _empty_review(self.root)
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        if data.get("schema_version") != APPROVAL_REVIEW_SCHEMA_VERSION:
+        data = json.loads(source.read_text(encoding="utf-8"))
+        schema_version = int(data.get("schema_version") or 0)
+        if schema_version not in {1, APPROVAL_REVIEW_SCHEMA_VERSION}:
             raise ValueError(
                 "不支持的审批 PDF 审核数据版本: "
                 f"{data.get('schema_version')}"
             )
+        data["schema_version"] = APPROVAL_REVIEW_SCHEMA_VERSION
         return data
 
     def save(self, data: dict[str, Any]) -> Path:
@@ -98,7 +139,22 @@ class ApprovalReviewRepository:
             self.path,
             json.dumps(data, ensure_ascii=False, indent=2),
         )
+        _archive_legacy_artifact(self.root, self.legacy_path)
         return self.path
+
+
+def _archive_legacy_artifact(root: Path, path: Path) -> None:
+    if not path.is_file():
+        return
+    archive_dir = root / INTERNAL_DIR_NAME / LEGACY_DIR_NAME
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    target = archive_dir / path.name
+    if target.exists():
+        target = archive_dir / (
+            f"{path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            f"{path.suffix}"
+        )
+    shutil.move(str(path), str(target))
 
 
 def _date_from_text(value: str) -> str:
@@ -188,59 +244,84 @@ def _date_delta(first: str, second: str) -> int | None:
         return None
 
 
-def _candidate_score(
+def _strict_non_date_match(
     pdf_text: str,
+    case_values: dict[str, str],
+) -> tuple[bool, bool]:
+    normalized_pdf = legacy.normalize_match_text(pdf_text)
+    area_key = legacy.normalize_match_text(case_values["area"])
+    content_key = legacy.normalize_match_text(case_values["content"])
+    if not area_key or not content_key:
+        return False, False
+
+    content_keys = [content_key]
+    if content_key.startswith(area_key):
+        shortened = content_key[len(area_key) :]
+        if shortened:
+            content_keys.append(shortened)
+    return (
+        area_key in normalized_pdf,
+        any(key in normalized_pdf for key in content_keys),
+    )
+
+
+def _date_points(delta: int | None, maximum: int) -> int:
+    if delta is None:
+        return 0
+    if delta == 0:
+        return maximum
+    if delta <= 3:
+        return maximum - 2
+    if delta <= 7:
+        return max(0, maximum - 4)
+    if delta <= 14:
+        return max(0, maximum - 7)
+    if delta <= 31:
+        return max(0, maximum - 10)
+    return 0
+
+
+def _candidate_confidence(
     pdf_values: dict[str, str],
     case_values: dict[str, str],
 ) -> tuple[int, list[str]]:
-    score = 0
     evidence: list[str] = []
-    normalized_pdf = legacy.normalize_match_text(pdf_text)
-    case_content = legacy.normalize_match_text(case_values["content"])
-    pdf_content = legacy.normalize_match_text(pdf_values["content"])
-    if case_content and case_content in normalized_pdf:
-        score += 60
-        evidence.append("施工内容文字命中")
-    elif case_content and pdf_content:
-        ratio = SequenceMatcher(None, case_content, pdf_content).ratio()
-        if ratio >= 0.45:
-            points = round(ratio * 40)
-            score += points
-            evidence.append(f"施工内容相似{ratio:.0%}")
-
-    case_area = legacy.normalize_match_text(case_values["area"])
-    pdf_area = legacy.normalize_match_text(pdf_values["area"])
-    if case_area and case_area in normalized_pdf:
-        score += 15
-        evidence.append("施工区域命中")
-    elif case_area and pdf_area:
-        ratio = SequenceMatcher(None, case_area, pdf_area).ratio()
-        if ratio >= 0.6:
-            score += 8
-            evidence.append(f"施工区域相似{ratio:.0%}")
-
     start_delta = _date_delta(case_values["start"], pdf_values["start"])
-    if start_delta is not None:
-        if start_delta == 0:
-            score += 25
-        elif start_delta <= 3:
-            score += 20
-        elif start_delta <= 7:
-            score += 12
-        elif start_delta <= 14:
-            score += 5
-        evidence.append(f"开始日期相差{start_delta}天")
-
     end_delta = _date_delta(case_values["end"], pdf_values["end"])
-    if end_delta is not None:
-        if end_delta == 0:
-            score += 15
-        elif end_delta <= 3:
-            score += 10
-        elif end_delta <= 7:
-            score += 5
+    confidence = (
+        NON_DATE_CONFIDENCE
+        + _date_points(start_delta, 12)
+        + _date_points(end_delta, 8)
+    )
+    evidence.extend(["施工内容严格命中", "施工区域严格命中"])
+    if start_delta is None:
+        evidence.append("开始日期缺失，不参与淘汰")
+    else:
+        evidence.append(f"开始日期相差{start_delta}天")
+    if end_delta is None:
+        evidence.append("结束日期缺失，不参与淘汰")
+    else:
         evidence.append(f"结束日期相差{end_delta}天")
-    return score, evidence
+    return min(100, confidence), evidence
+
+
+def _confidence_level(confidence: int) -> str:
+    if confidence >= 95:
+        return "高"
+    if confidence >= 85:
+        return "中"
+    return "低"
+
+
+def _selection_confidence(
+    candidate_confidence: int,
+    runner_up_confidence: int | None,
+) -> int:
+    if runner_up_confidence is None:
+        return candidate_confidence
+    gap = max(0, candidate_confidence - runner_up_confidence)
+    ambiguity_limit = 60 + min(40, gap * 3)
+    return min(candidate_confidence, ambiguity_limit)
 
 
 def _review_id(pdf_hash: str, case_id: str) -> str:
@@ -286,6 +367,8 @@ def build_approval_review(
         if not (application.get("approval") or {}).get("pdfs")
     ]
     pending: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    seen_pdf_hashes: set[str] = set()
     with RecognitionService(dataset, repo_root) as recognition:
         for pdf_item in dataset.get("unmatched_files") or []:
             if pdf_item.get("role") != APPROVAL_PDF_ROLE:
@@ -294,56 +377,152 @@ def build_approval_review(
             if pdf_path is None or not pdf_path.is_file():
                 continue
             pdf_hash = sha256_file(pdf_path)
+            if pdf_hash in seen_pdf_hashes:
+                continue
+            seen_pdf_hashes.add(pdf_hash)
             text = recognition.pdf_text(pdf_path)
             values = _pdf_values(text)
             application_no = (
                 legacy.extract_pdf_application_no_from_name(pdf_path.name)
                 or legacy.extract_pdf_rename_application_no(text)
             )
-            ranked: list[tuple[int, str, dict[str, Any], dict[str, str], list[str]]] = []
+            recognition_method = str(
+                (
+                    (dataset.get("recognition_cache") or {})
+                    .get(pdf_hash, {})
+                    .get("method", "unknown")
+                )
+            )
+            pdf_payload = {
+                "path": str(pdf_item.get("path") or ""),
+                "file_name": pdf_path.name,
+                "sha256": pdf_hash,
+                "application_no": application_no,
+                "recognition_method": recognition_method,
+                **values,
+            }
+            ranked: list[
+                tuple[
+                    int,
+                    str,
+                    dict[str, Any],
+                    dict[str, str],
+                    list[str],
+                    str,
+                ]
+            ] = []
+            any_area_match = False
+            any_content_match = False
+            strict_matches = 0
             for application in applications:
                 case_values = _case_values(application)
-                score, evidence = _candidate_score(text, values, case_values)
-                ranked.append(
-                    (
-                        score,
-                        str(application.get("case_name") or ""),
-                        application,
-                        case_values,
-                        evidence,
-                    )
+                area_match, content_match = _strict_non_date_match(
+                    text,
+                    case_values,
                 )
-            ranked.sort(key=lambda item: (-item[0], item[1]))
-            for score, _case_name, application, case_values, evidence in ranked:
+                any_area_match = any_area_match or area_match
+                any_content_match = any_content_match or content_match
+                if not (area_match and content_match):
+                    continue
+                strict_matches += 1
+                confidence, evidence = _candidate_confidence(
+                    values,
+                    case_values,
+                )
                 case_id = str(application.get("case_id") or "")
                 review_id = _review_id(pdf_hash, case_id)
                 if review_id in excluded_ids:
                     continue
-                pending.append(
+                ranked.append(
+                    (
+                        confidence,
+                        str(application.get("case_name") or ""),
+                        application,
+                        case_values,
+                        evidence,
+                        review_id,
+                    )
+                )
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            if not ranked:
+                if strict_matches:
+                    reason = "所有严格候选均已被人工排除"
+                elif not applications:
+                    reason = "没有可匹配的未审批案卷"
+                elif not any_content_match:
+                    reason = "施工内容没有严格文本命中"
+                elif not any_area_match:
+                    reason = "施工区域没有严格文本命中"
+                else:
+                    reason = "施工区域和施工内容未在同一案卷同时严格命中"
+                unresolved.append(
                     {
-                        "review_id": review_id,
-                        "decision": "待审核",
-                        "review_note": "",
-                        "candidate_score": score,
-                        "matching_evidence": "；".join(evidence) or "无自动命中依据",
-                        "pdf": {
-                            "path": str(pdf_item.get("path") or ""),
-                            "file_name": pdf_path.name,
-                            "sha256": pdf_hash,
-                            "application_no": application_no,
-                            **values,
-                        },
-                        "case": {
-                            "case_id": case_id,
-                            "case_name": str(application.get("case_name") or ""),
-                            "case_directory": str(
-                                application.get("case_directory") or ""
-                            ),
-                            "status": str(application.get("status") or ""),
-                            **case_values,
-                        },
+                        "status": "无严格候选",
+                        "reason": reason,
+                        "pdf": pdf_payload,
                     }
                 )
+                continue
+
+            (
+                candidate_confidence,
+                _case_name,
+                application,
+                case_values,
+                evidence,
+                review_id,
+            ) = ranked[0]
+            runner_up_confidence = ranked[1][0] if len(ranked) > 1 else None
+            confidence_gap = (
+                candidate_confidence - runner_up_confidence
+                if runner_up_confidence is not None
+                else None
+            )
+            confidence = _selection_confidence(
+                candidate_confidence,
+                runner_up_confidence,
+            )
+            case_id = str(application.get("case_id") or "")
+            ambiguity_evidence = (
+                [
+                    f"候选自身匹配度{candidate_confidence}%",
+                    f"次高匹配度{runner_up_confidence}%",
+                    f"领先{confidence_gap}个百分点",
+                    f"综合选择置信度{confidence}%",
+                ]
+                if runner_up_confidence is not None
+                else [f"唯一严格候选，置信度{confidence}%"]
+            )
+            pending.append(
+                {
+                    "review_id": review_id,
+                    "decision": "待审核",
+                    "review_note": "",
+                    "confidence": confidence,
+                    "candidate_match_confidence": candidate_confidence,
+                    "confidence_level": _confidence_level(confidence),
+                    "strict_candidate_count": len(ranked),
+                    "runner_up_confidence": runner_up_confidence,
+                    "confidence_gap": confidence_gap,
+                    "matching_evidence": "；".join(
+                        [
+                            *evidence,
+                            *ambiguity_evidence,
+                            f"严格候选{len(ranked)}个，仅展示最高项",
+                        ]
+                    ),
+                    "pdf": pdf_payload,
+                    "case": {
+                        "case_id": case_id,
+                        "case_name": str(application.get("case_name") or ""),
+                        "case_directory": str(
+                            application.get("case_directory") or ""
+                        ),
+                        "status": str(application.get("status") or ""),
+                        **case_values,
+                    },
+                }
+            )
     return {
         "schema_version": APPROVAL_REVIEW_SCHEMA_VERSION,
         "data_root": str(root),
@@ -351,7 +530,9 @@ def build_approval_review(
             dataset.get("dataset_revision") or 0
         ),
         "generated_at": _now(),
+        "match_rule_version": MATCH_RULE_VERSION,
         "pending_reviews": pending,
+        "unresolved_pdfs": unresolved,
         "decisions": decisions,
     }
 
@@ -359,11 +540,27 @@ def build_approval_review(
 def _pending_row(item: dict[str, Any]) -> list[Any]:
     pdf = item.get("pdf") or {}
     case = item.get("case") or {}
+    runner_up = item.get("runner_up_confidence")
+    confidence_gap = item.get("confidence_gap")
     return [
         item.get("decision", "待审核"),
+        "待人工审核",
         item.get("review_note", ""),
-        item.get("candidate_score", 0),
+        float(item.get("confidence", 0)) / 100,
+        item.get("confidence_level", ""),
+        item.get("strict_candidate_count", 0),
+        (
+            float(runner_up) / 100
+            if isinstance(runner_up, (int, float))
+            else ""
+        ),
+        (
+            float(confidence_gap) / 100
+            if isinstance(confidence_gap, (int, float))
+            else ""
+        ),
         item.get("matching_evidence", ""),
+        pdf.get("recognition_method", ""),
         pdf.get("file_name", ""),
         pdf.get("application_no", ""),
         pdf.get("area", ""),
@@ -371,7 +568,10 @@ def _pending_row(item: dict[str, Any]) -> list[Any]:
         pdf.get("end", ""),
         pdf.get("content", ""),
         case.get("case_name", ""),
-        case.get("status", ""),
+        CASE_STATUS_LABELS.get(
+            str(case.get("status") or ""),
+            case.get("status", ""),
+        ),
         case.get("area", ""),
         case.get("start", ""),
         case.get("end", ""),
@@ -381,6 +581,24 @@ def _pending_row(item: dict[str, Any]) -> list[Any]:
         item.get("review_id", ""),
         pdf.get("sha256", ""),
         case.get("case_id", ""),
+    ]
+
+
+def _unresolved_row(item: dict[str, Any]) -> list[Any]:
+    pdf = item.get("pdf") or {}
+    return [
+        item.get("status", "无严格候选"),
+        item.get("reason", ""),
+        pdf.get("file_name", ""),
+        pdf.get("application_no", ""),
+        pdf.get("area", ""),
+        pdf.get("start", ""),
+        pdf.get("end", ""),
+        pdf.get("content", ""),
+        pdf.get("recognition_method", ""),
+        "打开审批PDF",
+        pdf.get("sha256", ""),
+        pdf.get("path", ""),
     ]
 
 
@@ -406,6 +624,8 @@ def export_approval_review_excel(
 ) -> Path:
     root = root.resolve()
     workbook = Workbook()
+    workbook.calculation.fullCalcOnLoad = True
+    workbook.calculation.forceFullCalc = True
     sheet = workbook.active
     sheet.title = "待审核"
     sheet.append(PENDING_HEADERS)
@@ -416,7 +636,10 @@ def export_approval_review_excel(
     if pending:
         table = Table(
             displayName="ApprovalReviewCandidates",
-            ref=f"A1:U{len(pending) + 1}",
+            ref=(
+                f"A1:{get_column_letter(len(PENDING_HEADERS))}"
+                f"{len(pending) + 1}"
+            ),
         )
         table.tableStyleInfo = TableStyleInfo(
             name="TableStyleMedium2",
@@ -449,9 +672,34 @@ def export_approval_review_excel(
                 fill=PatternFill("solid", fgColor="FFC7CE"),
             ),
         )
+        sheet.conditional_formatting.add(
+            f"D2:D{len(pending) + 1}",
+            FormulaRule(
+                formula=["$D2>=0.95"],
+                fill=PatternFill("solid", fgColor="C6EFCE"),
+            ),
+        )
+        sheet.conditional_formatting.add(
+            f"D2:D{len(pending) + 1}",
+            FormulaRule(
+                formula=['AND($D2>=0.85,$D2<0.95)'],
+                fill=PatternFill("solid", fgColor="FFF2CC"),
+            ),
+        )
+        sheet.conditional_formatting.add(
+            f"D2:D{len(pending) + 1}",
+            FormulaRule(
+                formula=["$D2<0.85"],
+                fill=PatternFill("solid", fgColor="FCE4D6"),
+            ),
+        )
     editable_fill = PatternFill("solid", fgColor="FFF2CC")
     for row_index in range(2, len(pending) + 2):
-        for column_index in (1, 2):
+        sheet.cell(row=row_index, column=2).value = (
+            f'=IF(A{row_index}="确认匹配","已确认匹配，待执行回写",'
+            f'IF(A{row_index}="排除","已排除，待执行回写","待人工审核"))'
+        )
+        for column_index in (1, 3):
             sheet.cell(row=row_index, column=column_index).fill = editable_fill
             sheet.cell(row=row_index, column=column_index).protection = Protection(
                 locked=False
@@ -461,25 +709,76 @@ def export_approval_review_excel(
         case_path = root / Path(
             str((item.get("case") or {}).get("case_directory") or "")
         )
-        sheet.cell(row=row_index, column=17).hyperlink = str(pdf_path.resolve())
-        sheet.cell(row=row_index, column=18).hyperlink = str(case_path.resolve())
-        for column_index in (17, 18):
+        sheet.cell(row=row_index, column=23).hyperlink = str(pdf_path.resolve())
+        sheet.cell(row=row_index, column=24).hyperlink = str(case_path.resolve())
+        for column_index in (23, 24):
             sheet.cell(row=row_index, column=column_index).font = Font(
                 color="0563C1", underline="single"
             )
     widths = [
-        12, 28, 10, 28, 38, 16, 22, 13, 13, 32, 42,
-        16, 22, 13, 13, 32, 16, 16, 38, 68, 38,
+        12, 24, 28, 12, 10, 12, 12, 10, 42, 12, 38, 16, 22, 13,
+        13, 32, 42, 24, 22, 13, 13, 32, 16, 16, 38, 68, 38,
     ]
     for index, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(index)].width = width
-    for column_index in (19, 20, 21):
+    for row_index in range(2, len(pending) + 2):
+        for column_index in (4, 7, 8):
+            sheet.cell(row=row_index, column=column_index).number_format = "0%"
+    for column_index in (25, 26, 27):
         sheet.column_dimensions[get_column_letter(column_index)].hidden = True
+
+    unresolved = workbook.create_sheet("无严格候选")
+    unresolved.append(UNRESOLVED_HEADERS)
+    unresolved_items = list(review.get("unresolved_pdfs") or [])
+    for item in unresolved_items:
+        unresolved.append(_unresolved_row(item))
+    _format_table_sheet(
+        unresolved,
+        len(unresolved_items),
+        len(UNRESOLVED_HEADERS),
+    )
+    if unresolved_items:
+        unresolved_table = Table(
+            displayName="ApprovalReviewUnresolved",
+            ref=(
+                f"A1:{get_column_letter(len(UNRESOLVED_HEADERS))}"
+                f"{len(unresolved_items) + 1}"
+            ),
+        )
+        unresolved_table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showRowStripes=True,
+            showFirstColumn=False,
+            showLastColumn=False,
+            showColumnStripes=False,
+        )
+        unresolved.add_table(unresolved_table)
+    for row_index, item in enumerate(unresolved_items, start=2):
+        pdf_path = root / Path(str((item.get("pdf") or {}).get("path") or ""))
+        unresolved.cell(row=row_index, column=10).hyperlink = str(
+            pdf_path.resolve()
+        )
+        unresolved.cell(row=row_index, column=10).font = Font(
+            color="0563C1",
+            underline="single",
+        )
+        unresolved.cell(row=row_index, column=1).fill = PatternFill(
+            "solid",
+            fgColor="FCE4D6",
+        )
+    unresolved_widths = (
+        16, 38, 42, 16, 24, 13, 13, 32, 12, 16, 68, 48,
+    )
+    for index, width in enumerate(unresolved_widths, start=1):
+        unresolved.column_dimensions[get_column_letter(index)].width = width
+    for column_index in (11, 12):
+        unresolved.column_dimensions[get_column_letter(column_index)].hidden = True
 
     history = workbook.create_sheet("已处理决定")
     history_headers = [
         "处理时间",
         "审核结果",
+        "回写状态",
         "人工备注",
         "审批PDF文件",
         "PDF SHA-256",
@@ -493,6 +792,11 @@ def export_approval_review_excel(
             [
                 item.get("decided_at", ""),
                 item.get("decision", ""),
+                (
+                    "已归档，正式案卷状态已更新为审批完成"
+                    if item.get("decision") == "确认匹配"
+                    else "已记录排除"
+                ),
                 item.get("review_note", ""),
                 item.get("pdf_file_name", ""),
                 item.get("pdf_sha256", ""),
@@ -507,7 +811,7 @@ def export_approval_review_excel(
         len(history_headers),
     )
     for column, width in zip(
-        "ABCDEFGH", (22, 12, 32, 42, 68, 42, 38, 38)
+        "ABCDEFGHI", (22, 12, 38, 32, 42, 68, 42, 38, 38)
     ):
         history.column_dimensions[column].width = width
 
@@ -515,9 +819,31 @@ def export_approval_review_excel(
     notes.sheet_view.showGridLines = False
     instructions = [
         ["审批 PDF 人工匹配审核", ""],
-        ["1", "同一个审批 PDF 会列出多条候选案卷，并按候选评分从高到低排列。"],
+        [
+            "1",
+            "只处理 _inbox 第一层中尚未自动匹配的审批 PDF；"
+            "每个 PDF 在“待审核”中只显示置信度最高的一个严格候选。",
+        ],
+        [
+            "匹配规则",
+            "施工区域和施工内容必须同时严格文本命中；日期不淘汰候选，"
+            "只按相差天数降低置信度。",
+        ],
+        [
+            "置信度",
+            "非日期严格命中占 80%，开始和结束日期合计占 20%；"
+            "“严格候选数、次高置信度、领先差值”用于判断第一名是否稳定。",
+        ],
+        [
+            "无严格候选",
+            "没有通过区域和内容严格门槛的 PDF 单独列在“无严格候选”，"
+            "不会强行推荐案卷。",
+        ],
         ["2", "只修改黄色的“审核结果”和“人工备注”列。"],
-        ["3", "每个审批 PDF 最多只能有一行选择“确认匹配”；不可能的候选可选“排除”。"],
+        [
+            "3",
+            "选择“排除”后重新生成审核表，会在剩余严格候选中选择下一名。",
+        ],
         [
             "4",
             "保存并关闭 Excel 后，运行："
@@ -526,7 +852,9 @@ def export_approval_review_excel(
         ["5", "命令先保存审核决定，再更新正式 JSON，并从正式 JSON 重建正式汇总 Excel。"],
         ["正式数据版本", review.get("source_dataset_revision", 0)],
         ["生成时间", review.get("generated_at", "")],
-        ["待审核候选关系", len(pending)],
+        ["匹配规则版本", review.get("match_rule_version", "")],
+        ["待审核 PDF", len(pending)],
+        ["无严格候选 PDF", len(unresolved_items)],
     ]
     for row in instructions:
         notes.append(row)
@@ -550,6 +878,10 @@ def export_approval_review_excel(
         raise PermissionError(
             f"审核 Excel 正在使用，请先关闭后重试: {output}"
         ) from exc
+    _archive_legacy_artifact(
+        root,
+        root / LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME,
+    )
     return output
 
 
@@ -558,7 +890,12 @@ def import_excel_decisions(
 ) -> list[dict[str, Any]]:
     path = root.resolve() / APPROVAL_REVIEW_EXCEL_FILE_NAME
     if not path.is_file():
-        raise FileNotFoundError(f"审批 PDF 审核 Excel 不存在: {path}")
+        legacy_path = (
+            root.resolve() / LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME
+        )
+        path = legacy_path if legacy_path.is_file() else path
+    if not path.is_file():
+        raise FileNotFoundError(f"待人工审核匹配 PDF Excel 不存在: {path}")
     workbook = load_workbook(path, read_only=False, data_only=False)
     try:
         if "待审核" not in workbook.sheetnames:
