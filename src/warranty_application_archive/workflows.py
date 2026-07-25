@@ -63,6 +63,8 @@ def _change(
 
 
 def _refresh_status(application: dict[str, Any]) -> None:
+    if application.get("status") == "terminated":
+        return
     materials = application.get("materials") or {}
     required = application.get("required_material_types") or []
     missing = [role for role in required if not materials.get(role)]
@@ -557,6 +559,8 @@ def _approval_candidates(
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for application in applications:
+        if application.get("status") == "terminated":
+            continue
         business = application.get("application") or {}
         matched = legacy.find_matching_pdf_paths(
             str(business.get("施工区域") or ""),

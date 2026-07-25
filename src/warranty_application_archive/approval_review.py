@@ -34,6 +34,7 @@ CASE_STATUS_LABELS = {
     "approval_pdf_unmatched": "审批PDF待确认",
     "approved": "审批完成",
     "needs_review": "待人工确认",
+    "terminated": "终止",
 }
 CASE_NAME_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})_(?P<content>.+?)_质保作业申请单"
@@ -329,7 +330,10 @@ def build_approval_review(
     applications = [
         application
         for application in dataset.get("applications") or []
-        if not (application.get("approval") or {}).get("pdfs")
+        if (
+            application.get("status") != "terminated"
+            and not (application.get("approval") or {}).get("pdfs")
+        )
     ]
     pending: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
@@ -596,6 +600,7 @@ def apply_review_decisions(
     applications = {
         str(item.get("case_id") or ""): item
         for item in dataset.get("applications") or []
+        if item.get("status") != "terminated"
     }
     unmatched = {
         str(item.get("sha256") or ""): item
@@ -611,7 +616,7 @@ def apply_review_decisions(
         if pdf_hash not in unmatched:
             raise ValueError(f"审批 PDF 已不在待匹配列表: {pdf_hash}")
         if item.get("decision") == "确认匹配" and case_id not in applications:
-            raise ValueError(f"案卷已不存在: {case_id}")
+            raise ValueError(f"案卷已不存在或已终止: {case_id}")
         path = ensure_within(
             root / Path(str(unmatched[pdf_hash].get("path") or "")),
             root,

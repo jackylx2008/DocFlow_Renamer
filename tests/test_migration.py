@@ -7,8 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from openpyxl import load_workbook
-
 from src.warranty_application_archive.approval_review import (
     ApprovalReviewRepository,
     apply_review_decisions,
@@ -17,6 +15,7 @@ from src.warranty_application_archive.approval_review import (
 )
 from src.warranty_application_archive.approval_review_web import (
     export_approval_review_html,
+    save_and_apply_review_payload,
     save_review_payload,
 )
 from src.warranty_application_archive.constants import (
@@ -25,9 +24,9 @@ from src.warranty_application_archive.constants import (
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
     RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     DATA_FILE_NAME,
+    LEGACY_SUMMARY_EXCEL_FILE_NAME,
     TEMPLATE_FILE_NAME,
 )
-from src.warranty_application_archive.excel_export import export_excel
 from src.warranty_application_archive.file_utils import sha256_file
 from src.warranty_application_archive.migration import (
     apply_migration_plan,
@@ -36,6 +35,11 @@ from src.warranty_application_archive.migration import (
     verify_backup,
 )
 from src.warranty_application_archive.repository import JsonRepository
+from src.warranty_application_archive.summary_html import (
+    build_summary_view,
+    export_summary_html,
+)
+from src.warranty_application_archive.validation import validate_summary_html
 from src.warranty_application_archive.workflows import (
     intake_applications,
     ingest_approval_pdfs,
@@ -108,7 +112,9 @@ class MigrationTest(unittest.TestCase):
             dataset = apply_migration_plan(plan)
             repository = JsonRepository(primary)
             repository.save(dataset)
-            excel_path = export_excel(dataset, primary)
+            retired_excel = primary / LEGACY_SUMMARY_EXCEL_FILE_NAME
+            retired_excel.write_bytes(b"retired summary")
+            html_path = export_summary_html(dataset, primary)
 
             case_dir = primary / "_cases" / stem
             self.assertTrue((case_dir / f"{stem}.docx").is_file())
@@ -125,26 +131,34 @@ class MigrationTest(unittest.TestCase):
                 ).is_file()
             )
             self.assertTrue((primary / DATA_FILE_NAME).is_file())
-            self.assertTrue(excel_path.is_file())
-            workbook = load_workbook(excel_path, read_only=False, data_only=True)
-            try:
-                self.assertEqual(
-                    workbook.sheetnames,
-                    [
-                        "申请汇总",
-                        "待补材料",
-                        "待审批PDF",
-                        "已完成",
-                        "本次变更",
-                        "说明",
-                    ],
-                )
-                summary = workbook["申请汇总"]
-                self.assertEqual(summary["A2"].value, "材料齐全，待审批PDF")
-                self.assertEqual(summary["G2"].value, "维修冷塔")
-                self.assertIsNotNone(summary["J2"].hyperlink)
-            finally:
-                workbook.close()
+            self.assertTrue(html_path.is_file())
+            report = validate_summary_html(primary, 1)
+            self.assertTrue(report["valid"], report["errors"])
+            self.assertEqual(
+                report["sheets"],
+                [
+                    "申请汇总",
+                    "待补材料",
+                    "待审批PDF",
+                    "已完成",
+                ],
+            )
+            html = html_path.read_text(encoding="utf-8")
+            self.assertIn("材料齐全，待审批PDF", html)
+            self.assertIn("维修冷塔", html)
+            self.assertIn(f"{stem}.docx", html)
+            self.assertNotIn('"title": "说明"', html)
+            self.assertNotIn('"title": "本次变更"', html)
+            self.assertTrue(dataset.get("changes"))
+            self.assertFalse(retired_excel.exists())
+            self.assertTrue(
+                (
+                    primary
+                    / ".docflow"
+                    / "legacy"
+                    / LEGACY_SUMMARY_EXCEL_FILE_NAME
+                ).is_file()
+            )
 
     def test_backup_mismatch_blocks_migration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -158,6 +172,35 @@ class MigrationTest(unittest.TestCase):
 
             with self.assertRaises(RuntimeError):
                 verify_backup(primary, backup)
+
+    def test_terminated_case_is_gray_and_excluded_from_work_queues(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            application = dataset["applications"][0]
+            application["status"] = "terminated"
+
+            view = build_summary_view(dataset)
+            sheets = {
+                sheet["title"]: sheet
+                for sheet in view["sheets"]
+            }
+            row = sheets["申请汇总"]["rows"][0]
+            self.assertEqual(row[0]["text"], "终止")
+            self.assertTrue(
+                all(cell["tone"] == "terminated" for cell in row)
+            )
+            self.assertEqual(sheets["待补材料"]["rows"], [])
+            self.assertEqual(sheets["待审批PDF"]["rows"], [])
+            self.assertEqual(sheets["已完成"]["rows"], [])
+
+            html_path = export_summary_html(dataset, primary)
+            html = html_path.read_text(encoding="utf-8")
+            self.assertIn("td.tone-terminated", html)
+            self.assertIn('"text": "终止"', html)
 
     def test_worker_list_and_approval_pdf_subworkflows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -448,20 +491,26 @@ class MigrationTest(unittest.TestCase):
                     decision_payload,
                     int(dataset.get("dataset_revision") or 0) + 1,
                 )
-            save_review_payload(
-                review,
-                decision_payload,
-                int(dataset.get("dataset_revision") or 0),
-            )
-            decisions = import_json_decisions(review)
-            applied = apply_review_decisions(
-                dataset,
-                review,
-                decisions,
+            JsonRepository(primary).save(dataset)
+            ApprovalReviewRepository(primary).save(review)
+            applied = save_and_apply_review_payload(
                 primary,
+                Path(__file__).resolve().parents[1],
+                decision_payload,
             )
-            self.assertEqual(applied["confirmed"], 1)
-            self.assertEqual(applied["trashed"], 0)
+            self.assertEqual(
+                applied["approval_pdfs_human_confirmed"],
+                1,
+            )
+            self.assertEqual(
+                applied["approval_pdfs_moved_to_trash"],
+                0,
+            )
+            self.assertEqual(
+                applied["review"]["pending_reviews"],
+                [],
+            )
+            dataset = JsonRepository(primary).load()
             application = dataset["applications"][0]
             self.assertEqual(application["status"], "approved")
             self.assertEqual(
@@ -483,6 +532,9 @@ class MigrationTest(unittest.TestCase):
                 ).is_file()
             )
             self.assertTrue(html_path.is_file())
+            self.assertTrue(
+                (primary / "质保作业申请汇总.html").is_file()
+            )
 
     def test_review_outputs_only_top_strict_candidate_per_inbox_pdf(
         self,
@@ -617,7 +669,7 @@ class MigrationTest(unittest.TestCase):
                 APPROVAL_REVIEW_HTML_FILE_NAME,
             )
             html = html_path.read_text(encoding="utf-8")
-            self.assertIn("保存审核结果到 JSON", html)
+            self.assertIn("保存并执行审核结果", html)
             self.assertNotIn("showOpenFilePicker", html)
             self.assertIn("打开待人工审核匹配PDF.cmd", html)
             self.assertIn("移至 _trash", html)

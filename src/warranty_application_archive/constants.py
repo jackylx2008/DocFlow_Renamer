@@ -5,7 +5,8 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 DATA_FILE_NAME = "质保作业申请数据.json"
-EXCEL_FILE_NAME = "质保作业申请汇总.xlsx"
+SUMMARY_HTML_FILE_NAME = "质保作业申请汇总.html"
+LEGACY_SUMMARY_EXCEL_FILE_NAME = "质保作业申请汇总.xlsx"
 APPROVAL_REVIEW_DATA_FILE_NAME = "待人工审核匹配PDF.json"
 APPROVAL_REVIEW_HTML_FILE_NAME = "待人工审核匹配PDF.html"
 APPROVAL_REVIEW_LAUNCHER_FILE_NAME = "打开待人工审核匹配PDF.cmd"

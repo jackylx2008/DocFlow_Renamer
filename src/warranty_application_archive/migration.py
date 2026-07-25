@@ -14,10 +14,10 @@ from .constants import (
     CASES_DIR_NAME,
     CONFINED_SPACE_ROLE,
     DATA_FILE_NAME,
-    EXCEL_FILE_NAME,
     HIGH_ALTITUDE_ROLE,
     IMAGE_SUFFIXES,
     INBOX_DIR_NAME,
+    LEGACY_SUMMARY_EXCEL_FILE_NAME,
     SAFETY_AGREEMENT_ROLE,
     SIGNED_APPLICATION_ROLE,
     SPECIAL_WORK_ROLE,
@@ -103,7 +103,7 @@ def file_record(
 def _legacy_pdf_matches(
     root: Path, parsed_cases: list[tuple[Path, dict[str, Any]]]
 ) -> dict[str, list[str]]:
-    excel_path = root / EXCEL_FILE_NAME
+    excel_path = root / LEGACY_SUMMARY_EXCEL_FILE_NAME
     if not excel_path.is_file():
         return {}
     cache = legacy.load_existing_pdf_match_cache(excel_path)
@@ -172,7 +172,7 @@ def build_migration_plan(root: Path) -> MigrationPlan:
     parsed_cases = [(word_path, legacy.parse_document(word_path)) for word_path in word_files]
     pdf_matches = _legacy_pdf_matches(root, parsed_cases)
     operations: list[FileOperation] = []
-    legacy_excel = root / EXCEL_FILE_NAME
+    legacy_excel = root / LEGACY_SUMMARY_EXCEL_FILE_NAME
     if legacy_excel.is_file():
         operations.append(
             FileOperation(
@@ -387,7 +387,7 @@ def build_migration_plan(root: Path) -> MigrationPlan:
     unmatched_files: list[dict[str, Any]] = []
     inbox_dir = root / INBOX_DIR_NAME
     excluded_names = {
-        EXCEL_FILE_NAME,
+        LEGACY_SUMMARY_EXCEL_FILE_NAME,
         DATA_FILE_NAME,
     }
     for source in sorted(root.iterdir(), key=lambda item: item.name.lower()):

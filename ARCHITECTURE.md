@@ -10,8 +10,8 @@ subworkflows:
 3. Approved-PDF intake.
 
 All subworkflows operate on the same JSON repository and recognition cache.
-Excel is an output adapter and is never read after the one-time legacy
-migration.
+The summary HTML is an output adapter and is never read as business data.
+Legacy Excel is read only during the one-time migration.
 
 `_input` is the only user-facing drop zone. The input router moves Word and
 image files to the application-material workflow. It recognizes each PDF once,
@@ -20,11 +20,12 @@ application material so they cannot be consumed by the approval workflow.
 `_inbox` is an internal processing area.
 
 Unmatched approval PDFs use a separate staging repository,
-`待人工审核匹配PDF.json`. A local HTML review page writes only to that staging
-repository. The apply command validates the staged IDs, hashes and dataset
-revision before updating the authoritative dataset and rendering the formal
-Excel workbook. Human delete decisions are recoverable moves to `_trash`, not
-filesystem deletion.
+`待人工审核匹配PDF.json`. Saving the local HTML review page validates the staged
+IDs, hashes and dataset revision, immediately applies every non-pending
+decision, and then refreshes the authoritative dataset, formal summary HTML,
+and review artifacts. The standalone apply command remains as a compatibility
+path for decisions saved by older review pages. Human delete decisions are
+recoverable moves to `_trash`, not filesystem deletion.
 
 ## Data authority
 
@@ -52,8 +53,8 @@ Legacy migration is intentionally plan-first:
 4. Execute explicit single-file move/copy operations.
 5. Verify the target hash after every operation.
 6. Persist JSON atomically.
-7. Render Excel from JSON.
-8. Validate JSON, filesystem evidence and workbook shape.
+7. Render summary HTML from JSON.
+8. Validate JSON, filesystem evidence and HTML tab structure.
 
 Incremental workflows also record their file operations. Duplicate evidence is
 moved to quarantine rather than deleted.

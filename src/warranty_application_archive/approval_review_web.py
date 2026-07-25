@@ -18,6 +18,9 @@ from .approval_review import (
     ApprovalReviewRepository,
     DECISION_OPTIONS,
     _archive_legacy_artifact,
+    apply_review_decisions,
+    build_approval_review,
+    import_json_decisions,
 )
 from .constants import (
     APPROVAL_REVIEW_HTML_FILE_NAME,
@@ -28,6 +31,8 @@ from .constants import (
 )
 from .file_utils import atomic_replace_text, ensure_within
 from .repository import JsonRepository
+from .summary_html import export_summary_html
+from .workflows import append_run
 
 
 LOGGER = logging.getLogger(__name__)
@@ -167,6 +172,69 @@ def export_approval_review_html(
     return output
 
 
+def save_and_apply_review_payload(
+    root: Path,
+    repo_root: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Persist submitted decisions and immediately execute non-pending ones."""
+    root = root.resolve()
+    data_repository = JsonRepository(root)
+    review_repository = ApprovalReviewRepository(root)
+    data = data_repository.load()
+    review = review_repository.load()
+    current_revision = int(data.get("dataset_revision") or 0)
+    saved = save_review_payload(
+        review,
+        payload,
+        current_revision,
+    )
+    decisions = import_json_decisions(review)
+    apply_result = {"confirmed": 0, "trashed": 0}
+    formal_html: Path | None = None
+
+    if decisions:
+        apply_result = apply_review_decisions(
+            data,
+            review,
+            decisions,
+            root,
+        )
+        if apply_result["confirmed"] or apply_result["trashed"]:
+            data["dataset_revision"] = current_revision + 1
+        append_run(
+            data,
+            "apply-approval-review-web",
+            {
+                "review_decisions_imported": len(decisions),
+                "approval_pdfs_human_confirmed": apply_result["confirmed"],
+                "approval_pdfs_moved_to_trash": apply_result["trashed"],
+            },
+        )
+        data_repository.save(data)
+        formal_html = export_summary_html(data, root)
+        review = build_approval_review(
+            data,
+            root,
+            repo_root,
+            existing=review,
+        )
+        # Recognition can populate cache entries while the next candidate is
+        # rebuilt, so persist the dataset once more after rebuilding.
+        data_repository.save(data)
+
+    review_repository.save(review)
+    export_approval_review_html(review, root)
+    return {
+        "saved_decisions": saved,
+        "review_decisions_applied": len(decisions),
+        "approval_pdfs_human_confirmed": apply_result["confirmed"],
+        "approval_pdfs_moved_to_trash": apply_result["trashed"],
+        "formal_html": str(formal_html) if formal_html else "",
+        "review": review,
+    }
+
+
 def serve_approval_review(
     root: Path,
     host: str = "127.0.0.1",
@@ -175,7 +243,7 @@ def serve_approval_review(
 ) -> None:
     root = root.resolve()
     review_repository = ApprovalReviewRepository(root)
-    data_repository = JsonRepository(root)
+    repo_root = Path(__file__).resolve().parents[2]
     lock = threading.Lock()
 
     class ReviewHandler(BaseHTTPRequestHandler):
@@ -257,22 +325,12 @@ def serve_approval_review(
                 if not isinstance(payload, dict):
                     raise ValueError("审核结果格式错误")
                 with lock:
-                    review = review_repository.load()
-                    data = data_repository.load()
-                    saved = save_review_payload(
-                        review,
+                    result = save_and_apply_review_payload(
+                        root,
+                        repo_root,
                         payload,
-                        int(data.get("dataset_revision") or 0),
                     )
-                    review_repository.save(review)
-                    export_approval_review_html(review, root)
-                self._send_json(
-                    {
-                        "ok": True,
-                        "saved_decisions": saved,
-                        "review": review,
-                    }
-                )
+                self._send_json({"ok": True, **result})
             except (ValueError, json.JSONDecodeError) as exc:
                 self._send_json(
                     {"ok": False, "error": str(exc)},
@@ -490,7 +548,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         <div class="status"><span id="dot" class="dot"></span><strong id="serverStatus">正在连接本地审核服务…</strong></div>
         <div id="message" class="message"></div>
       </div>
-      <button id="saveButton" type="button" disabled>保存审核结果到 JSON</button>
+      <button id="saveButton" type="button" disabled>保存并执行审核结果</button>
     </div>
     <section class="summary" aria-label="审核概况">
       <div class="metric"><strong id="pendingCount">0</strong><span>待审核候选</span></div>
@@ -534,7 +592,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
         materials_ready: "材料齐全，待审批 PDF",
         approval_pdf_unmatched: "审批 PDF 待确认",
         approved: "审批完成",
-        needs_review: "待人工确认"
+        needs_review: "待人工确认",
+        terminated: "终止"
       }[value] || value || "—";
     }
     function renderPendingCard(item) {
@@ -602,7 +661,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       const trashButton = text("button", "移至 _trash", "trash-button");
       trashButton.type = "button";
       trashButton.addEventListener("click", () => {
-        if (window.confirm(`确认将“${pdf.file_name || "该 PDF"}”标记为移至 _trash？\n保存并应用审核结果后执行，可从 _trash 恢复。`)) {
+        if (window.confirm(`确认将“${pdf.file_name || "该 PDF"}”移至 _trash？\n点击“保存并执行审核结果”后立即移动，可从 _trash 恢复。`)) {
           select.value = "移至_trash";
           if (!note.value.trim()) note.value = "人工审核决定移至 _trash";
           updateStyle();
@@ -673,7 +732,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         const trashButton = text("button", "移至 _trash", "trash-button");
         trashButton.type = "button";
         trashButton.addEventListener("click", () => {
-          if (window.confirm(`确认将“${pdf.file_name || "该 PDF"}”标记为移至 _trash？\n保存并应用审核结果后执行，可从 _trash 恢复。`)) {
+          if (window.confirm(`确认将“${pdf.file_name || "该 PDF"}”移至 _trash？\n点击“保存并执行审核结果”后立即移动，可从 _trash 恢复。`)) {
             select.value = "移至_trash";
             if (!note.value.trim()) note.value = "人工审核决定移至 _trash";
             updateStyle();
@@ -714,7 +773,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     async function connect() {
       if (location.protocol === "file:") {
         byId("serverStatus").textContent = "请通过审核启动器打开";
-        setMessage("双击同目录的“打开待人工审核匹配PDF.cmd”，保存时将固定写入审核 JSON，不再询问位置。", "error");
+        setMessage("双击同目录的“打开待人工审核匹配PDF.cmd”；保存后会立即归档或移至 _trash。", "error");
         return;
       }
       try {
@@ -726,7 +785,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         byId("dot").classList.add("online");
         byId("serverStatus").textContent = "本地审核服务已连接";
         byId("saveButton").disabled = false;
-        setMessage("审核结果保存到待人工审核匹配PDF.json，不会直接修改正式数据。");
+        setMessage("保存后立即执行决定，并同步正式 JSON、汇总 HTML 和本审核页面。");
         render();
       } catch (error) {
         setMessage(error.message || "无法连接本地审核服务", "error");
@@ -753,7 +812,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       if (saveMode === "readonly") return;
       const decisions = collectDecisions();
       byId("saveButton").disabled = true;
-      setMessage("正在校验并保存…");
+      setMessage("正在校验、归档并刷新数据，请稍候…");
       try {
         const response = await fetch("/api/decisions", {
           method: "POST",
@@ -767,7 +826,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
         if (!response.ok || !result.ok) throw new Error(result.error || "保存失败");
         state = result.review;
         render();
-        setMessage(`已保存 ${result.saved_decisions} 条人工决定到待人工审核匹配PDF.json。`, "ok");
+        setMessage(
+          `已处理 ${result.review_decisions_applied} 条：确认归档 ${result.approval_pdfs_human_confirmed} 条，移至 _trash ${result.approval_pdfs_moved_to_trash} 条；待审核列表已刷新。`,
+          "ok"
+        );
       } catch (error) {
         setMessage(error.message || "保存失败", "error");
       } finally {

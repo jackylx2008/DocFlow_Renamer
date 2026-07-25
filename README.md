@@ -1,16 +1,16 @@
 # Warranty Application Archive
 
-质保作业申请案卷归档工具。项目以一份质保申请为一个案卷，完成申报材料入库、统一命名、审批 PDF 回传、JSON 归档和 Excel 人工审查视图生成。
+质保作业申请案卷归档工具。项目以一份质保申请为一个案卷，完成申报材料入库、统一命名、审批 PDF 回传、JSON 归档和 HTML 人工审查视图生成。
 
 ## 核心原则
 
 - `质保作业申请数据.json` 是唯一事实数据源。
-- `质保作业申请汇总.xlsx` 只用于人工调阅，由 JSON 单向生成。
+- `质保作业申请汇总.html` 只用于人工调阅，由 JSON 单向生成。
 - 仅 `_inbox` 第一层中未自动匹配的审批 PDF 使用独立的
   `待人工审核匹配PDF.json/.html` 闭环处理。
 - 自动唯一匹配成功的审批 PDF 视为可信，直接归档，不进入人工审核。
-- 人工在本地 HTML 页面填写审核结果和备注；页面只回写审核 JSON，
-  应用命令校验后再同步正式 JSON/Excel。
+- 人工在本地 HTML 页面填写审核结果和备注；保存时校验并立即同步审核
+  JSON、正式 JSON 和正式汇总 HTML。
 - Word 申请单是案卷锚点，每份申请建立独立目录。
 - AI 客户端和识别缓存由所有支流程共享，同一内容不会重复识别。
 - 文件移动、复制和隔离均记录在 JSON 的 `changes` 中。
@@ -37,7 +37,7 @@
 │  ├─ legacy/               # 迁移前的旧版汇总表
 │  └─ quarantine/           # 可恢复的重复件和已处理公共源文件
 ├─ 质保作业申请数据.json
-├─ 质保作业申请汇总.xlsx
+├─ 质保作业申请汇总.html
 ├─ 待人工审核匹配PDF.json
 ├─ 待人工审核匹配PDF.html
 └─ 打开待人工审核匹配PDF.cmd
@@ -54,7 +54,7 @@
 5. 关联手签图片、人员名单和有限空间/高处作业材料。
 6. 从 `_templates` 复制每份申请必需的安全协议。
 7. 将案卷字段、文件路径、SHA-256、识别结果和缺失材料写入 JSON。
-8. 根据 JSON 更新 Excel，供人工审查和填报飞书。
+8. 根据 JSON 更新汇总 HTML，供人工审查和填报飞书。
 
 ### 2. 审批 PDF 回传
 
@@ -66,7 +66,7 @@
 4. 按施工区域、内容、开始时间和结束时间匹配已有案卷。
 5. 提取申请编号，规范命名并移动到对应案卷目录。
 6. 更新 JSON 中的审批信息和案卷状态。
-7. 根据 JSON 更新 Excel。
+7. 根据 JSON 更新汇总 HTML。
 
 自动匹配要求唯一且证据完整；成功匹配的结果直接视为可信。只有 `_inbox` 第一层中仍未匹配的 PDF 才进入独立人工审核流程：
 
@@ -77,17 +77,20 @@
    “无严格候选”页签单独显示，不强行推荐案卷。
 4. 结果写入 `待人工审核匹配PDF.json`，并生成
    `待人工审核匹配PDF.html`。
-5. 人工可选择 `确认匹配`、`排除`，或点击“移至 `_trash`”；决定先保存
-   到审核 JSON。
+5. 人工可选择 `确认匹配`、`排除`，或点击“移至 `_trash`”，再点击
+   “保存并执行审核结果”。
 6. 程序校验案卷不能重复绑定、隐藏 ID 和 SHA-256 未被修改。
-7. 应用审核结果时，确认项归档到案卷，删除项移动到 `_trash`，正式 JSON
-   更新，再由正式 JSON 重建正式汇总 Excel。
+7. 保存成功后立即执行：确认项归档到案卷，删除项移动到 `_trash`，
+   正式 JSON、正式汇总 HTML 和审核 JSON/HTML 同步刷新；已处理条目
+   从待审核列表消失。
 
 ## 案卷状态
 
 - `materials_incomplete`：缺少必需申报材料。
 - `materials_ready`：材料齐全，等待人工填报或回传审批 PDF。
 - `approved`：审批 PDF 已匹配并归档。
+- `terminated`：案卷已人工终止；保留全部数据与文件，但不再进入待补材料、
+  待审批 PDF 或审批匹配流程，汇总页整行显示为灰色。
 - `needs_review`：识别、匹配或文件状态需要人工确认。
 
 已审批案卷仍保留 `missing_material_types`，用于发现历史材料缺失。
@@ -159,9 +162,9 @@ python warranty_application_archive.py approval-review
 ```
 
 双击 `打开待人工审核匹配PDF.cmd` 启动审核。程序会自动在 Chrome 中打开
-HTML 页面；“保存审核结果到 JSON”固定写入同目录的
-`待人工审核匹配PDF.json`，不会询问保存位置。直接双击 HTML 只能预览，
-不能写入本地文件。
+HTML 页面；“保存并执行审核结果”固定更新同目录的
+`待人工审核匹配PDF.json`，不会询问保存位置，并立即完成确认归档、
+移入 `_trash` 及正式数据刷新。直接双击 HTML 只能预览，不能写入本地文件。
 
 也可以从命令行启动：
 
@@ -169,7 +172,8 @@ HTML 页面；“保存审核结果到 JSON”固定写入同目录的
 python warranty_application_archive.py approval-review-server
 ```
 
-页面保存成功后，在另一个终端应用审核结果：
+正常使用网页时不再需要第二步应用命令。下面的命令只用于兼容处理旧版页面
+已经保存、但尚未执行的审核决定：
 
 ```powershell
 python warranty_application_archive.py apply-approval-review
@@ -178,7 +182,7 @@ python warranty_application_archive.py apply-approval-review
 如果正式 JSON 在审核页面生成后发生过版本变化，页面保存和应用命令都会
 拒绝过期结果，须先重新生成审核文件。
 
-仅从 JSON 重新生成 Excel：
+仅从 JSON 重新生成汇总 HTML：
 
 ```powershell
 python warranty_application_archive.py export
@@ -196,20 +200,24 @@ python warranty_application_archive.py validate
 - 案卷 ID 和文件 ID 是否重复。
 - JSON 中的目录和文件是否存在。
 - 文件大小和 SHA-256 是否一致。
-- Excel 工作表结构和汇总行数是否与 JSON 一致。
+- HTML 页签结构、汇总行数和本地链接是否与 JSON 一致。
 
-## Excel 人工审查视图
+## HTML 人工审查视图
 
-工作簿包含：
+`质保作业申请汇总.html` 包含以下页签：
 
 - `申请汇总`
 - `待补材料`
 - `待审批PDF`
 - `已完成`
-- `本次变更`
-- `说明`
 
-正式 Excel 中的 Word、图片、协议、审批 PDF 和案卷目录均提供本地超链接。正式 Excel 不作为数据输入。
+“说明”和“本次变更”页签不再生成；文件变更记录只保留在正式 JSON 的
+`changes` 中。Word、图片、协议、审批 PDF 和案卷目录均提供本地链接；
+页面支持页签切换、当前页签搜索、固定表头和打印。正式汇总 HTML 不作为
+数据输入。
+
+原 `质保作业申请汇总.xlsx` 不再生成；首次生成正式汇总 HTML 时会将已有
+文件移入 `.docflow/legacy`。
 
 独立的 `待人工审核匹配PDF.html` 包含：
 
@@ -258,7 +266,7 @@ src/warranty_application_archive/
 ├─ workflows.py                    # 申报、人员名单、审批 PDF 支流程
 ├─ approval_review.py              # 未匹配审批 PDF 候选、决定与正式回写
 ├─ approval_review_web.py          # 本地 HTML 审核页与审核 JSON 回写服务
-├─ excel_export.py                 # JSON → Excel
+├─ summary_html.py                 # JSON → 正式汇总 HTML
 ├─ validation.py                   # 数据和成果校验
 └─ legacy.py                       # 迁移期间保留的解析/AI兼容层
 ```

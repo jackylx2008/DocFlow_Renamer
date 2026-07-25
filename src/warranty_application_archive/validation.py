@@ -1,22 +1,20 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 
-from openpyxl import load_workbook
-
-from .constants import EXCEL_FILE_NAME
+from .constants import SUMMARY_HTML_FILE_NAME
 from .file_utils import ensure_within, sha256_file
 
 
-EXPECTED_SHEETS = [
+EXPECTED_SUMMARY_SHEETS = [
     "申请汇总",
     "待补材料",
     "待审批PDF",
     "已完成",
-    "本次变更",
-    "说明",
 ]
 
 
@@ -119,48 +117,99 @@ def _validate_file_record(
         warnings.append(f"文件缺少 SHA-256: {relative_path}")
 
 
-def validate_excel(root: Path, expected_applications: int) -> dict[str, Any]:
-    excel_path = root.resolve() / EXCEL_FILE_NAME
-    if not excel_path.is_file():
+class _SummaryDataParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_summary_data = False
+        self.parts: list[str] = []
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        attributes = dict(attrs)
+        if tag == "script" and attributes.get("id") == "summaryData":
+            self.in_summary_data = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "script" and self.in_summary_data:
+            self.in_summary_data = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_summary_data:
+            self.parts.append(data)
+
+
+def validate_summary_html(
+    root: Path,
+    expected_applications: int,
+) -> dict[str, Any]:
+    root = root.resolve()
+    html_path = root / SUMMARY_HTML_FILE_NAME
+    if not html_path.is_file():
         return {
             "valid": False,
-            "path": str(excel_path),
-            "errors": ["Excel 文件不存在"],
+            "path": str(html_path),
+            "errors": ["汇总 HTML 文件不存在"],
         }
-    workbook = load_workbook(excel_path, read_only=False, data_only=False)
     errors: list[str] = []
     try:
-        if workbook.sheetnames != EXPECTED_SHEETS:
+        parser = _SummaryDataParser()
+        parser.feed(html_path.read_text(encoding="utf-8"))
+        if not parser.parts:
+            raise ValueError("缺少 summaryData 数据块")
+        view = json.loads("".join(parser.parts))
+        sheets = list(view.get("sheets") or [])
+        sheet_names = [str(item.get("title") or "") for item in sheets]
+        if sheet_names != EXPECTED_SUMMARY_SHEETS:
             errors.append(
-                f"工作表不符合预期: {workbook.sheetnames}"
+                f"HTML 页签不符合预期: {sheet_names}"
             )
-        if "申请汇总" in workbook.sheetnames:
-            summary = workbook["申请汇总"]
-            actual_rows = max(0, summary.max_row - 1)
+        summary = next(
+            (
+                item
+                for item in sheets
+                if item.get("title") == "申请汇总"
+            ),
+            None,
+        )
+        if summary is None:
+            errors.append("HTML 缺少申请汇总页签")
+        else:
+            actual_rows = len(summary.get("rows") or [])
             if actual_rows != expected_applications:
                 errors.append(
                     f"申请汇总行数错误: {actual_rows}，预期 {expected_applications}"
                 )
-            hyperlink_columns = (10, 11, 12, 13, 14, 16, 17)
-            for row_index in range(2, summary.max_row + 1):
-                for column_index in hyperlink_columns:
-                    hyperlink = summary.cell(
-                        row=row_index,
-                        column=column_index,
-                    ).hyperlink
-                    if not hyperlink or not hyperlink.target:
-                        continue
-                    if not Path(hyperlink.target).exists():
-                        errors.append(
-                            "Excel 超链接目标不存在: "
-                            f"{summary.cell(row=1, column=column_index).value}"
-                            f" 第 {row_index} 行 -> {hyperlink.target}"
-                        )
-    finally:
-        workbook.close()
+        for sheet in sheets:
+            for row_index, row in enumerate(
+                sheet.get("rows") or [],
+                start=1,
+            ):
+                for cell in row:
+                    for link in cell.get("links") or []:
+                        relative = str(link.get("path") or "")
+                        if not relative:
+                            continue
+                        try:
+                            target = ensure_within(root / relative, root)
+                        except ValueError:
+                            errors.append(
+                                f"HTML 链接路径越界: {relative}"
+                            )
+                            continue
+                        if not target.exists():
+                            errors.append(
+                                "HTML 链接目标不存在: "
+                                f"{sheet.get('title')} 第 {row_index} 行"
+                                f" -> {relative}"
+                            )
+    except (ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"汇总 HTML 数据无效: {exc}")
     return {
         "valid": not errors,
-        "path": str(excel_path),
-        "sheets": EXPECTED_SHEETS,
+        "path": str(html_path),
+        "sheets": EXPECTED_SUMMARY_SHEETS,
         "errors": errors,
     }

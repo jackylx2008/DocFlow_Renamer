@@ -19,14 +19,14 @@ from .approval_review_web import (
     serve_approval_review,
 )
 from .config import AppConfig
-from .excel_export import export_excel
 from .migration import (
     apply_migration_plan,
     build_migration_plan,
     verify_backup,
 )
 from .repository import JsonRepository
-from .validation import validate_dataset, validate_excel
+from .summary_html import export_summary_html
+from .validation import validate_dataset, validate_summary_html
 from .workflows import (
     append_run,
     intake_applications,
@@ -73,8 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("status", help="显示当前 JSON 数据状态")
-    subparsers.add_parser("validate", help="校验 JSON、案卷文件和 Excel")
-    subparsers.add_parser("export", help="从 JSON 重新生成 Excel")
+    subparsers.add_parser("validate", help="校验 JSON、案卷文件和汇总 HTML")
+    subparsers.add_parser("export", help="从 JSON 重新生成汇总 HTML")
     subparsers.add_parser("applications", help="处理待入库质保申请材料")
     subparsers.add_parser("approval-pdfs", help="处理待入库审批 PDF")
     subparsers.add_parser(
@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser(
         "apply-approval-review",
-        help="读取审核 JSON 中的人工决定并同步正式 JSON/Excel",
+        help="读取审核 JSON 中的人工决定并同步正式 JSON/HTML",
     )
     subparsers.add_parser("worker-lists", help="处理待入库施工人员名单")
     subparsers.add_parser("run", help="执行完整增量工作流")
@@ -172,13 +172,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         dataset = apply_migration_plan(plan)
         data_path = repository.save(dataset)
         LOGGER.info("迁移完成，JSON 已保存: %s", data_path)
-        excel_path = export_excel(dataset, config.data_root)
-        LOGGER.info("Excel 已从 JSON 生成: %s", excel_path)
+        html_path = export_summary_html(dataset, config.data_root)
+        LOGGER.info("汇总 HTML 已从 JSON 生成: %s", html_path)
         print(
             json.dumps(
                 {
                     **_status(repository),
-                    "excel_file": str(excel_path),
+                    "html_file": str(html_path),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -193,26 +193,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "validate":
         data = repository.load()
         data_report = validate_dataset(data, config.data_root)
-        excel_report = validate_excel(
+        html_report = validate_summary_html(
             config.data_root,
             len(data.get("applications") or []),
         )
         report = {
             "data": data_report,
-            "excel": excel_report,
+            "html": html_report,
         }
         print(json.dumps(report, ensure_ascii=False, indent=2))
-        return 0 if data_report["valid"] and excel_report["valid"] else 1
+        return 0 if data_report["valid"] and html_report["valid"] else 1
 
     if command == "export":
         data = repository.load()
-        output_path = export_excel(data, config.data_root)
-        LOGGER.info("Excel 已从 JSON 生成: %s", output_path)
+        output_path = export_summary_html(data, config.data_root)
+        LOGGER.info("汇总 HTML 已从 JSON 生成: %s", output_path)
         print(
             json.dumps(
                 {
                     **_status(repository),
-                    "excel_file": str(output_path),
+                    "html_file": str(output_path),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -304,7 +304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
         )
         repository.save(data)
-        formal_excel = export_excel(data, config.data_root)
+        formal_html = export_summary_html(data, config.data_root)
         refreshed_review = build_approval_review(
             data,
             config.data_root,
@@ -322,7 +322,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "review_decisions_imported": len(decisions),
                     "approval_pdfs_human_confirmed": apply_result["confirmed"],
                     "approval_pdfs_moved_to_trash": apply_result["trashed"],
-                    "formal_excel": str(formal_excel),
+                    "formal_html": str(formal_html),
                     "review_json": str(review_path),
                     "review_html": str(review_html),
                 },
@@ -390,7 +390,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
         )
         repository.save(data)
-        excel_path = export_excel(data, config.data_root)
+        html_path = export_summary_html(data, config.data_root)
         review_path = ""
         review_html = ""
         if command in {"approval-pdfs", "run"}:
@@ -413,7 +413,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "approval_pdfs_ingested": approval_count,
                     "worker_lists_ingested": worker_list_count,
                     **route_summary,
-                    "excel_file": str(excel_path),
+                    "html_file": str(html_path),
                     "review_json": review_path,
                     "review_html": review_html,
                 },
