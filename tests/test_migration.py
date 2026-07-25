@@ -1,7 +1,9 @@
+import os
 import shutil
 import tempfile
 import unittest
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -166,6 +168,11 @@ class MigrationTest(unittest.TestCase):
 
             worker_source = inbox / "现场施工人员名单.jpg"
             worker_source.write_bytes(b"new workers")
+            worker_timestamp = datetime(2026, 7, 24, 12, 0).timestamp()
+            os.utime(
+                worker_source,
+                (worker_timestamp, worker_timestamp),
+            )
             application = dataset["applications"][0]
             before_workers = len(
                 application["materials"]["worker_list"]
