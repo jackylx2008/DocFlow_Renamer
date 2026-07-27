@@ -27,12 +27,14 @@ from .approval_review import (
 from .constants import (
     APPROVAL_REVIEW_HTML_FILE_NAME,
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
+    APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
     LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     SUMMARY_HTML_FILE_NAME,
     TRASH_DIR_NAME,
 )
 from .file_utils import atomic_replace_text, ensure_within
+from .launchers import write_page_launchers
 from .repository import JsonRepository
 from .summary_html import export_summary_html
 from .workflows import append_run
@@ -120,6 +122,52 @@ def copy_file_to_windows_clipboard(path: Path) -> None:
         user32.CloseClipboard()
         if handle and not transferred:
             kernel32.GlobalFree(handle)
+
+
+def copy_file_to_macos_clipboard(path: Path) -> None:
+    """Put one file or folder on the macOS clipboard as an alias list."""
+    script = "\n".join(
+        [
+            "on run argv",
+            "set targetItem to POSIX file (item 1 of argv) as alias",
+            "set the clipboard to {targetItem}",
+            "end run",
+        ]
+    )
+    result = subprocess.run(
+        ["osascript", "-e", script, "--", str(path.resolve())],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"无法设置 macOS 文件剪贴板{f'：{detail}' if detail else ''}"
+        )
+
+
+def copy_path_to_system_clipboard(path: Path) -> None:
+    if sys.platform == "win32":
+        copy_file_to_windows_clipboard(path)
+        return
+    if sys.platform == "darwin":
+        copy_file_to_macos_clipboard(path)
+        return
+    raise RuntimeError("直接粘贴文件功能目前仅支持 Windows 和 macOS")
+
+
+def open_path_in_file_manager(path: Path) -> None:
+    if sys.platform == "win32":
+        command = ["explorer.exe", str(path)]
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    elif sys.platform == "darwin":
+        command = ["open", str(path)]
+        creationflags = 0
+    else:
+        command = ["xdg-open", str(path)]
+        creationflags = 0
+    subprocess.Popen(command, creationflags=creationflags)
 
 
 def save_review_payload(
@@ -210,28 +258,18 @@ def export_approval_review_html(
         Path(__file__).resolve().parents[2]
         / "warranty_application_archive.py"
     )
-    launch_command = subprocess.list2cmdline(
+    write_page_launchers(
+        root,
+        entry_point.parent,
         [
             sys.executable,
             str(entry_point),
             "--input-dir",
             str(root),
             "approval-review-server",
-        ]
-    )
-    launcher = root / APPROVAL_REVIEW_LAUNCHER_FILE_NAME
-    atomic_replace_text(
-        launcher,
-        "\n".join(
-            [
-                "@echo off",
-                "chcp 65001 >nul",
-                f'cd /d "{entry_point.parent}"',
-                launch_command,
-                "pause",
-                "",
-            ]
-        ),
+        ],
+        windows_name=APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
+        macos_name=APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
     )
     _archive_legacy_artifact(
         root,
@@ -425,14 +463,7 @@ def serve_approval_review(
                     target = ensure_within(root / Path(relative), root)
                     if not target.is_dir():
                         raise ValueError(f"文件夹不存在: {relative}")
-                    subprocess.Popen(
-                        ["explorer.exe", str(target)],
-                        creationflags=getattr(
-                            subprocess,
-                            "CREATE_NO_WINDOW",
-                            0,
-                        ),
-                    )
+                    open_path_in_file_manager(target)
                     self._send_json({"ok": True})
                     return
                 if request_path == "/api/copy-file":
@@ -443,7 +474,7 @@ def serve_approval_review(
                     if not file_path.exists():
                         raise ValueError(f"文件或文件夹不存在: {relative}")
                     with lock:
-                        copy_file_to_windows_clipboard(file_path)
+                        copy_path_to_system_clipboard(file_path)
                     self._send_json(
                         {
                             "ok": True,
@@ -928,7 +959,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
     async function connect() {
       if (location.protocol === "file:") {
         byId("serverStatus").textContent = "请通过审核启动器打开";
-        setMessage("双击同目录的“打开待人工审核匹配PDF.cmd”；保存后会立即归档或移至 _trash。", "error");
+        setMessage(
+          "Windows 请使用 .cmd，macOS 请使用 .command；保存后会立即归档或移至 _trash。",
+          "error"
+        );
         return;
       }
       try {
@@ -1020,7 +1054,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
     byId("copyFileButton").addEventListener("click", async () => {
       hideFileMenu();
       if (location.protocol === "file:") {
-        setMessage("请用“打开待人工审核匹配PDF.cmd”启动页面后复制文件", "error");
+        setMessage(
+          "请通过启动器打开：Windows 使用 .cmd，macOS 使用 .command",
+          "error"
+        );
         return;
       }
       try {

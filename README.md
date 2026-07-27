@@ -40,7 +40,8 @@
 ├─ 质保作业申请汇总.html
 ├─ 待人工审核匹配PDF.json
 ├─ 待人工审核匹配PDF.html
-└─ 打开待人工审核匹配PDF.cmd
+├─ 打开待人工审核匹配PDF.cmd       # Windows
+└─ 打开待人工审核匹配PDF.command   # macOS
 ```
 
 ## 两阶段工作流
@@ -161,7 +162,8 @@ python warranty_application_archive.py approval-pdfs
 python warranty_application_archive.py approval-review
 ```
 
-双击 `打开待人工审核匹配PDF.cmd` 启动审核。程序会自动在 Chrome 中打开
+Windows 双击 `打开待人工审核匹配PDF.cmd`，macOS 双击
+`打开待人工审核匹配PDF.command` 启动审核。程序会自动在浏览器中打开
 HTML 页面；“保存并执行审核结果”固定更新同目录的
 `待人工审核匹配PDF.json`，不会询问保存位置，并立即完成确认归档、
 移入 `_trash` 及正式数据刷新。直接双击 HTML 只能预览，不能写入本地文件。
@@ -216,11 +218,15 @@ python warranty_application_archive.py validate
 页面支持页签切换、当前页签搜索、固定表头和打印。正式汇总 HTML 不作为
 数据输入。
 
-需要把页面中的文档复制到其他位置时，应双击
-`打开质保作业申请汇总.cmd`，再右键文档链接并选择
-“复制文件（可直接粘贴）”。程序会把真实文件写入 Windows 文件剪贴板，
-随后可在资源管理器等位置直接粘贴。直接双击 HTML 仍可打开文档，但受浏览器
-安全限制，不能复制为可粘贴的文件。
+需要把页面中的文档复制到其他位置时，应先通过对应系统的独立启动器打开：
+
+- Windows：`打开质保作业申请汇总.cmd`
+- macOS：`打开质保作业申请汇总.command`
+
+再右键文档链接并选择“复制文件（可直接粘贴）”。程序会把真实文件写入
+系统文件剪贴板，随后可在 Windows 资源管理器或 macOS Finder 等位置直接
+粘贴。直接双击 HTML 仍可打开文档，但受浏览器安全限制，不能复制为可粘贴
+的文件。
 
 原 `质保作业申请汇总.xlsx` 不再生成；首次生成正式汇总 HTML 时会将已有
 文件移入 `.docflow/legacy`。
@@ -234,8 +240,9 @@ python warranty_application_archive.py validate
 - `已处理记录`：从审核 JSON 展示历史确认、排除和移至 `_trash` 记录。
 - 页面会显示置信度、严格候选数、匹配依据和正式数据版本。
 
-人工审核页面通过 `打开待人工审核匹配PDF.cmd` 启动时，同样可右键文档
-链接并选择“复制文件（可直接粘贴）”。
+人工审核页面使用 Windows 的 `打开待人工审核匹配PDF.cmd` 或 macOS 的
+`打开待人工审核匹配PDF.command` 启动时，同样可右键文档链接并选择
+“复制文件（可直接粘贴）”。
 
 原 `待人工审核匹配PDF.xlsx` 不再生成；首次生成 HTML 时会将已有文件移入
 `.docflow/legacy`，保留历史记录。

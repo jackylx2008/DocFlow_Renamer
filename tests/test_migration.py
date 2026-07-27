@@ -5,7 +5,7 @@ import unittest
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.warranty_application_archive.approval_review import (
     ApprovalReviewRepository,
@@ -15,6 +15,7 @@ from src.warranty_application_archive.approval_review import (
 )
 from src.warranty_application_archive.approval_review_web import (
     _file_drop_clipboard_data,
+    copy_file_to_macos_clipboard,
     export_approval_review_html,
     save_and_apply_review_payload,
     save_review_payload,
@@ -23,10 +24,12 @@ from src.warranty_application_archive.constants import (
     APPROVAL_REVIEW_DATA_FILE_NAME,
     APPROVAL_REVIEW_HTML_FILE_NAME,
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
+    APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
     RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     DATA_FILE_NAME,
     LEGACY_SUMMARY_EXCEL_FILE_NAME,
     SUMMARY_LAUNCHER_FILE_NAME,
+    SUMMARY_MACOS_LAUNCHER_FILE_NAME,
     TEMPLATE_FILE_NAME,
 )
 from src.warranty_application_archive.file_utils import sha256_file
@@ -162,6 +165,14 @@ class MigrationTest(unittest.TestCase):
             self.assertIn(
                 "--page summary",
                 summary_launcher.read_text(encoding="utf-8"),
+            )
+            summary_macos_launcher = (
+                primary / SUMMARY_MACOS_LAUNCHER_FILE_NAME
+            )
+            self.assertTrue(summary_macos_launcher.is_file())
+            self.assertIn(
+                "#!/bin/zsh",
+                summary_macos_launcher.read_text(encoding="utf-8"),
             )
             self.assertTrue(dataset.get("changes"))
             self.assertFalse(retired_excel.exists())
@@ -685,7 +696,7 @@ class MigrationTest(unittest.TestCase):
             html = html_path.read_text(encoding="utf-8")
             self.assertIn("保存并执行审核结果", html)
             self.assertNotIn("showOpenFilePicker", html)
-            self.assertIn("打开待人工审核匹配PDF.cmd", html)
+            self.assertIn("Windows 使用 .cmd，macOS 使用 .command", html)
             self.assertIn("移至 _trash", html)
             self.assertIn(matching_pdf.name, html)
             self.assertIn(unresolved_pdf.name, html)
@@ -703,6 +714,14 @@ class MigrationTest(unittest.TestCase):
             self.assertIn(
                 "approval-review-server",
                 launcher.read_text(encoding="utf-8"),
+            )
+            macos_launcher = (
+                primary / APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME
+            )
+            self.assertTrue(macos_launcher.is_file())
+            self.assertIn(
+                "#!/bin/zsh",
+                macos_launcher.read_text(encoding="utf-8"),
             )
 
             self.assertFalse(retired_excel.exists())
@@ -768,6 +787,25 @@ class MigrationTest(unittest.TestCase):
             payload[20:].decode("utf-16le"),
             f"{path.resolve()}\0\0",
         )
+
+    def test_macos_file_clipboard_uses_alias_list(self) -> None:
+        path = Path("资料") / "审批单.pdf"
+        completed = Mock(
+            returncode=0,
+            stderr="",
+            stdout="",
+        )
+        with patch(
+            "src.warranty_application_archive.approval_review_web."
+            "subprocess.run",
+            return_value=completed,
+        ) as run:
+            copy_file_to_macos_clipboard(path)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "osascript")
+        self.assertIn("set the clipboard to {targetItem}", command[2])
+        self.assertEqual(command[-1], str(path.resolve()))
 
 
 if __name__ == "__main__":

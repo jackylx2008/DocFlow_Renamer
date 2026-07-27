@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -15,8 +14,10 @@ from .constants import (
     LEGACY_SUMMARY_EXCEL_FILE_NAME,
     SUMMARY_HTML_FILE_NAME,
     SUMMARY_LAUNCHER_FILE_NAME,
+    SUMMARY_MACOS_LAUNCHER_FILE_NAME,
 )
 from .file_utils import atomic_replace_text
+from .launchers import write_page_launchers
 
 
 STATUS_LABELS = {
@@ -294,7 +295,9 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
         Path(__file__).resolve().parents[2]
         / "warranty_application_archive.py"
     )
-    launch_command = subprocess.list2cmdline(
+    write_page_launchers(
+        root,
+        entry_point.parent,
         [
             sys.executable,
             str(entry_point),
@@ -305,20 +308,9 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
             "summary",
             "--port",
             "8766",
-        ]
-    )
-    atomic_replace_text(
-        root / SUMMARY_LAUNCHER_FILE_NAME,
-        "\n".join(
-            [
-                "@echo off",
-                "chcp 65001 >nul",
-                f'cd /d "{entry_point.parent}"',
-                launch_command,
-                "pause",
-                "",
-            ]
-        ),
+        ],
+        windows_name=SUMMARY_LAUNCHER_FILE_NAME,
+        macos_name=SUMMARY_MACOS_LAUNCHER_FILE_NAME,
     )
     return output
 
@@ -723,7 +715,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
     byId("copyFileButton").addEventListener("click", async () => {
       hideFileMenu();
       if (location.protocol === "file:") {
-        showCopyMessage("请用“打开质保作业申请汇总.cmd”启动页面后复制文件", true);
+        showCopyMessage(
+          "请通过启动器打开：Windows 使用 .cmd，macOS 使用 .command",
+          true
+        );
         return;
       }
       try {
