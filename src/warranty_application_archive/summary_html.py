@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -12,6 +14,7 @@ from .constants import (
     LEGACY_DIR_NAME,
     LEGACY_SUMMARY_EXCEL_FILE_NAME,
     SUMMARY_HTML_FILE_NAME,
+    SUMMARY_LAUNCHER_FILE_NAME,
 )
 from .file_utils import atomic_replace_text
 
@@ -287,6 +290,36 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
     )
     output = root / SUMMARY_HTML_FILE_NAME
     atomic_replace_text(output, content)
+    entry_point = (
+        Path(__file__).resolve().parents[2]
+        / "warranty_application_archive.py"
+    )
+    launch_command = subprocess.list2cmdline(
+        [
+            sys.executable,
+            str(entry_point),
+            "--input-dir",
+            str(root),
+            "approval-review-server",
+            "--page",
+            "summary",
+            "--port",
+            "8766",
+        ]
+    )
+    atomic_replace_text(
+        root / SUMMARY_LAUNCHER_FILE_NAME,
+        "\n".join(
+            [
+                "@echo off",
+                "chcp 65001 >nul",
+                f'cd /d "{entry_point.parent}"',
+                launch_command,
+                "pause",
+                "",
+            ]
+        ),
+    )
     return output
 
 
@@ -318,6 +351,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       --shadow: 0 12px 30px rgba(32, 51, 73, .11);
     }
     * { box-sizing: border-box; }
+    html, body { max-width: 100%; overflow-x: hidden; }
     body {
       margin: 0;
       color: var(--ink);
@@ -325,14 +359,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
       font-family: "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
     }
     header {
-      padding: 25px max(18px, calc((100vw - 1680px) / 2));
+      padding: 25px max(18px, calc((100vw - 2520px) / 2));
       color: white;
       background: linear-gradient(135deg, var(--navy-dark), #536b86);
     }
     h1 { margin: 0 0 7px; font-size: 25px; }
     header p { margin: 0; color: #dce8f4; font-size: 14px; }
     main {
-      width: min(1680px, calc(100% - 28px));
+      width: min(2520px, calc(100% - 28px));
       margin: 18px auto 50px;
     }
     .metrics {
@@ -404,18 +438,47 @@ _HTML_TEMPLATE = r"""<!doctype html>
       border-bottom: 1px solid var(--line);
       font-size: 13px;
     }
-    .table-wrap { max-height: calc(100vh - 285px); overflow: auto; }
-    table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+    .table-wrap {
+      max-height: calc(100vh - 285px);
+      overflow-x: hidden;
+      overflow-y: auto;
+    }
+    table {
+      width: 100%;
+      table-layout: fixed;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: clamp(11px, .58vw, 13px);
+    }
     th, td {
-      min-width: 116px;
-      max-width: 360px;
-      padding: 10px 11px;
+      min-width: 0;
+      max-width: none;
+      padding: 9px 7px;
       border-right: 1px solid var(--line);
       border-bottom: 1px solid var(--line);
       text-align: left;
       vertical-align: middle;
+      overflow-wrap: anywhere;
       word-break: break-word;
     }
+    th:nth-child(1), td:nth-child(1),
+    th:nth-child(2), td:nth-child(2),
+    th:nth-child(4), td:nth-child(4),
+    th:nth-child(5), td:nth-child(5),
+    th:nth-child(6), td:nth-child(6),
+    th:nth-child(8), td:nth-child(8),
+    th:nth-child(9), td:nth-child(9),
+    th:nth-child(15), td:nth-child(15),
+    th:nth-child(18), td:nth-child(18) { width: 5%; }
+    th:nth-child(3), td:nth-child(3),
+    th:nth-child(7), td:nth-child(7),
+    th:nth-child(10), td:nth-child(10),
+    th:nth-child(11), td:nth-child(11),
+    th:nth-child(12), td:nth-child(12),
+    th:nth-child(13), td:nth-child(13),
+    th:nth-child(14), td:nth-child(14),
+    th:nth-child(16), td:nth-child(16) { width: 6%; }
+    th:nth-child(17), td:nth-child(17) { width: 7%; }
     th {
       position: sticky;
       top: 0;
@@ -435,7 +498,42 @@ _HTML_TEMPLATE = r"""<!doctype html>
     td.tone-terminated { color: #4f5965; background: #d7dbe0 !important; }
     td.tone-terminated a { color: #4f5965; }
     a { color: #075fa8; text-decoration: underline; text-underline-offset: 2px; }
-    .links { display: grid; gap: 5px; }
+    .links { display: grid; min-width: 0; gap: 5px; }
+    .links a { min-width: 0; overflow-wrap: anywhere; }
+    .file-menu {
+      position: fixed;
+      z-index: 20;
+      min-width: 210px;
+      padding: 6px;
+      border: 1px solid #aebccd;
+      border-radius: 8px;
+      background: white;
+      box-shadow: 0 10px 28px rgba(21, 35, 52, .22);
+    }
+    .file-menu button {
+      width: 100%;
+      padding: 9px 12px;
+      border: 0;
+      border-radius: 5px;
+      color: var(--ink);
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+    .file-menu button:hover { background: #e6edf5; }
+    .copy-toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 21;
+      max-width: min(420px, calc(100% - 40px));
+      padding: 11px 16px;
+      border-radius: 8px;
+      color: white;
+      background: #267147;
+      box-shadow: var(--shadow);
+    }
+    .copy-toast.error { background: #a03936; }
     .empty { padding: 34px; color: var(--muted); text-align: center; }
     [hidden] { display: none !important; }
     @media (max-width: 850px) {
@@ -445,6 +543,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
       .toolbar { align-items: stretch; flex-direction: column; }
       .search { width: 100%; }
       .table-wrap { max-height: none; }
+      table { font-size: 10px; }
+      th, td { padding: 7px 4px; }
     }
     @media print {
       header, .metrics, .toolbar, .sheet-status { display: none; }
@@ -484,11 +584,22 @@ _HTML_TEMPLATE = r"""<!doctype html>
       </div>
     </section>
   </main>
+  <div id="fileMenu" class="file-menu" role="menu" hidden>
+    <button id="copyFileButton" type="button" role="menuitem">复制文件（可直接粘贴）</button>
+  </div>
+  <div id="copyToast" class="copy-toast" role="status" hidden></div>
   <script id="summaryData" type="application/json">__SUMMARY_DATA__</script>
   <script>
     const data = JSON.parse(document.getElementById("summaryData").textContent);
     let activeIndex = 0;
     const byId = (id) => document.getElementById(id);
+    const fileUrl = (path, directory = false) => {
+      const normalized = String(path || "").replaceAll("\\", "/").replace(/^\/+/, "");
+      const encoded = normalized.split("/").map(encodeURIComponent).join("/");
+      if (location.protocol === "file:") return `${encoded}${directory ? "/" : ""}`;
+      if (directory) return "#";
+      return `/files/${encoded}`;
+    };
     const text = (tag, value, className = "") => {
       const node = document.createElement(tag);
       node.textContent = value ?? "";
@@ -518,9 +629,32 @@ _HTML_TEMPLATE = r"""<!doctype html>
         const links = text("div", "", "links");
         cell.links.forEach((item) => {
           const anchor = text("a", item.text || item.path || "打开");
-          anchor.href = item.href;
-          anchor.target = "_blank";
+          const directory = String(item.href || "").endsWith("/");
+          anchor.href = fileUrl(item.path || item.href, directory);
+          if (!directory || location.protocol === "file:") {
+            anchor.target = "_blank";
+          }
           anchor.rel = "noopener";
+          anchor.dataset.filePath = item.path || "";
+          anchor.dataset.fileKind = directory ? "directory" : "file";
+          if (directory && location.protocol !== "file:") {
+            anchor.addEventListener("click", async (event) => {
+              event.preventDefault();
+              try {
+                const response = await fetch("/api/open-path", {
+                  method: "POST",
+                  headers: {"Content-Type": "application/json"},
+                  body: JSON.stringify({path: anchor.dataset.filePath}),
+                });
+                const result = await response.json();
+                if (!response.ok || !result.ok) {
+                  throw new Error(result.error || "打开文件夹失败");
+                }
+              } catch (error) {
+                showCopyMessage(error.message || "打开文件夹失败", true);
+              }
+            });
+          }
           links.append(anchor);
         });
         td.append(links);
@@ -555,6 +689,56 @@ _HTML_TEMPLATE = r"""<!doctype html>
       byId("tableHead").hidden = rows.length === 0;
     }
     byId("search").addEventListener("input", renderSheet);
+    let selectedFilePath = "";
+    let toastTimer = 0;
+    const hideFileMenu = () => { byId("fileMenu").hidden = true; };
+    const showCopyMessage = (message, error = false) => {
+      const toast = byId("copyToast");
+      toast.textContent = message;
+      toast.className = `copy-toast${error ? " error" : ""}`;
+      toast.hidden = false;
+      window.clearTimeout(toastTimer);
+      toastTimer = window.setTimeout(() => { toast.hidden = true; }, 3200);
+    };
+    document.addEventListener("contextmenu", (event) => {
+      const anchor = event.target.closest("a[data-file-path]");
+      if (!anchor || !anchor.dataset.filePath) return;
+      event.preventDefault();
+      selectedFilePath = anchor.dataset.filePath;
+      byId("copyFileButton").textContent = (
+        anchor.dataset.fileKind === "directory"
+          ? "复制文件夹（可直接粘贴）"
+          : "复制文件（可直接粘贴）"
+      );
+      const menu = byId("fileMenu");
+      menu.hidden = false;
+      const bounds = menu.getBoundingClientRect();
+      menu.style.left = `${Math.min(event.clientX, window.innerWidth - bounds.width - 8)}px`;
+      menu.style.top = `${Math.min(event.clientY, window.innerHeight - bounds.height - 8)}px`;
+    });
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest("#fileMenu")) hideFileMenu();
+    });
+    window.addEventListener("blur", hideFileMenu);
+    byId("copyFileButton").addEventListener("click", async () => {
+      hideFileMenu();
+      if (location.protocol === "file:") {
+        showCopyMessage("请用“打开质保作业申请汇总.cmd”启动页面后复制文件", true);
+        return;
+      }
+      try {
+        const response = await fetch("/api/copy-file", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({path: selectedFilePath}),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || "复制失败");
+        showCopyMessage(`已复制文件：${result.file_name}`);
+      } catch (error) {
+        showCopyMessage(error.message || "复制失败，请查看程序日志", true);
+      }
+    });
     byId("totalMetric").textContent = data.metrics.total;
     byId("approvedMetric").textContent = data.metrics.approved;
     byId("pendingMetric").textContent = data.metrics.pending;

@@ -38,6 +38,13 @@ from .workflows import (
 
 LOGGER = logging.getLogger(__name__)
 
+STATUS_LABELS = {
+    "materials_incomplete": "材料不完整",
+    "approved": "已审批",
+    "terminated": "已终止",
+    "unknown": "状态未知",
+}
+
 
 def _repo_root() -> Path:
     current_directory = Path.cwd().resolve()
@@ -101,6 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="启动后不自动打开浏览器",
     )
+    review_server_parser.add_argument(
+        "--page",
+        choices=("review", "summary"),
+        default="review",
+        help="启动后打开的页面（默认人工审核页）",
+    )
     subparsers.add_parser(
         "apply-approval-review",
         help="读取审核 JSON 中的人工决定并同步正式 JSON/HTML",
@@ -124,6 +137,54 @@ def _status(repository: JsonRepository) -> dict[str, object]:
         "statuses": statuses,
         "unmatched_files": len(data.get("unmatched_files") or []),
     }
+
+
+def _log_workflow_summary(
+    status: dict[str, object],
+    *,
+    applications_ingested: int,
+    approval_pdfs_ingested: int,
+    worker_lists_ingested: int,
+    route_summary: dict[str, int],
+    html_file: str,
+    review_json: str,
+    review_html: str,
+) -> None:
+    """Write the interactive run report as readable timestamped log lines."""
+    LOGGER.info("增量归档工作流执行完成")
+    LOGGER.info("正式数据文件: %s", status["data_file"])
+    LOGGER.info(
+        "数据版本: %s；申请记录: %s 条；待匹配文件: %s 个",
+        status["dataset_revision"],
+        status["applications"],
+        status["unmatched_files"],
+    )
+    statuses = status.get("statuses")
+    if isinstance(statuses, dict) and statuses:
+        status_description = "，".join(
+            f"{STATUS_LABELS.get(str(name), str(name))} {count} 条"
+            for name, count in statuses.items()
+        )
+        LOGGER.info("申请状态统计: %s", status_description)
+    LOGGER.info(
+        "本次接收: 申请材料 %s 份；审批 PDF %s 份；施工人员名单 %s 份",
+        applications_ingested,
+        approval_pdfs_ingested,
+        worker_lists_ingested,
+    )
+    LOGGER.info(
+        "_input 分流: 共 %s 个文件；审批 PDF %s 个；申请材料 %s 个；"
+        "重复文件隔离 %s 个",
+        route_summary["input_files_routed"],
+        route_summary["approval_pdfs_routed"],
+        route_summary["application_files_routed"],
+        route_summary["input_duplicates_quarantined"],
+    )
+    LOGGER.info("申请汇总页面: %s", html_file)
+    if review_json:
+        LOGGER.info("待人工审核数据: %s", review_json)
+    if review_html:
+        LOGGER.info("待人工审核页面: %s", review_html)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -257,19 +318,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if command == "approval-review-server":
-        if not review_repository.path.is_file():
-            raise FileNotFoundError(
-                "尚未生成审核 JSON，请先运行 approval-review"
+        if args.page == "review":
+            if not review_repository.path.is_file():
+                raise FileNotFoundError(
+                    "尚未生成审核 JSON，请先运行 approval-review"
+                )
+            export_approval_review_html(
+                review_repository.load(),
+                config.data_root,
             )
-        export_approval_review_html(
-            review_repository.load(),
-            config.data_root,
-        )
+        else:
+            if not repository.path.is_file():
+                raise FileNotFoundError("尚未建立正式 JSON 数据")
+            export_summary_html(repository.load(), config.data_root)
         serve_approval_review(
             config.data_root,
             host=args.host,
             port=args.port,
             open_browser=not args.no_open,
+            initial_page=args.page,
         )
         return 0
 
@@ -405,21 +472,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             review_html = str(
                 export_approval_review_html(review, config.data_root)
             )
-        print(
-            json.dumps(
-                {
-                    **_status(repository),
-                    "applications_ingested": application_count,
-                    "approval_pdfs_ingested": approval_count,
-                    "worker_lists_ingested": worker_list_count,
-                    **route_summary,
-                    "html_file": str(html_path),
-                    "review_json": review_path,
-                    "review_html": review_html,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+        _log_workflow_summary(
+            _status(repository),
+            applications_ingested=application_count,
+            approval_pdfs_ingested=approval_count,
+            worker_lists_ingested=worker_list_count,
+            route_summary=route_summary,
+            html_file=str(html_path),
+            review_json=review_path,
+            review_html=review_html,
         )
         return 0
 

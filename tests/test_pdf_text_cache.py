@@ -1,9 +1,10 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.warranty_application_archive import legacy as archive_workflow
+from src.warranty_application_archive.recognition import RecognitionService
 
 
 class PdfTextCacheTest(unittest.TestCase):
@@ -100,6 +101,42 @@ class PdfTextCacheTest(unittest.TestCase):
             self.assertEqual(renamed_count, 1)
             self.assertTrue(target_path.is_file())
             self.assertFalse(pdf_path.exists())
+
+    def test_recognition_logs_local_ai_ocr_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            pdf_path = root / "扫描审批单.pdf"
+            pdf_path.write_bytes(b"scanned pdf")
+            client = Mock()
+
+            with (
+                patch.object(
+                    archive_workflow,
+                    "read_pdf_plain_text",
+                    return_value="",
+                ),
+                patch.object(
+                    archive_workflow,
+                    "read_pdf_ai_ocr_text",
+                    return_value="工程类-主体质保施工 申请编号 202607240001",
+                ),
+                patch.object(
+                    RecognitionService,
+                    "_ensure_client",
+                    return_value=client,
+                ),
+                self.assertLogs(
+                    "src.warranty_application_archive.recognition",
+                    level="INFO",
+                ) as captured,
+            ):
+                text = RecognitionService({}, root).pdf_text(pdf_path)
+
+            messages = "\n".join(captured.output)
+            self.assertIn("PDF 内嵌文本不足，准备调用本地 AI OCR", messages)
+            self.assertIn("本地 AI OCR 开始识别 PDF", messages)
+            self.assertIn("本地 AI OCR 识别完成", messages)
+            self.assertIn("申请编号", text)
 
 
 if __name__ == "__main__":

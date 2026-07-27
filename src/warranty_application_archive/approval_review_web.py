@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import struct
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from datetime import datetime
 from http import HTTPStatus
@@ -27,6 +29,7 @@ from .constants import (
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
     LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
+    SUMMARY_HTML_FILE_NAME,
     TRASH_DIR_NAME,
 )
 from .file_utils import atomic_replace_text, ensure_within
@@ -37,6 +40,8 @@ from .workflows import append_run
 
 LOGGER = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 1024 * 1024
+CF_HDROP = 15
+GMEM_MOVEABLE_ZEROINIT = 0x0042
 
 
 def _json_for_script(value: object) -> str:
@@ -48,6 +53,73 @@ def _json_for_script(value: object) -> str:
         .replace("\u2028", "\\u2028")
         .replace("\u2029", "\\u2029")
     )
+
+
+def _file_drop_clipboard_data(path: Path) -> bytes:
+    """Build a DROPFILES payload containing one absolute UTF-16 file path."""
+    header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+    paths = (str(path.resolve()) + "\0\0").encode("utf-16le")
+    return header + paths
+
+
+def copy_file_to_windows_clipboard(path: Path) -> None:
+    """Put one real file on the Windows clipboard using the CF_HDROP format."""
+    if sys.platform != "win32":
+        raise RuntimeError("直接粘贴文件功能仅支持 Windows")
+
+    import ctypes
+    from ctypes import wintypes
+
+    path = path.resolve()
+    clipboard_data = _file_drop_clipboard_data(path)
+    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.restype = wintypes.HGLOBAL
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.CloseClipboard.restype = wintypes.BOOL
+
+    for attempt in range(5):
+        if user32.OpenClipboard(None):
+            break
+        if attempt == 4:
+            raise RuntimeError("Windows 剪贴板正被其他程序占用，请稍后重试")
+        time.sleep(0.05)
+    handle = None
+    transferred = False
+    try:
+        if not user32.EmptyClipboard():
+            raise RuntimeError("无法清空 Windows 剪贴板")
+        handle = kernel32.GlobalAlloc(
+            GMEM_MOVEABLE_ZEROINIT,
+            len(clipboard_data),
+        )
+        if not handle:
+            raise RuntimeError("无法分配 Windows 剪贴板内存")
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            raise RuntimeError("无法写入 Windows 剪贴板")
+        try:
+            ctypes.memmove(pointer, clipboard_data, len(clipboard_data))
+        finally:
+            kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(CF_HDROP, handle):
+            raise RuntimeError("无法设置 Windows 文件剪贴板")
+        transferred = True
+    finally:
+        user32.CloseClipboard()
+        if handle and not transferred:
+            kernel32.GlobalFree(handle)
 
 
 def save_review_payload(
@@ -240,6 +312,7 @@ def serve_approval_review(
     host: str = "127.0.0.1",
     port: int = 8765,
     open_browser: bool = True,
+    initial_page: str = "review",
 ) -> None:
     root = root.resolve()
     review_repository = ApprovalReviewRepository(root)
@@ -284,9 +357,25 @@ def serve_approval_review(
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path in {"/", f"/{APPROVAL_REVIEW_HTML_FILE_NAME}"}:
-                html_path = root / APPROVAL_REVIEW_HTML_FILE_NAME
+                default_name = (
+                    SUMMARY_HTML_FILE_NAME
+                    if initial_page == "summary"
+                    else APPROVAL_REVIEW_HTML_FILE_NAME
+                )
+                html_path = root / (
+                    default_name if parsed.path == "/" else unquote(
+                        parsed.path.lstrip("/")
+                    )
+                )
                 if not html_path.is_file():
-                    self.send_error(HTTPStatus.NOT_FOUND, "审核页面尚未生成")
+                    self.send_error(HTTPStatus.NOT_FOUND, "页面尚未生成")
+                    return
+                self._send_file(html_path, "text/html; charset=utf-8")
+                return
+            if parsed.path == f"/{SUMMARY_HTML_FILE_NAME}":
+                html_path = root / SUMMARY_HTML_FILE_NAME
+                if not html_path.is_file():
+                    self.send_error(HTTPStatus.NOT_FOUND, "汇总页面尚未生成")
                     return
                 self._send_file(html_path, "text/html; charset=utf-8")
                 return
@@ -312,7 +401,12 @@ def serve_approval_review(
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
-            if urlparse(self.path).path != "/api/decisions":
+            request_path = urlparse(self.path).path
+            if request_path not in {
+                "/api/decisions",
+                "/api/copy-file",
+                "/api/open-path",
+            }:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             try:
@@ -323,7 +417,40 @@ def serve_approval_review(
                     self.rfile.read(length).decode("utf-8")
                 )
                 if not isinstance(payload, dict):
-                    raise ValueError("审核结果格式错误")
+                    raise ValueError("请求格式错误")
+                if request_path == "/api/open-path":
+                    relative = str(payload.get("path") or "").strip()
+                    if not relative:
+                        raise ValueError("缺少待打开文件夹路径")
+                    target = ensure_within(root / Path(relative), root)
+                    if not target.is_dir():
+                        raise ValueError(f"文件夹不存在: {relative}")
+                    subprocess.Popen(
+                        ["explorer.exe", str(target)],
+                        creationflags=getattr(
+                            subprocess,
+                            "CREATE_NO_WINDOW",
+                            0,
+                        ),
+                    )
+                    self._send_json({"ok": True})
+                    return
+                if request_path == "/api/copy-file":
+                    relative = str(payload.get("path") or "").strip()
+                    if not relative:
+                        raise ValueError("缺少待复制文件路径")
+                    file_path = ensure_within(root / Path(relative), root)
+                    if not file_path.exists():
+                        raise ValueError(f"文件或文件夹不存在: {relative}")
+                    with lock:
+                        copy_file_to_windows_clipboard(file_path)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "file_name": file_path.name,
+                        }
+                    )
+                    return
                 with lock:
                     result = save_and_apply_review_payload(
                         root,
@@ -331,13 +458,13 @@ def serve_approval_review(
                         payload,
                     )
                 self._send_json({"ok": True, **result})
-            except (ValueError, json.JSONDecodeError) as exc:
+            except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
                 self._send_json(
                     {"ok": False, "error": str(exc)},
                     HTTPStatus.BAD_REQUEST,
                 )
             except Exception:
-                LOGGER.exception("保存人工审核结果失败")
+                LOGGER.exception("本地页面请求执行失败")
                 self._send_json(
                     {"ok": False, "error": "保存失败，请查看程序日志"},
                     HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -346,8 +473,9 @@ def serve_approval_review(
     server = ThreadingHTTPServer((host, port), ReviewHandler)
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     url = f"http://{display_host}:{server.server_port}/"
-    LOGGER.info("人工审核服务已启动: %s", url)
-    LOGGER.info("审核结果将保存到: %s", review_repository.path)
+    LOGGER.info("本地文档页面服务已启动: %s", url)
+    if initial_page == "review":
+        LOGGER.info("审核结果将保存到: %s", review_repository.path)
     if open_browser:
         webbrowser.open(url)
     try:
@@ -383,6 +511,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       --shadow: 0 12px 32px rgba(35, 54, 78, .10);
     }
     * { box-sizing: border-box; }
+    html, body { max-width: 100%; overflow-x: hidden; }
     body {
       margin: 0;
       background: #f3f6fa;
@@ -390,14 +519,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
       font-family: "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
     }
     header {
-      padding: 28px max(24px, calc((100vw - 1440px) / 2));
+      padding: 28px max(24px, calc((100vw - 2200px) / 2));
       color: white;
       background: linear-gradient(135deg, #35465d, #536b87);
     }
     header h1 { margin: 0 0 8px; font-size: 26px; }
     header p { margin: 0; color: #dce8f5; }
     main {
-      width: min(1440px, calc(100% - 32px));
+      width: min(2200px, calc(100% - 32px));
       margin: 22px auto 56px;
     }
     .toolbar, .summary, .card, .empty {
@@ -416,6 +545,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
       justify-content: space-between;
       padding: 12px 16px;
       margin-bottom: 16px;
+    }
+    .toolbar > *, .card-head > *, .compare > *, .decision > * {
+      min-width: 0;
     }
     .status { display: flex; align-items: center; gap: 10px; }
     .dot { width: 10px; height: 10px; border-radius: 50%; background: #9aa8b7; }
@@ -483,8 +615,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
       line-height: 1.55;
     }
     dt { color: var(--muted); }
-    dd { margin: 0; word-break: break-word; }
-    a { color: #1769aa; }
+    dd { margin: 0; overflow-wrap: anywhere; word-break: break-word; }
+    a { color: #1769aa; overflow-wrap: anywhere; }
     .evidence {
       margin: 0;
       padding: 12px 18px;
@@ -526,6 +658,24 @@ _HTML_TEMPLATE = r"""<!doctype html>
     .message { min-height: 22px; color: var(--muted); }
     .message.ok { color: var(--ok); }
     .message.error { color: var(--bad); }
+    .file-menu {
+      position: fixed;
+      z-index: 20;
+      min-width: 210px;
+      padding: 6px;
+      border: 1px solid #aebccd;
+      border-radius: 8px;
+      background: white;
+      box-shadow: 0 10px 28px rgba(21, 35, 52, .22);
+    }
+    .file-menu button {
+      width: 100%;
+      padding: 9px 12px;
+      color: var(--ink);
+      background: transparent;
+      text-align: left;
+    }
+    .file-menu button:hover { color: var(--ink); background: #e6edf5; }
     [hidden] { display: none !important; }
     @media (max-width: 820px) {
       .summary { grid-template-columns: 1fr 1fr; }
@@ -565,6 +715,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <section id="unresolvedSection" hidden><div id="unresolvedCards" class="cards"></div></section>
     <section id="historySection" hidden><div id="historyCards" class="cards"></div></section>
   </main>
+  <div id="fileMenu" class="file-menu" role="menu" hidden>
+    <button id="copyFileButton" type="button" role="menuitem">复制文件（可直接粘贴）</button>
+  </div>
   <script id="reviewData" type="application/json">__REVIEW_DATA__</script>
   <script>
     let state = JSON.parse(document.getElementById("reviewData").textContent);
@@ -620,6 +773,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       pdfLink.href = fileUrl(pdf.path);
       pdfLink.target = "_blank";
       pdfLink.rel = "noopener";
+      pdfLink.dataset.filePath = pdf.path || "";
       const pdfLinkRow = text("dd");
       pdfLinkRow.append(pdfLink);
       pdfList.append(text("dt", "原文件"), pdfLinkRow);
@@ -703,6 +857,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         link.href = fileUrl(pdf.path);
         link.target = "_blank";
         link.rel = "noopener";
+        link.dataset.filePath = pdf.path || "";
         const linkRow = text("dd");
         linkRow.append(link);
         list.append(text("dt", "原文件"), linkRow);
@@ -845,6 +1000,42 @@ _HTML_TEMPLATE = r"""<!doctype html>
       });
     });
     byId("saveButton").addEventListener("click", save);
+    let selectedFilePath = "";
+    const hideFileMenu = () => { byId("fileMenu").hidden = true; };
+    document.addEventListener("contextmenu", (event) => {
+      const anchor = event.target.closest("a[data-file-path]");
+      if (!anchor || !anchor.dataset.filePath) return;
+      event.preventDefault();
+      selectedFilePath = anchor.dataset.filePath;
+      const menu = byId("fileMenu");
+      menu.hidden = false;
+      const bounds = menu.getBoundingClientRect();
+      menu.style.left = `${Math.min(event.clientX, window.innerWidth - bounds.width - 8)}px`;
+      menu.style.top = `${Math.min(event.clientY, window.innerHeight - bounds.height - 8)}px`;
+    });
+    document.addEventListener("click", (event) => {
+      if (!event.target.closest("#fileMenu")) hideFileMenu();
+    });
+    window.addEventListener("blur", hideFileMenu);
+    byId("copyFileButton").addEventListener("click", async () => {
+      hideFileMenu();
+      if (location.protocol === "file:") {
+        setMessage("请用“打开待人工审核匹配PDF.cmd”启动页面后复制文件", "error");
+        return;
+      }
+      try {
+        const response = await fetch("/api/copy-file", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({path: selectedFilePath}),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || "复制失败");
+        setMessage(`已复制文件：${result.file_name}；可到目标位置直接粘贴。`, "ok");
+      } catch (error) {
+        setMessage(error.message || "复制失败，请查看程序日志", "error");
+      }
+    });
     render();
     connect();
   </script>

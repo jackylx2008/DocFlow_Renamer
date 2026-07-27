@@ -14,6 +14,7 @@ from src.warranty_application_archive.approval_review import (
     import_json_decisions,
 )
 from src.warranty_application_archive.approval_review_web import (
+    _file_drop_clipboard_data,
     export_approval_review_html,
     save_and_apply_review_payload,
     save_review_payload,
@@ -25,6 +26,7 @@ from src.warranty_application_archive.constants import (
     RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     DATA_FILE_NAME,
     LEGACY_SUMMARY_EXCEL_FILE_NAME,
+    SUMMARY_LAUNCHER_FILE_NAME,
     TEMPLATE_FILE_NAME,
 )
 from src.warranty_application_archive.file_utils import sha256_file
@@ -149,6 +151,18 @@ class MigrationTest(unittest.TestCase):
             self.assertIn(f"{stem}.docx", html)
             self.assertNotIn('"title": "说明"', html)
             self.assertNotIn('"title": "本次变更"', html)
+            self.assertIn("width: min(2520px, calc(100% - 28px))", html)
+            self.assertIn("table-layout: fixed", html)
+            self.assertIn("overflow-x: hidden", html)
+            self.assertNotIn("min-width: 116px", html)
+            self.assertIn("复制文件（可直接粘贴）", html)
+            self.assertIn("/api/copy-file", html)
+            summary_launcher = primary / SUMMARY_LAUNCHER_FILE_NAME
+            self.assertTrue(summary_launcher.is_file())
+            self.assertIn(
+                "--page summary",
+                summary_launcher.read_text(encoding="utf-8"),
+            )
             self.assertTrue(dataset.get("changes"))
             self.assertFalse(retired_excel.exists())
             self.assertTrue(
@@ -676,12 +690,21 @@ class MigrationTest(unittest.TestCase):
             self.assertIn(matching_pdf.name, html)
             self.assertIn(unresolved_pdf.name, html)
             self.assertIn('"confidence": 98', html)
+            self.assertIn("width: min(2200px, calc(100% - 32px))", html)
+            self.assertIn(
+                "html, body { max-width: 100%; overflow-x: hidden; }",
+                html,
+            )
+            self.assertIn("overflow-wrap: anywhere", html)
+            self.assertIn("复制文件（可直接粘贴）", html)
+            self.assertIn("/api/copy-file", html)
             launcher = primary / APPROVAL_REVIEW_LAUNCHER_FILE_NAME
             self.assertTrue(launcher.is_file())
             self.assertIn(
                 "approval-review-server",
                 launcher.read_text(encoding="utf-8"),
             )
+
             self.assertFalse(retired_excel.exists())
             self.assertTrue(
                 (
@@ -732,6 +755,19 @@ class MigrationTest(unittest.TestCase):
                     for item in dataset.get("unmatched_files") or []
                 )
             )
+
+    def test_windows_file_clipboard_payload_contains_absolute_path(
+        self,
+    ) -> None:
+        path = Path("资料") / "审批单.pdf"
+        payload = _file_drop_clipboard_data(path)
+
+        self.assertEqual(payload[:4], (20).to_bytes(4, "little"))
+        self.assertEqual(payload[16:20], (1).to_bytes(4, "little"))
+        self.assertEqual(
+            payload[20:].decode("utf-16le"),
+            f"{path.resolve()}\0\0",
+        )
 
 
 if __name__ == "__main__":
