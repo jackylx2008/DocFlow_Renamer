@@ -309,6 +309,13 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
             "--port",
             "8766",
         ],
+        [
+            "approval-review-server",
+            "--page",
+            "summary",
+            "--port",
+            "8766",
+        ],
         windows_name=SUMMARY_LAUNCHER_FILE_NAME,
         macos_name=SUMMARY_MACOS_LAUNCHER_FILE_NAME,
     )

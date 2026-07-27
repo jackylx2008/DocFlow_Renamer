@@ -268,6 +268,7 @@ def export_approval_review_html(
             str(root),
             "approval-review-server",
         ],
+        ["approval-review-server"],
         windows_name=APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
         macos_name=APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
     )

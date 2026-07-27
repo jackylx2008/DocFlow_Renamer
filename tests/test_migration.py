@@ -170,10 +170,20 @@ class MigrationTest(unittest.TestCase):
                 primary / SUMMARY_MACOS_LAUNCHER_FILE_NAME
             )
             self.assertTrue(summary_macos_launcher.is_file())
+            summary_macos_script = summary_macos_launcher.read_text(
+                encoding="utf-8"
+            )
             self.assertIn(
                 "#!/bin/zsh",
-                summary_macos_launcher.read_text(encoding="utf-8"),
+                summary_macos_script,
             )
+            self.assertIn('SCRIPT_DIR="${0:A:h}"', summary_macos_script)
+            self.assertIn(
+                '"$HOME/anaconda3/bin/python"',
+                summary_macos_script,
+            )
+            self.assertIn("DOCFLOW_PROJECT_ROOT", summary_macos_script)
+            self.assertNotIn(str(primary), summary_macos_script)
             self.assertTrue(dataset.get("changes"))
             self.assertFalse(retired_excel.exists())
             self.assertTrue(
@@ -719,10 +729,16 @@ class MigrationTest(unittest.TestCase):
                 primary / APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME
             )
             self.assertTrue(macos_launcher.is_file())
+            macos_script = macos_launcher.read_text(encoding="utf-8")
             self.assertIn(
                 "#!/bin/zsh",
-                macos_launcher.read_text(encoding="utf-8"),
+                macos_script,
             )
+            self.assertIn(
+                '--input-dir "$SCRIPT_DIR" approval-review-server',
+                macos_script,
+            )
+            self.assertNotIn(str(primary), macos_script)
 
             self.assertFalse(retired_excel.exists())
             self.assertTrue(

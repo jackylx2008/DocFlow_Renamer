@@ -223,6 +223,14 @@ python warranty_application_archive.py validate
 - Windows：`打开质保作业申请汇总.cmd`
 - macOS：`打开质保作业申请汇总.command`
 
+macOS 启动器不会保存 Windows 绝对路径。资料目录自动取 `.command` 文件
+所在目录；项目目录会从资料目录逐级向上查找
+`Python/Project/DocFlow_Renamer`，并兼容 `~/Clooustation`、
+`~/CloudStation` 和 `~/Cloudstation`。Python 依次尝试
+`~/anaconda3/bin/python`、`~/opt/anaconda3/bin/python`、
+`/opt/anaconda3/bin/python` 和系统 `python3`。特殊安装位置可通过
+`DOCFLOW_PROJECT_ROOT` 和 `DOCFLOW_PYTHON` 环境变量指定。
+
 再右键文档链接并选择“复制文件（可直接粘贴）”。程序会把真实文件写入
 系统文件剪贴板，随后可在 Windows 资源管理器或 macOS Finder 等位置直接
 粘贴。直接双击 HTML 仍可打开文档，但受浏览器安全限制，不能复制为可粘贴
