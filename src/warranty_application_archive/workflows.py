@@ -100,6 +100,397 @@ def _business_data(parsed: dict[str, Any]) -> dict[str, Any]:
     return {key: parsed.get(key, "") for key in keys}
 
 
+def _application_duplicate_key(
+    business: dict[str, Any],
+) -> tuple[str, str, str, str] | None:
+    start = legacy.normalize_date_for_pdf_match(
+        str(business.get("施工开始时间") or "")
+    )
+    end = legacy.normalize_date_for_pdf_match(
+        str(business.get("施工结束时间") or "")
+    )
+    content = legacy.normalize_match_text(
+        str(business.get("施工内容") or "")
+    )
+    area = legacy.normalize_match_text(
+        str(business.get("施工区域") or "")
+    )
+    if not all((start, end, content, area)):
+        return None
+    return start, end, content, area
+
+
+def _find_duplicate_application(
+    parsed: dict[str, Any],
+    applications: list[dict[str, Any]],
+    root: Path | None = None,
+) -> dict[str, Any] | None:
+    matches = _matching_duplicate_applications(parsed, applications)
+    if not matches:
+        return None
+    selected = max(
+        matches,
+        key=lambda application: _application_completeness_score(
+            application, root
+        ),
+    )
+    if len(matches) > 1:
+        LOGGER.warning(
+            "发现 %d 条相同质保申请记录，按资料完整度保留: %s",
+            len(matches),
+            selected.get("case_name") or "",
+        )
+    return selected
+
+
+def _application_completeness_score(
+    application: dict[str, Any],
+    root: Path | None = None,
+) -> tuple[int, int, int, int, int, int, int]:
+    materials = application.get("materials") or {}
+    required = application.get("required_material_types") or []
+    approval = application.get("approval") or {}
+    valid_materials = {
+        role: [
+            file_item
+            for file_item in (role_files or [])
+            if _application_file_exists(application, file_item, root)
+        ]
+        for role, role_files in materials.items()
+    }
+    approval_files = [
+        file_item
+        for file_item in (approval.get("pdfs") or [])
+        if _application_file_exists(application, file_item, root)
+    ]
+    required_present = sum(
+        1 for role in required if valid_materials.get(role)
+    )
+    filled_roles = sum(
+        1 for role_files in valid_materials.values() if role_files
+    )
+    file_keys = {
+        str(file_item.get("sha256") or file_item.get("path") or "")
+        for role_files in valid_materials.values()
+        for file_item in (role_files or [])
+        if isinstance(file_item, dict)
+    }
+    file_keys.update(
+        str(file_item.get("sha256") or file_item.get("path") or "")
+        for file_item in approval_files
+        if isinstance(file_item, dict)
+    )
+    file_keys.discard("")
+    missing_count = sum(
+        1 for role in required if not valid_materials.get(role)
+    )
+    case_name = str(application.get("case_name") or "")
+    _prefix, separator, suffix = case_name.rpartition("_")
+    original_name = int(
+        not (separator and len(suffix) == 2 and suffix.isdigit())
+    )
+    approved = int(
+        bool(approval_files) or application.get("status") == "approved"
+    )
+    return (
+        required_present,
+        approved,
+        len(approval_files),
+        filled_roles,
+        len(file_keys),
+        -missing_count,
+        original_name,
+    )
+
+
+def _application_file_exists(
+    application: dict[str, Any],
+    file_item: Any,
+    root: Path | None,
+) -> bool:
+    if not isinstance(file_item, dict):
+        return False
+    if root is None:
+        return True
+    relative_path = str(file_item.get("path") or "")
+    relative_case_dir = str(application.get("case_directory") or "")
+    if not relative_path or not relative_case_dir:
+        return False
+    try:
+        path = ensure_within(root / relative_path, root)
+        case_dir = ensure_within(root / relative_case_dir, root)
+        path.relative_to(case_dir)
+    except (ValueError, OSError):
+        return False
+    return path.is_file()
+
+
+def _matching_duplicate_applications(
+    parsed: dict[str, Any],
+    applications: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    incoming_key = _application_duplicate_key(parsed)
+    if incoming_key is None:
+        return []
+    return [
+        application
+        for application in applications
+        if isinstance(application.get("application"), dict)
+        and _application_duplicate_key(application["application"])
+        == incoming_key
+    ]
+
+
+def _quarantine_less_complete_duplicate_cases(
+    dataset: dict[str, Any],
+    parsed: dict[str, Any],
+    retained: dict[str, Any],
+    root: Path,
+    changes: list[dict[str, Any]],
+) -> int:
+    applications = dataset.setdefault("applications", [])
+    duplicates = [
+        application
+        for application in _matching_duplicate_applications(
+            parsed, applications
+        )
+        if application is not retained
+    ]
+    if not duplicates:
+        return 0
+    quarantine_dir = (
+        root
+        / INTERNAL_DIR_NAME
+        / QUARANTINE_DIR_NAME
+        / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        / "duplicate_cases"
+    )
+    removed_ids = {id(application) for application in duplicates}
+    for application in duplicates:
+        _merge_duplicate_case_files(
+            application,
+            retained,
+            root,
+            changes,
+        )
+        relative_case_dir = str(application.get("case_directory") or "")
+        cases_root = root / CASES_DIR_NAME
+        source = (
+            ensure_within(root / relative_case_dir, cases_root)
+            if relative_case_dir
+            else cases_root / "_missing_case_directory"
+        )
+        target = quarantine_dir / (
+            source.name
+            if relative_case_dir
+            else str(application.get("case_id") or "unknown_case")
+        )
+        result = "case_directory_missing"
+        if relative_case_dir and source.is_dir():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(target))
+            result = "completed"
+        changes.append(
+            _change(
+                "quarantine_less_complete_duplicate_case",
+                source,
+                target,
+                "application_case",
+                str(application.get("case_id") or ""),
+                result,
+            )
+        )
+        LOGGER.warning(
+            "重复案卷资料较少，已从汇总移除: 移除=%s；保留=%s；"
+            "案卷目录处理=%s",
+            application.get("case_name") or "",
+            retained.get("case_name") or "",
+            target if result == "completed" else "原案卷目录不存在",
+        )
+    applications[:] = [
+        application
+        for application in applications
+        if id(application) not in removed_ids
+    ]
+    return len(duplicates)
+
+
+def _merge_duplicate_case_files(
+    source_application: dict[str, Any],
+    retained: dict[str, Any],
+    root: Path,
+    changes: list[dict[str, Any]],
+) -> None:
+    retained_materials = retained.setdefault("materials", {})
+    for role, retained_files in list(retained_materials.items()):
+        retained_materials[role] = [
+            file_item
+            for file_item in (retained_files or [])
+            if _application_file_exists(retained, file_item, root)
+        ]
+    retained_case_dir = ensure_within(
+        root / str(retained["case_directory"]),
+        root / CASES_DIR_NAME,
+    )
+    for role, role_files in (
+        source_application.get("materials") or {}
+    ).items():
+        for file_item in role_files or []:
+            if not _application_file_exists(
+                source_application, file_item, root
+            ):
+                continue
+            source = ensure_within(
+                root / str(file_item["path"]),
+                root / CASES_DIR_NAME,
+            )
+            fingerprint = sha256_file(source)
+            if _application_contains_hash(retained, fingerprint):
+                _quarantine_duplicate_application_sources(
+                    [source],
+                    root,
+                    changes,
+                    str(retained.get("case_id") or ""),
+                )
+                continue
+            target = _unique_inbox_target(retained_case_dir, source)
+            _move_verified(source, target, root)
+            retained_materials.setdefault(role, []).append(
+                file_record(
+                    target,
+                    target,
+                    root,
+                    role,
+                    fingerprint=fingerprint,
+                )
+            )
+            changes.append(
+                _change(
+                    "merge_duplicate_case_material",
+                    source,
+                    target,
+                    role,
+                    str(retained.get("case_id") or ""),
+                )
+            )
+    retained_approval = retained.setdefault("approval", {})
+    retained_approval_files = [
+        file_item
+        for file_item in (retained_approval.get("pdfs") or [])
+        if _application_file_exists(retained, file_item, root)
+    ]
+    retained_approval["pdfs"] = retained_approval_files
+    known_approval_hashes = {
+        str(file_item.get("sha256") or "")
+        for file_item in retained_approval_files
+    }
+    source_approval = source_application.get("approval") or {}
+    for file_item in source_approval.get("pdfs") or []:
+        if not _application_file_exists(
+            source_application, file_item, root
+        ):
+            continue
+        source = ensure_within(
+            root / str(file_item["path"]),
+            root / CASES_DIR_NAME,
+        )
+        fingerprint = sha256_file(source)
+        if fingerprint in known_approval_hashes:
+            _quarantine_duplicate_application_sources(
+                [source],
+                root,
+                changes,
+                str(retained.get("case_id") or ""),
+            )
+            continue
+        target = _unique_inbox_target(retained_case_dir, source)
+        _move_verified(source, target, root)
+        retained_approval_files.append(
+            file_record(
+                target,
+                target,
+                root,
+                APPROVAL_PDF_ROLE,
+                fingerprint=fingerprint,
+            )
+        )
+        known_approval_hashes.add(fingerprint)
+        changes.append(
+            _change(
+                "merge_duplicate_case_approval",
+                source,
+                target,
+                APPROVAL_PDF_ROLE,
+                str(retained.get("case_id") or ""),
+            )
+        )
+    if retained_approval_files:
+        for field in ("application_no", "match_source"):
+            if not retained_approval.get(field) and source_approval.get(
+                field
+            ):
+                retained_approval[field] = source_approval[field]
+        retained_approval["status"] = "approved"
+    _refresh_status(retained)
+
+
+def deduplicate_applications(
+    dataset: dict[str, Any],
+    root: Path,
+    checkpoint: Callable[[dict[str, Any]], None] | None = None,
+) -> int:
+    root = root.resolve()
+    applications = dataset.setdefault("applications", [])
+    changes = dataset.setdefault("changes", [])
+    duplicate_keys = {
+        key
+        for application in applications
+        if isinstance(application.get("application"), dict)
+        if (key := _application_duplicate_key(application["application"]))
+        is not None
+        if sum(
+            1
+            for candidate in applications
+            if isinstance(candidate.get("application"), dict)
+            and _application_duplicate_key(candidate["application"]) == key
+        )
+        > 1
+    }
+    removed = 0
+    for duplicate_key in duplicate_keys:
+        matches = [
+            application
+            for application in applications
+            if isinstance(application.get("application"), dict)
+            and _application_duplicate_key(application["application"])
+            == duplicate_key
+        ]
+        if len(matches) < 2:
+            continue
+        retained = max(
+            matches,
+            key=lambda application: _application_completeness_score(
+                application, root
+            ),
+        )
+        business = retained.get("application") or {}
+        LOGGER.warning(
+            "发现 %d 条相同质保申请记录，按资料完整度保留: %s",
+            len(matches),
+            retained.get("case_name") or "",
+        )
+        removed += _quarantine_less_complete_duplicate_cases(
+            dataset,
+            business,
+            retained,
+            root,
+            changes,
+        )
+        if checkpoint:
+            checkpoint(dataset)
+    return removed
+
+
 def _next_case_name(
     base_name: str, applications: list[dict[str, Any]]
 ) -> str:
@@ -172,15 +563,21 @@ def _archive_material(
     return target
 
 
-def _classify_recognized_image(text: str) -> str:
+def _classify_recognized_image(text: str) -> str | None:
     normalized = legacy.normalize_match_text(text)
-    if "工人名单" in normalized or "人员名单" in normalized:
+    if (
+        "工人名单" in normalized
+        or "人员名单" in normalized
+        or all(label in normalized for label in ("姓名", "性别", "电话"))
+    ):
         return WORKER_LIST_ROLE
+    if "质保作业申请单" in normalized or "质保申请单" in normalized:
+        return SIGNED_APPLICATION_ROLE
     if "有限空间" in normalized:
         return CONFINED_SPACE_ROLE
     if "高处作业" in normalized or "高空作业" in normalized:
         return HIGH_ALTITUDE_ROLE
-    return SIGNED_APPLICATION_ROLE
+    return None
 
 
 def _is_approval_pdf(path: Path, text: str) -> tuple[bool, str]:
@@ -240,11 +637,115 @@ def _quarantine_input_duplicate(
     return quarantine
 
 
+def _quarantine_duplicate_application_sources(
+    sources: list[Path],
+    root: Path,
+    changes: list[dict[str, Any]],
+    case_id: str,
+) -> list[Path]:
+    quarantine_dir = (
+        root
+        / INTERNAL_DIR_NAME
+        / QUARANTINE_DIR_NAME
+        / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    )
+    quarantined: list[Path] = []
+    for source in sources:
+        source = ensure_within(source, root)
+        target = quarantine_dir / source.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+        changes.append(
+            _change(
+                "quarantine_duplicate_application",
+                source,
+                target,
+                WORD_ROLE if source.suffix.lower() == ".docx" else "input_file",
+                case_id,
+            )
+        )
+        quarantined.append(target)
+    return quarantined
+
+
+def _application_contains_hash(
+    application: dict[str, Any],
+    fingerprint: str,
+) -> bool:
+    return any(
+        str(file_item.get("sha256") or "") == fingerprint
+        for role_files in (application.get("materials") or {}).values()
+        for file_item in role_files or []
+        if isinstance(file_item, dict)
+    )
+
+
+def _archive_material_once(
+    application: dict[str, Any],
+    source: Path,
+    role: str,
+    root: Path,
+    changes: list[dict[str, Any]],
+) -> bool:
+    fingerprint = sha256_file(source)
+    if _application_contains_hash(application, fingerprint):
+        quarantined = _quarantine_duplicate_application_sources(
+            [source],
+            root,
+            changes,
+            str(application.get("case_id") or ""),
+        )
+        LOGGER.warning(
+            "申请材料内容重复，未再次归档: 文件=%s；案卷=%s；"
+            "SHA-256=%s；重复文件已移至=%s",
+            source.name,
+            application.get("case_name") or "",
+            fingerprint,
+            quarantined[0],
+        )
+        return False
+    _archive_material(application, source, role, root, changes)
+    return True
+
+
+def _input_batch_files(
+    dataset: dict[str, Any],
+    root: Path,
+    input_batch_id: str,
+) -> set[Path]:
+    if not input_batch_id:
+        return set()
+    paths: set[Path] = set()
+    for item in dataset.get("input_routes") or []:
+        if (
+            item.get("input_batch_id") != input_batch_id
+            or item.get("kind") != APPLICATION_MATERIAL_ROUTE
+        ):
+            continue
+        relative_path = str(item.get("processing_path") or "")
+        if not relative_path and item.get("action") == "routed":
+            relative_path = str(item.get("path") or "")
+        if not relative_path and item.get("action") == "quarantine_duplicate":
+            source_name = Path(str(item.get("source_path") or "")).name
+            relative_path = str(Path("_inbox") / source_name)
+        try:
+            path = ensure_within(
+                root / Path(relative_path),
+                root,
+            )
+        except ValueError:
+            continue
+        if path.is_file():
+            paths.add(path.resolve())
+    return paths
+
+
 def route_input_files(
     dataset: dict[str, Any],
     root: Path,
     repo_root: Path,
     checkpoint: Callable[[dict[str, Any]], None] | None = None,
+    input_batch_id: str = "",
 ) -> dict[str, int]:
     """Classify the public _input drop zone before business workflows run."""
     root = root.resolve()
@@ -269,6 +770,7 @@ def route_input_files(
     if not sources:
         return summary
 
+    resolved_batch_id = input_batch_id or str(uuid.uuid4())
     routes = dataset.setdefault("input_routes", [])
     changes = dataset.setdefault("changes", [])
     with RecognitionService(dataset, repo_root) as recognition:
@@ -333,6 +835,7 @@ def route_input_files(
                 )
                 summary["input_duplicates_quarantined"] += 1
                 action = "quarantine_duplicate"
+                processing_target = existing_target
             else:
                 target = _unique_inbox_target(inbox, source)
                 _move_verified(source, target, root)
@@ -346,6 +849,7 @@ def route_input_files(
                 )
                 summary["input_files_routed"] += 1
                 action = "routed"
+                processing_target = target
 
             routes.append(
                 {
@@ -356,10 +860,15 @@ def route_input_files(
                         root,
                     ),
                     "path": relative_posix(target, root),
+                    "processing_path": relative_posix(
+                        processing_target,
+                        root,
+                    ),
                     "kind": route_kind,
                     "reason": reason,
                     "recognition_method": recognition_method,
                     "action": action,
+                    "input_batch_id": resolved_batch_id,
                     "routed_at": datetime.now().astimezone().isoformat(
                         timespec="seconds"
                     ),
@@ -379,6 +888,7 @@ def intake_applications(
     root: Path,
     repo_root: Path,
     checkpoint: Callable[[dict[str, Any]], None] | None = None,
+    input_batch_id: str = "",
 ) -> int:
     root = root.resolve()
     inbox = root / "_inbox"
@@ -400,6 +910,18 @@ def intake_applications(
     template_hash = sha256_file(template)
     created: list[dict[str, Any]] = []
     claimed: set[Path] = set()
+    batch_files = _input_batch_files(dataset, root, input_batch_id)
+    batch_word_files = {
+        path
+        for path in batch_files
+        if path.suffix.lower() == ".docx"
+    }
+    single_batch_word = (
+        next(iter(batch_word_files))
+        if len(batch_word_files) == 1
+        else None
+    )
+    batch_application: dict[str, Any] | None = None
 
     for source_word in word_files:
         parsed = legacy.parse_document(source_word)
@@ -408,6 +930,72 @@ def intake_applications(
             str(parsed["施工内容"]),
         )
         base_case_name = Path(canonical_word_name).stem
+        duplicate = _find_duplicate_application(
+            parsed, applications, root
+        )
+        if duplicate is not None:
+            removed_duplicates = (
+                _quarantine_less_complete_duplicate_cases(
+                    dataset,
+                    parsed,
+                    duplicate,
+                    root,
+                    changes,
+                )
+            )
+            quarantined = _quarantine_duplicate_application_sources(
+                [source_word],
+                root,
+                changes,
+                str(duplicate.get("case_id") or ""),
+            )
+            claimed.add(source_word.resolve())
+            if (
+                single_batch_word is not None
+                and source_word.resolve() == single_batch_word
+            ):
+                batch_application = duplicate
+            duplicate_business = duplicate.get("application") or {}
+            LOGGER.warning(
+                "检测到重复质保申请，已跳过写入 JSON: 文件=%s；"
+                "已有案卷=%s；施工开始时间=%s；施工结束时间=%s；"
+                "施工内容=%s；施工区域=%s；重复文件已移至=%s",
+                source_word.name,
+                duplicate.get("case_name") or "",
+                duplicate_business.get("施工开始时间") or "",
+                duplicate_business.get("施工结束时间") or "",
+                duplicate_business.get("施工内容") or "",
+                duplicate_business.get("施工区域") or "",
+                quarantined[0].parent,
+            )
+            if removed_duplicates and checkpoint:
+                checkpoint(dataset)
+            direct_candidates = sorted(
+                path
+                for path in inbox.iterdir()
+                if path.is_file()
+                and path.resolve() not in claimed
+                and path.suffix.lower()
+                in {*IMAGE_SUFFIXES, ".pdf"}
+            )
+            for candidate in direct_candidates:
+                role = material_role(candidate, source_word.stem)
+                if role is None:
+                    role = material_role(candidate, base_case_name)
+                if role is None:
+                    continue
+                _archive_material_once(
+                    duplicate,
+                    candidate,
+                    role,
+                    root,
+                    changes,
+                )
+                claimed.add(candidate.resolve())
+            _refresh_status(duplicate)
+            if checkpoint:
+                checkpoint(dataset)
+            continue
         case_name = _next_case_name(base_case_name, applications)
         case_id = str(uuid.uuid5(CASE_NAMESPACE, case_name))
         case_dir = root / CASES_DIR_NAME / case_name
@@ -460,6 +1048,11 @@ def intake_applications(
         }
         applications.append(application)
         created.append(application)
+        if (
+            single_batch_word is not None
+            and source_word.resolve() == single_batch_word
+        ):
+            batch_application = application
 
         direct_candidates = sorted(
             path
@@ -475,7 +1068,13 @@ def intake_applications(
                 role = material_role(candidate, base_case_name)
             if role is None:
                 continue
-            _archive_material(application, candidate, role, root, changes)
+            _archive_material_once(
+                application,
+                candidate,
+                role,
+                root,
+                changes,
+            )
             claimed.add(candidate.resolve())
 
         agreement_target = (
@@ -513,8 +1112,6 @@ def intake_applications(
         if path.is_file()
         and path.suffix.lower() in IMAGE_SUFFIXES
         and path.resolve() not in claimed
-        and "工人名单" not in path.stem
-        and "人员名单" not in path.stem
     )
     with RecognitionService(dataset, repo_root) as recognition:
         for image in remaining_images:
@@ -525,23 +1122,44 @@ def intake_applications(
                 continue
             if checkpoint:
                 checkpoint(dataset)
-            candidates = [
-                application
-                for application in created
-                if legacy.normalize_match_text(
-                    str(
-                        (application.get("application") or {}).get(
-                            "施工内容"
-                        )
-                        or ""
-                    )
-                )
-                in text
-            ]
-            if len(candidates) != 1:
-                continue
             role = _classify_recognized_image(text)
-            _archive_material(
+            if role is None:
+                LOGGER.warning(
+                    "无法判断申请材料图片类型，保留在 _inbox: %s",
+                    image.name,
+                )
+                continue
+            if (
+                batch_application is not None
+                and image.resolve() in batch_files
+            ):
+                candidates = [batch_application]
+                LOGGER.info(
+                    "按 _input 同批投放策略关联申请材料: %s -> %s",
+                    image.name,
+                    batch_application.get("case_name") or "",
+                )
+            else:
+                candidates = [
+                    application
+                    for application in created
+                    if legacy.normalize_match_text(
+                        str(
+                            (application.get("application") or {}).get(
+                                "施工内容"
+                            )
+                            or ""
+                        )
+                    )
+                    in text
+                ]
+            if len(candidates) != 1:
+                LOGGER.warning(
+                    "申请材料图片无法唯一关联案卷，保留在 _inbox: %s",
+                    image.name,
+                )
+                continue
+            _archive_material_once(
                 candidates[0],
                 image,
                 role,

@@ -47,16 +47,14 @@ SUMMARY_HEADERS = [
     "施工结束时间",
     "施工内容",
     "危险作业",
-    "缺少材料",
+    "质保负责人及联系电话",
+    "施工负责人及联系电话",
     "Word申请单",
     "手签申请单",
     "施工人员名单",
     "专项作业材料",
     "安全协议",
-    "审批编号",
     "审批PDF",
-    "案卷目录",
-    "案卷ID",
 ]
 SUMMARY_SHEET_NAMES = [
     "申请汇总",
@@ -106,12 +104,32 @@ def _cell(
     *,
     links: list[dict[str, str]] | None = None,
     tone: str = "",
+    copy_text: Any = "",
+    copy_name: Any = "",
+    copy_phone: Any = "",
 ) -> dict[str, Any]:
+    resolved_text = str(copy_text or "").strip()
+    resolved_name = str(copy_name or "").strip()
+    resolved_phone = str(copy_phone or "").strip()
     return {
         "text": str(value or ""),
         "links": links or [],
         "tone": tone,
+        "copyable": bool(
+            resolved_text or resolved_name or resolved_phone
+        ),
+        "copy_text": resolved_text,
+        "copy_name": resolved_name,
+        "copy_phone": resolved_phone,
     }
+
+
+def _contact_text(name: Any, phone: Any) -> str:
+    return " ".join(
+        value
+        for value in (str(name or "").strip(), str(phone or "").strip())
+        if value
+    )
 
 
 def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
@@ -138,39 +156,52 @@ def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
         "materials_incomplete": "warning",
         "needs_review": "danger",
     }.get(status, "")
-    case_directory = str(application.get("case_directory") or "")
+    status_text = STATUS_LABELS.get(status, status)
+    if missing and status != "terminated":
+        status_text = f"{status_text}：{'、'.join(missing)}"
     cells = [
-        _cell(STATUS_LABELS.get(status, status), tone=status_tone),
+        _cell(status_text, tone=status_tone),
         _cell(
             "完整" if not missing else "缺少材料",
             tone="success" if not missing else "warning",
         ),
-        _cell(business.get("项目名称", "")),
-        _cell(business.get("施工区域", "")),
+        _cell(
+            business.get("项目名称", ""),
+            copy_text=business.get("项目名称", ""),
+        ),
+        _cell(
+            business.get("施工区域", ""),
+            copy_text=business.get("施工区域", ""),
+        ),
         _cell(business.get("施工开始时间", "")),
         _cell(business.get("施工结束时间", "")),
-        _cell(business.get("施工内容", "")),
+        _cell(
+            business.get("施工内容", ""),
+            copy_text=business.get("施工内容", ""),
+        ),
         _cell(business.get("危险作业", "")),
-        _cell("；".join(missing), tone="warning" if missing else ""),
+        _cell(
+            _contact_text(
+                business.get("质保负责人", ""),
+                business.get("质保负责人联系电话", ""),
+            ),
+            copy_name=business.get("质保负责人", ""),
+            copy_phone=business.get("质保负责人联系电话", ""),
+        ),
+        _cell(
+            _contact_text(
+                business.get("施工负责人", ""),
+                business.get("施工负责人联系电话", ""),
+            ),
+            copy_name=business.get("施工负责人", ""),
+            copy_phone=business.get("施工负责人联系电话", ""),
+        ),
         _cell(links=_file_links(word_files)),
         _cell(links=_file_links(signed_files)),
         _cell(links=_file_links(worker_files)),
         _cell(links=_file_links(special_files)),
         _cell(links=_file_links(safety_files)),
-        _cell(approval.get("application_no", "")),
         _cell(links=_file_links(approval_files)),
-        _cell(
-            links=[
-                {
-                    "text": case_directory,
-                    "href": _relative_href(case_directory, directory=True),
-                    "path": case_directory,
-                }
-            ]
-            if case_directory
-            else []
-        ),
-        _cell(application.get("case_id", "")),
     ]
     if status == "terminated":
         for cell in cells:
@@ -461,23 +492,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
       word-break: break-word;
     }
     th:nth-child(1), td:nth-child(1),
-    th:nth-child(2), td:nth-child(2),
-    th:nth-child(4), td:nth-child(4),
-    th:nth-child(5), td:nth-child(5),
-    th:nth-child(6), td:nth-child(6),
-    th:nth-child(8), td:nth-child(8),
     th:nth-child(9), td:nth-child(9),
-    th:nth-child(15), td:nth-child(15),
-    th:nth-child(18), td:nth-child(18) { width: 5%; }
-    th:nth-child(3), td:nth-child(3),
-    th:nth-child(7), td:nth-child(7),
     th:nth-child(10), td:nth-child(10),
     th:nth-child(11), td:nth-child(11),
+    th:nth-child(15), td:nth-child(15) { width: 7%; }
+    th:nth-child(2), td:nth-child(2),
+    th:nth-child(5), td:nth-child(5),
+    th:nth-child(6), td:nth-child(6),
+    th:nth-child(8), td:nth-child(8) { width: 5%; }
+    th:nth-child(3), td:nth-child(3),
+    th:nth-child(4), td:nth-child(4),
     th:nth-child(12), td:nth-child(12),
     th:nth-child(13), td:nth-child(13),
     th:nth-child(14), td:nth-child(14),
     th:nth-child(16), td:nth-child(16) { width: 6%; }
-    th:nth-child(17), td:nth-child(17) { width: 7%; }
+    th:nth-child(7), td:nth-child(7) { width: 9%; }
     th {
       position: sticky;
       top: 0;
@@ -499,6 +528,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
     a { color: #075fa8; text-decoration: underline; text-underline-offset: 2px; }
     .links { display: grid; min-width: 0; gap: 5px; }
     .links a { min-width: 0; overflow-wrap: anywhere; }
+    .copyable-cell { cursor: context-menu; }
+    .copyable-cell:hover { box-shadow: inset 0 0 0 2px #5b87b4; }
     .file-menu {
       position: fixed;
       z-index: 20;
@@ -584,7 +615,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
     </section>
   </main>
   <div id="fileMenu" class="file-menu" role="menu" hidden>
-    <button id="copyFileButton" type="button" role="menuitem">复制文件（可直接粘贴）</button>
+    <button id="copyFileButton" type="button" role="menuitem" hidden>复制文件（可直接粘贴）</button>
+    <button id="copyTextButton" type="button" role="menuitem" hidden>复制内容</button>
+    <button id="copyNameButton" type="button" role="menuitem" hidden>复制姓名</button>
+    <button id="copyPhoneButton" type="button" role="menuitem" hidden>复制电话</button>
   </div>
   <div id="copyToast" class="copy-toast" role="status" hidden></div>
   <script id="summaryData" type="application/json">__SUMMARY_DATA__</script>
@@ -624,6 +658,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
     function renderCell(cell) {
       const td = document.createElement("td");
       if (cell.tone) td.className = `tone-${cell.tone}`;
+      if (cell.copyable && cell.text) {
+        td.classList.add("copyable-cell");
+        if (cell.copy_text) td.dataset.copyText = cell.copy_text;
+        if (cell.copy_name) td.dataset.copyName = cell.copy_name;
+        if (cell.copy_phone) td.dataset.copyPhone = cell.copy_phone;
+        td.title = cell.copy_text
+          ? "右键复制内容"
+          : "右键分别复制姓名或电话";
+      }
       if (cell.links && cell.links.length) {
         const links = text("div", "", "links");
         cell.links.forEach((item) => {
@@ -689,6 +732,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
     }
     byId("search").addEventListener("input", renderSheet);
     let selectedFilePath = "";
+    let selectedCopyText = "";
+    let selectedCopyName = "";
+    let selectedCopyPhone = "";
     let toastTimer = 0;
     const hideFileMenu = () => { byId("fileMenu").hidden = true; };
     const showCopyMessage = (message, error = false) => {
@@ -701,14 +747,49 @@ _HTML_TEMPLATE = r"""<!doctype html>
     };
     document.addEventListener("contextmenu", (event) => {
       const anchor = event.target.closest("a[data-file-path]");
-      if (!anchor || !anchor.dataset.filePath) return;
-      event.preventDefault();
-      selectedFilePath = anchor.dataset.filePath;
-      byId("copyFileButton").textContent = (
-        anchor.dataset.fileKind === "directory"
-          ? "复制文件夹（可直接粘贴）"
-          : "复制文件（可直接粘贴）"
+      const copyCell = event.target.closest(
+        "td[data-copy-text], td[data-copy-name], td[data-copy-phone]"
       );
+      if (
+        (!anchor || !anchor.dataset.filePath)
+        && (
+          !copyCell
+          || (
+            !copyCell.dataset.copyText
+            && !copyCell.dataset.copyName
+            && !copyCell.dataset.copyPhone
+          )
+        )
+      ) return;
+      event.preventDefault();
+      const copyFileButton = byId("copyFileButton");
+      const copyTextButton = byId("copyTextButton");
+      const copyNameButton = byId("copyNameButton");
+      const copyPhoneButton = byId("copyPhoneButton");
+      copyFileButton.hidden = true;
+      copyTextButton.hidden = true;
+      copyNameButton.hidden = true;
+      copyPhoneButton.hidden = true;
+      if (anchor && anchor.dataset.filePath) {
+        selectedFilePath = anchor.dataset.filePath;
+        selectedCopyText = "";
+        selectedCopyName = "";
+        selectedCopyPhone = "";
+        copyFileButton.textContent = (
+          anchor.dataset.fileKind === "directory"
+            ? "复制文件夹（可直接粘贴）"
+            : "复制文件（可直接粘贴）"
+        );
+        copyFileButton.hidden = false;
+      } else {
+        selectedFilePath = "";
+        selectedCopyText = copyCell.dataset.copyText || "";
+        selectedCopyName = copyCell.dataset.copyName || "";
+        selectedCopyPhone = copyCell.dataset.copyPhone || "";
+        copyTextButton.hidden = !selectedCopyText;
+        copyNameButton.hidden = !selectedCopyName;
+        copyPhoneButton.hidden = !selectedCopyPhone;
+      }
       const menu = byId("fileMenu");
       menu.hidden = false;
       const bounds = menu.getBoundingClientRect();
@@ -719,6 +800,43 @@ _HTML_TEMPLATE = r"""<!doctype html>
       if (!event.target.closest("#fileMenu")) hideFileMenu();
     });
     window.addEventListener("blur", hideFileMenu);
+    const copyText = async (value) => {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+          await navigator.clipboard.writeText(value);
+          return;
+        } catch (_error) {
+          // Fall back for browsers that expose Clipboard API but deny access.
+        }
+      }
+      const textarea = document.createElement("textarea");
+      textarea.value = value;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.append(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      textarea.remove();
+      if (!copied) throw new Error("浏览器未允许复制内容");
+    };
+    const copyContactValue = async (label, value) => {
+      hideFileMenu();
+      try {
+        await copyText(value);
+        showCopyMessage(`已复制${label}：${value}`);
+      } catch (error) {
+        showCopyMessage(error.message || `复制${label}失败`, true);
+      }
+    };
+    byId("copyTextButton").addEventListener("click", async () => {
+      await copyContactValue("内容", selectedCopyText);
+    });
+    byId("copyNameButton").addEventListener("click", async () => {
+      await copyContactValue("姓名", selectedCopyName);
+    });
+    byId("copyPhoneButton").addEventListener("click", async () => {
+      await copyContactValue("电话", selectedCopyPhone);
+    });
     byId("copyFileButton").addEventListener("click", async () => {
       hideFileMenu();
       if (location.protocol === "file:") {

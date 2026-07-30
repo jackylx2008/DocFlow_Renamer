@@ -46,6 +46,7 @@ from src.warranty_application_archive.summary_html import (
 )
 from src.warranty_application_archive.validation import validate_summary_html
 from src.warranty_application_archive.workflows import (
+    _find_duplicate_application,
     intake_applications,
     ingest_approval_pdfs,
     ingest_worker_lists,
@@ -151,6 +152,14 @@ class MigrationTest(unittest.TestCase):
             html = html_path.read_text(encoding="utf-8")
             self.assertIn("材料齐全，待审批PDF", html)
             self.assertIn("维修冷塔", html)
+            self.assertIn("质保负责人及联系电话", html)
+            self.assertIn("施工负责人及联系电话", html)
+            self.assertIn("负责人 13800000000", html)
+            self.assertIn("施工负责人 13900000000", html)
+            self.assertNotIn('"缺少材料", "Word申请单"', html)
+            self.assertNotIn('"审批编号"', html)
+            self.assertNotIn('"案卷目录"', html)
+            self.assertNotIn('"案卷ID"', html)
             self.assertIn(f"{stem}.docx", html)
             self.assertNotIn('"title": "说明"', html)
             self.assertNotIn('"title": "本次变更"', html)
@@ -159,6 +168,13 @@ class MigrationTest(unittest.TestCase):
             self.assertIn("overflow-x: hidden", html)
             self.assertNotIn("min-width: 116px", html)
             self.assertIn("复制文件（可直接粘贴）", html)
+            self.assertIn("右键分别复制姓名或电话", html)
+            self.assertIn("复制姓名", html)
+            self.assertIn("复制电话", html)
+            self.assertIn("复制内容", html)
+            self.assertIn("dataset.copyText", html)
+            self.assertIn("dataset.copyName", html)
+            self.assertIn("dataset.copyPhone", html)
             self.assertIn("/api/copy-file", html)
             summary_launcher = primary / SUMMARY_LAUNCHER_FILE_NAME
             self.assertTrue(summary_launcher.is_file())
@@ -236,6 +252,50 @@ class MigrationTest(unittest.TestCase):
             html = html_path.read_text(encoding="utf-8")
             self.assertIn("td.tone-terminated", html)
             self.assertIn('"text": "终止"', html)
+
+    def test_summary_contacts_are_copyable_and_missing_roles_are_in_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            _primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            application = dataset["applications"][0]
+            application["status"] = "materials_incomplete"
+            application["missing_material_types"] = ["worker_list"]
+
+            view = build_summary_view(dataset)
+            sheet = view["sheets"][0]
+            headers = sheet["headers"]
+            row = sheet["rows"][0]
+
+            self.assertEqual(len(headers), 16)
+            self.assertNotIn("缺少材料", headers)
+            self.assertNotIn("审批编号", headers)
+            self.assertNotIn("案卷目录", headers)
+            self.assertNotIn("案卷ID", headers)
+            self.assertEqual(
+                headers[8:10],
+                [
+                    "质保负责人及联系电话",
+                    "施工负责人及联系电话",
+                ],
+            )
+            self.assertIn("施工人员名单", row[0]["text"])
+            self.assertEqual(row[2]["copy_text"], "测试项目")
+            self.assertEqual(row[3]["copy_text"], "冷却塔")
+            self.assertEqual(row[6]["copy_text"], "维修冷塔")
+            self.assertEqual(row[8]["text"], "负责人 13800000000")
+            self.assertTrue(row[8]["copyable"])
+            self.assertEqual(row[8]["copy_name"], "负责人")
+            self.assertEqual(row[8]["copy_phone"], "13800000000")
+            self.assertEqual(
+                row[9]["text"],
+                "施工负责人 13900000000",
+            )
+            self.assertTrue(row[9]["copyable"])
+            self.assertEqual(row[9]["copy_name"], "施工负责人")
+            self.assertEqual(row[9]["copy_phone"], "13900000000")
 
     def test_worker_list_and_approval_pdf_subworkflows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -441,6 +501,253 @@ class MigrationTest(unittest.TestCase):
                     case_dir
                     / "2026-07-25_保温修复_质保作业申请单_手签_01.jpg"
                 ).is_file()
+            )
+
+    def test_duplicate_application_is_quarantined_and_not_added(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+            incoming_word = inbox / "重复申请.docx"
+            incoming_word.write_bytes(b"duplicate word")
+            original_count = len(dataset["applications"])
+
+            with (
+                patch(
+                    "src.warranty_application_archive.workflows."
+                    "legacy.parse_document",
+                    return_value=deepcopy(PARSED_APPLICATION),
+                ),
+                self.assertLogs(
+                    "src.warranty_application_archive.workflows",
+                    level="WARNING",
+                ) as captured,
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            self.assertEqual(count, 0)
+            self.assertEqual(len(dataset["applications"]), original_count)
+            self.assertFalse(incoming_word.exists())
+            quarantined = list(
+                (primary / ".docflow" / "quarantine").rglob("*")
+            )
+            self.assertTrue(
+                any(path.name == incoming_word.name for path in quarantined)
+            )
+            messages = "\n".join(captured.output)
+            self.assertIn("检测到重复质保申请", messages)
+            self.assertIn("已跳过写入 JSON", messages)
+            self.assertIn(PARSED_APPLICATION["施工开始时间"], messages)
+            self.assertTrue(
+                any(
+                    change.get("action")
+                    == "quarantine_duplicate_application"
+                    for change in dataset["changes"]
+                )
+            )
+
+    def test_duplicate_application_retains_more_complete_case(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            original = dataset["applications"][0]
+            more_complete = deepcopy(original)
+            more_complete["case_id"] = "more-complete-case"
+            more_complete["case_name"] = f"{stem}_02"
+            more_complete["case_directory"] = (
+                f"_cases/{stem}_02"
+            )
+            more_complete["status"] = "approved"
+            more_complete["approval"] = {
+                "status": "approved",
+                "pdfs": [
+                    {
+                        "path": f"_cases/{stem}_02/approval.pdf",
+                        "sha256": "approval-hash",
+                    }
+                ],
+            }
+            more_complete_dir = primary / more_complete["case_directory"]
+            more_complete_dir.mkdir(parents=True)
+            for role_files in more_complete["materials"].values():
+                for file_item in role_files:
+                    source_file = primary / file_item["path"]
+                    copied_file = more_complete_dir / source_file.name
+                    shutil.copy2(source_file, copied_file)
+                    file_item["path"] = copied_file.relative_to(
+                        primary
+                    ).as_posix()
+            (more_complete_dir / "approval.pdf").write_bytes(b"approval")
+            dataset["applications"].append(more_complete)
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+            incoming_word = inbox / "再次提交.docx"
+            incoming_word.write_bytes(b"duplicate word")
+
+            selected = _find_duplicate_application(
+                PARSED_APPLICATION,
+                dataset["applications"],
+            )
+            self.assertIs(selected, more_complete)
+
+            with patch(
+                "src.warranty_application_archive.workflows."
+                "legacy.parse_document",
+                return_value=deepcopy(PARSED_APPLICATION),
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            self.assertEqual(count, 0)
+            self.assertEqual(dataset["applications"], [more_complete])
+            self.assertTrue(more_complete_dir.is_dir())
+            self.assertFalse(
+                (primary / "_cases" / stem).exists()
+            )
+            quarantined_case_dirs = list(
+                (
+                    primary / ".docflow" / "quarantine"
+                ).rglob(stem)
+            )
+            self.assertTrue(quarantined_case_dirs)
+            self.assertTrue(
+                any(
+                    change.get("action")
+                    == "quarantine_less_complete_duplicate_case"
+                    for change in dataset["changes"]
+                )
+            )
+
+    def test_one_input_batch_adds_random_named_images_to_duplicate_case(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            input_dir = primary / "_input"
+            inbox = primary / "_inbox"
+            input_dir.mkdir(exist_ok=True)
+            inbox.mkdir(exist_ok=True)
+            incoming_word = input_dir / "重复申请.docx"
+            signed_image = input_dir / "random-signed.png"
+            worker_image = input_dir / "random-workers.jpg"
+            incoming_word.write_bytes(b"duplicate word")
+            signed_image.write_bytes(b"new signed application")
+            worker_image.write_bytes(b"new worker list")
+            existing_worker_image = inbox / worker_image.name
+            existing_worker_image.write_bytes(worker_image.read_bytes())
+            signed_hash = sha256_file(signed_image)
+            worker_hash = sha256_file(worker_image)
+            batch_id = "test-input-batch"
+
+            route_input_files(
+                dataset,
+                primary,
+                Path(__file__).resolve().parents[1],
+                input_batch_id=batch_id,
+            )
+
+            def recognized_text(path: Path) -> str:
+                if path.suffix.lower() == ".png":
+                    return "质保作业申请单 施工区域 冷却塔"
+                return "姓名 性别 电话 张三 男 13800000000"
+
+            with (
+                patch(
+                    "src.warranty_application_archive.workflows."
+                    "legacy.parse_document",
+                    return_value=deepcopy(PARSED_APPLICATION),
+                ),
+                patch(
+                    "src.warranty_application_archive.workflows."
+                    "RecognitionService.image_text",
+                    side_effect=recognized_text,
+                ),
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                    input_batch_id=batch_id,
+                )
+
+            self.assertEqual(count, 0)
+            application = dataset["applications"][0]
+            materials = application["materials"]
+            self.assertTrue(
+                any(
+                    item["sha256"] == signed_hash
+                    for item in materials["signed_application"]
+                )
+            )
+            self.assertTrue(
+                any(
+                    item["sha256"] == worker_hash
+                    for item in materials["worker_list"]
+                )
+            )
+            self.assertFalse(any(input_dir.iterdir()))
+            self.assertFalse(any(inbox.iterdir()))
+            worker_route = next(
+                item
+                for item in dataset["input_routes"]
+                if item["sha256"] == worker_hash
+            )
+            self.assertEqual(
+                worker_route["action"],
+                "quarantine_duplicate",
+            )
+            self.assertEqual(
+                worker_route["processing_path"],
+                "_inbox/random-workers.jpg",
+            )
+
+    def test_same_content_with_different_end_date_is_not_duplicate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+            incoming_word = inbox / "日期不同申请.docx"
+            incoming_word.write_bytes(b"different end date")
+            parsed = {
+                **PARSED_APPLICATION,
+                "施工结束时间": "2026-07-25",
+            }
+
+            with patch(
+                "src.warranty_application_archive.workflows."
+                "legacy.parse_document",
+                return_value=parsed,
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            self.assertEqual(count, 1)
+            self.assertEqual(
+                dataset["applications"][-1]["application"]["施工结束时间"],
+                "2026-07-25",
             )
 
     def test_human_approval_review_updates_formal_data(self) -> None:

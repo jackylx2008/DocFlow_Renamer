@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import sys
+import uuid
 from pathlib import Path
 from typing import Sequence
 
@@ -29,6 +30,7 @@ from .summary_html import export_summary_html
 from .validation import validate_dataset, validate_summary_html
 from .workflows import (
     append_run,
+    deduplicate_applications,
     intake_applications,
     ingest_approval_pdfs,
     ingest_worker_lists,
@@ -145,6 +147,7 @@ def _log_workflow_summary(
     applications_ingested: int,
     approval_pdfs_ingested: int,
     worker_lists_ingested: int,
+    duplicate_applications_removed: int,
     route_summary: dict[str, int],
     html_file: str,
     review_json: str,
@@ -172,6 +175,11 @@ def _log_workflow_summary(
         approval_pdfs_ingested,
         worker_lists_ingested,
     )
+    if duplicate_applications_removed:
+        LOGGER.info(
+            "重复申请整理: 移除资料较少的重复案卷 %s 条",
+            duplicate_applications_removed,
+        )
     LOGGER.info(
         "_input 分流: 共 %s 个文件；审批 PDF %s 个；申请材料 %s 个；"
         "重复文件隔离 %s 个",
@@ -413,11 +421,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         approval_count = 0
         worker_list_count = 0
         application_count = 0
+        duplicate_application_count = deduplicate_applications(
+            data,
+            config.data_root,
+            checkpoint=repository.save,
+        )
+        input_batch_id = str(uuid.uuid4())
         route_summary = route_input_files(
             data,
             config.data_root,
             repo_root,
             checkpoint=repository.save,
+            input_batch_id=input_batch_id,
         )
         if command in {"applications", "run"}:
             application_count = intake_applications(
@@ -425,6 +440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config.data_root,
                 repo_root,
                 checkpoint=repository.save,
+                input_batch_id=input_batch_id,
             )
         if command in {"approval-pdfs", "run"}:
             approval_count = ingest_approval_pdfs(
@@ -441,6 +457,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             + worker_list_count
             + route_summary["input_files_routed"]
             + route_summary["input_duplicates_quarantined"]
+            + duplicate_application_count
         )
         if changed:
             data["dataset_revision"] = int(
@@ -453,6 +470,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "applications_ingested": application_count,
                 "approval_pdfs_ingested": approval_count,
                 "worker_lists_ingested": worker_list_count,
+                "duplicate_applications_removed": (
+                    duplicate_application_count
+                ),
                 **route_summary,
             },
         )
@@ -477,6 +497,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             applications_ingested=application_count,
             approval_pdfs_ingested=approval_count,
             worker_lists_ingested=worker_list_count,
+            duplicate_applications_removed=duplicate_application_count,
             route_summary=route_summary,
             html_file=str(html_path),
             review_json=review_path,
