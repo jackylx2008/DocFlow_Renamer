@@ -39,16 +39,16 @@ ROLE_LABELS = {
     "approval_pdf": "审批PDF",
 }
 SUMMARY_HEADERS = [
-    "案卷状态",
-    "材料完整性",
+    "案卷状态及\n材料完整性",
     "项目名称",
+    "质保单位和分包单位",
+    "质保负责人及\n联系电话",
     "施工区域",
     "施工开始时间",
     "施工结束时间",
     "施工内容",
-    "危险作业",
-    "质保负责人及联系电话",
-    "施工负责人及联系电话",
+    "施工负责人及\n联系电话",
+    "危险作业及专项材料核对",
     "Word申请单",
     "手签申请单",
     "施工人员名单",
@@ -107,29 +107,122 @@ def _cell(
     copy_text: Any = "",
     copy_name: Any = "",
     copy_phone: Any = "",
+    copy_warranty_unit: Any = "",
+    copy_subcontract_unit: Any = "",
+    multiline: bool = False,
 ) -> dict[str, Any]:
     resolved_text = str(copy_text or "").strip()
     resolved_name = str(copy_name or "").strip()
     resolved_phone = str(copy_phone or "").strip()
+    resolved_warranty_unit = str(copy_warranty_unit or "").strip()
+    resolved_subcontract_unit = str(copy_subcontract_unit or "").strip()
     return {
         "text": str(value or ""),
         "links": links or [],
         "tone": tone,
         "copyable": bool(
-            resolved_text or resolved_name or resolved_phone
+            resolved_text
+            or resolved_name
+            or resolved_phone
+            or resolved_warranty_unit
+            or resolved_subcontract_unit
         ),
         "copy_text": resolved_text,
         "copy_name": resolved_name,
         "copy_phone": resolved_phone,
+        "copy_warranty_unit": resolved_warranty_unit,
+        "copy_subcontract_unit": resolved_subcontract_unit,
+        "multiline": multiline,
     }
 
 
 def _contact_text(name: Any, phone: Any) -> str:
-    return " ".join(
+    return "\n".join(
         value
         for value in (str(name or "").strip(), str(phone or "").strip())
         if value
     )
+
+
+def _unit_text(warranty_unit: Any, subcontract_unit: Any) -> str:
+    parts = []
+    if str(warranty_unit or "").strip():
+        parts.append(f"质保：{str(warranty_unit).strip()}")
+    if str(subcontract_unit or "").strip():
+        parts.append(f"分包：{str(subcontract_unit).strip()}")
+    return "；\n".join(parts)
+
+
+def _dangerous_work_review(
+    application: dict[str, Any],
+    business: dict[str, Any],
+) -> tuple[str, str]:
+    fire_impact = str(
+        business.get("影响改动消防设备设施") or ""
+    ).strip()
+    passage_impact = str(
+        business.get("影响堵塞应急疏散通道") or ""
+    ).strip()
+    dangerous_work = str(business.get("危险作业") or "").strip()
+    expected_roles: set[str] = set()
+    if fire_impact == "是" or passage_impact == "是":
+        expected_roles.add("special_work")
+    if "有限空间" in dangerous_work:
+        expected_roles.add("confined_space")
+    if "高处" in dangerous_work or "高空" in dangerous_work:
+        expected_roles.add("high_altitude")
+    if any(
+        keyword in dangerous_work
+        for keyword in ("动火", "危大工程", "配电室接电")
+    ):
+        expected_roles.add("special_work")
+
+    role_order = [
+        "confined_space",
+        "high_altitude",
+        "special_work",
+    ]
+    actual_roles = {
+        role
+        for role in role_order
+        if _files(application, role)
+    }
+    missing_roles = [
+        role for role in role_order if role in expected_roles - actual_roles
+    ]
+    extra_roles = [
+        role for role in role_order if role in actual_roles - expected_roles
+    ]
+    if missing_roles:
+        comparison = "缺少：" + "、".join(
+            ROLE_LABELS[role] for role in missing_roles
+        )
+        tone = "warning"
+    elif not expected_roles and actual_roles:
+        comparison = "危险作业为无，但存在：" + "、".join(
+            ROLE_LABELS[role] for role in extra_roles
+        )
+        tone = "warning"
+    elif expected_roles:
+        comparison = "相符"
+        if extra_roles:
+            comparison += "；另有：" + "、".join(
+                ROLE_LABELS[role] for role in extra_roles
+            )
+        tone = "success"
+    else:
+        comparison = "相符（无需专项作业材料）"
+        tone = "success"
+
+    text = "\n".join(
+        [
+            f"影响、改动消防设备设施：{fire_impact or '未填写'}",
+            f"影响、堵塞应急疏散通道：{passage_impact or '未填写'}",
+            f"危险作业：{dangerous_work or '无'}",
+            f"专项材料核对：{comparison}",
+        ]
+    )
+    return text, tone
 
 
 def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
@@ -157,17 +250,38 @@ def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
         "needs_review": "danger",
     }.get(status, "")
     status_text = STATUS_LABELS.get(status, status)
-    if missing and status != "terminated":
-        status_text = f"{status_text}：{'、'.join(missing)}"
+    material_text = (
+        f"缺少：{'、'.join(missing)}"
+        if missing
+        else "材料完整"
+    )
+    status_text = f"{status_text}；\n{material_text}"
+    dangerous_work_text, dangerous_work_tone = (
+        _dangerous_work_review(application, business)
+    )
     cells = [
-        _cell(status_text, tone=status_tone),
-        _cell(
-            "完整" if not missing else "缺少材料",
-            tone="success" if not missing else "warning",
-        ),
+        _cell(status_text, tone=status_tone, multiline=True),
         _cell(
             business.get("项目名称", ""),
             copy_text=business.get("项目名称", ""),
+        ),
+        _cell(
+            _unit_text(
+                business.get("质保单位", ""),
+                business.get("分包单位", ""),
+            ),
+            copy_warranty_unit=business.get("质保单位", ""),
+            copy_subcontract_unit=business.get("分包单位", ""),
+            multiline=True,
+        ),
+        _cell(
+            _contact_text(
+                business.get("质保负责人", ""),
+                business.get("质保负责人联系电话", ""),
+            ),
+            copy_name=business.get("质保负责人", ""),
+            copy_phone=business.get("质保负责人联系电话", ""),
+            multiline=True,
         ),
         _cell(
             business.get("施工区域", ""),
@@ -179,15 +293,6 @@ def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
             business.get("施工内容", ""),
             copy_text=business.get("施工内容", ""),
         ),
-        _cell(business.get("危险作业", "")),
-        _cell(
-            _contact_text(
-                business.get("质保负责人", ""),
-                business.get("质保负责人联系电话", ""),
-            ),
-            copy_name=business.get("质保负责人", ""),
-            copy_phone=business.get("质保负责人联系电话", ""),
-        ),
         _cell(
             _contact_text(
                 business.get("施工负责人", ""),
@@ -195,6 +300,12 @@ def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
             ),
             copy_name=business.get("施工负责人", ""),
             copy_phone=business.get("施工负责人联系电话", ""),
+            multiline=True,
+        ),
+        _cell(
+            dangerous_work_text,
+            tone=dangerous_work_tone,
+            multiline=True,
         ),
         _cell(links=_file_links(word_files)),
         _cell(links=_file_links(signed_files)),
@@ -338,14 +449,14 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
             "--page",
             "summary",
             "--port",
-            "8766",
+            "0",
         ],
         [
             "approval-review-server",
             "--page",
             "summary",
             "--port",
-            "8766",
+            "0",
         ],
         windows_name=SUMMARY_LAUNCHER_FILE_NAME,
         macos_name=SUMMARY_MACOS_LAUNCHER_FILE_NAME,
@@ -492,21 +603,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
       word-break: break-word;
     }
     th:nth-child(1), td:nth-child(1),
-    th:nth-child(9), td:nth-child(9),
-    th:nth-child(10), td:nth-child(10),
-    th:nth-child(11), td:nth-child(11),
-    th:nth-child(15), td:nth-child(15) { width: 7%; }
-    th:nth-child(2), td:nth-child(2),
-    th:nth-child(5), td:nth-child(5),
-    th:nth-child(6), td:nth-child(6),
-    th:nth-child(8), td:nth-child(8) { width: 5%; }
-    th:nth-child(3), td:nth-child(3),
     th:nth-child(4), td:nth-child(4),
+    th:nth-child(5), td:nth-child(5),
+    th:nth-child(9), td:nth-child(9),
+    th:nth-child(11), td:nth-child(11),
     th:nth-child(12), td:nth-child(12),
     th:nth-child(13), td:nth-child(13),
-    th:nth-child(14), td:nth-child(14),
+    th:nth-child(15), td:nth-child(15),
     th:nth-child(16), td:nth-child(16) { width: 6%; }
-    th:nth-child(7), td:nth-child(7) { width: 9%; }
+    th:nth-child(2), td:nth-child(2),
+    th:nth-child(6), td:nth-child(6),
+    th:nth-child(7), td:nth-child(7),
+    th:nth-child(14), td:nth-child(14) { width: 5%; }
+    th:nth-child(3), td:nth-child(3),
+    th:nth-child(8), td:nth-child(8) { width: 8%; }
+    th:nth-child(10), td:nth-child(10) { width: 10%; }
     th {
       position: sticky;
       top: 0;
@@ -515,6 +626,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       background: var(--navy);
       text-align: center;
       font-weight: 700;
+      white-space: pre-line;
     }
     tbody tr:nth-child(odd) td { background: var(--blue-row); }
     tbody tr:nth-child(even) td { background: white; }
@@ -528,6 +640,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     a { color: #075fa8; text-decoration: underline; text-underline-offset: 2px; }
     .links { display: grid; min-width: 0; gap: 5px; }
     .links a { min-width: 0; overflow-wrap: anywhere; }
+    .multiline-cell { white-space: pre-line; }
     .copyable-cell { cursor: context-menu; }
     .copyable-cell:hover { box-shadow: inset 0 0 0 2px #5b87b4; }
     .file-menu {
@@ -619,6 +732,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <button id="copyTextButton" type="button" role="menuitem" hidden>复制内容</button>
     <button id="copyNameButton" type="button" role="menuitem" hidden>复制姓名</button>
     <button id="copyPhoneButton" type="button" role="menuitem" hidden>复制电话</button>
+    <button id="copyWarrantyUnitButton" type="button" role="menuitem" hidden>复制质保单位</button>
+    <button id="copySubcontractUnitButton" type="button" role="menuitem" hidden>复制分包单位</button>
   </div>
   <div id="copyToast" class="copy-toast" role="status" hidden></div>
   <script id="summaryData" type="application/json">__SUMMARY_DATA__</script>
@@ -658,14 +773,25 @@ _HTML_TEMPLATE = r"""<!doctype html>
     function renderCell(cell) {
       const td = document.createElement("td");
       if (cell.tone) td.className = `tone-${cell.tone}`;
+      if (cell.multiline) td.classList.add("multiline-cell");
       if (cell.copyable && cell.text) {
         td.classList.add("copyable-cell");
         if (cell.copy_text) td.dataset.copyText = cell.copy_text;
         if (cell.copy_name) td.dataset.copyName = cell.copy_name;
         if (cell.copy_phone) td.dataset.copyPhone = cell.copy_phone;
+        if (cell.copy_warranty_unit) {
+          td.dataset.copyWarrantyUnit = cell.copy_warranty_unit;
+        }
+        if (cell.copy_subcontract_unit) {
+          td.dataset.copySubcontractUnit = cell.copy_subcontract_unit;
+        }
         td.title = cell.copy_text
           ? "右键复制内容"
-          : "右键分别复制姓名或电话";
+          : (
+            cell.copy_warranty_unit || cell.copy_subcontract_unit
+              ? "右键分别复制质保单位或分包单位"
+              : "右键分别复制姓名或电话"
+          );
       }
       if (cell.links && cell.links.length) {
         const links = text("div", "", "links");
@@ -679,7 +805,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
           anchor.rel = "noopener";
           anchor.dataset.filePath = item.path || "";
           anchor.dataset.fileKind = directory ? "directory" : "file";
-          if (directory && location.protocol !== "file:") {
+          if (location.protocol !== "file:") {
             anchor.addEventListener("click", async (event) => {
               event.preventDefault();
               try {
@@ -690,10 +816,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
                 });
                 const result = await response.json();
                 if (!response.ok || !result.ok) {
-                  throw new Error(result.error || "打开文件夹失败");
+                  if (
+                    !directory
+                    && String(result.error || "").startsWith("文件夹不存在")
+                  ) {
+                    throw new Error(
+                      "后台服务仍是旧版本，请关闭旧启动器窗口，"
+                      + "再重新双击汇总页面启动器"
+                    );
+                  }
+                  throw new Error(result.error || "打开文件失败");
                 }
               } catch (error) {
-                showCopyMessage(error.message || "打开文件夹失败", true);
+                showCopyMessage(error.message || "打开文件失败", true);
               }
             });
           }
@@ -735,6 +870,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
     let selectedCopyText = "";
     let selectedCopyName = "";
     let selectedCopyPhone = "";
+    let selectedWarrantyUnit = "";
+    let selectedSubcontractUnit = "";
     let toastTimer = 0;
     const hideFileMenu = () => { byId("fileMenu").hidden = true; };
     const showCopyMessage = (message, error = false) => {
@@ -748,7 +885,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
     document.addEventListener("contextmenu", (event) => {
       const anchor = event.target.closest("a[data-file-path]");
       const copyCell = event.target.closest(
-        "td[data-copy-text], td[data-copy-name], td[data-copy-phone]"
+        "td[data-copy-text], td[data-copy-name], td[data-copy-phone], "
+        + "td[data-copy-warranty-unit], td[data-copy-subcontract-unit]"
       );
       if (
         (!anchor || !anchor.dataset.filePath)
@@ -758,6 +896,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
             !copyCell.dataset.copyText
             && !copyCell.dataset.copyName
             && !copyCell.dataset.copyPhone
+            && !copyCell.dataset.copyWarrantyUnit
+            && !copyCell.dataset.copySubcontractUnit
           )
         )
       ) return;
@@ -766,15 +906,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
       const copyTextButton = byId("copyTextButton");
       const copyNameButton = byId("copyNameButton");
       const copyPhoneButton = byId("copyPhoneButton");
+      const copyWarrantyUnitButton = byId("copyWarrantyUnitButton");
+      const copySubcontractUnitButton = byId("copySubcontractUnitButton");
       copyFileButton.hidden = true;
       copyTextButton.hidden = true;
       copyNameButton.hidden = true;
       copyPhoneButton.hidden = true;
+      copyWarrantyUnitButton.hidden = true;
+      copySubcontractUnitButton.hidden = true;
       if (anchor && anchor.dataset.filePath) {
         selectedFilePath = anchor.dataset.filePath;
         selectedCopyText = "";
         selectedCopyName = "";
         selectedCopyPhone = "";
+        selectedWarrantyUnit = "";
+        selectedSubcontractUnit = "";
         copyFileButton.textContent = (
           anchor.dataset.fileKind === "directory"
             ? "复制文件夹（可直接粘贴）"
@@ -786,9 +932,17 @@ _HTML_TEMPLATE = r"""<!doctype html>
         selectedCopyText = copyCell.dataset.copyText || "";
         selectedCopyName = copyCell.dataset.copyName || "";
         selectedCopyPhone = copyCell.dataset.copyPhone || "";
+        selectedWarrantyUnit = (
+          copyCell.dataset.copyWarrantyUnit || ""
+        );
+        selectedSubcontractUnit = (
+          copyCell.dataset.copySubcontractUnit || ""
+        );
         copyTextButton.hidden = !selectedCopyText;
         copyNameButton.hidden = !selectedCopyName;
         copyPhoneButton.hidden = !selectedCopyPhone;
+        copyWarrantyUnitButton.hidden = !selectedWarrantyUnit;
+        copySubcontractUnitButton.hidden = !selectedSubcontractUnit;
       }
       const menu = byId("fileMenu");
       menu.hidden = false;
@@ -836,6 +990,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
     });
     byId("copyPhoneButton").addEventListener("click", async () => {
       await copyContactValue("电话", selectedCopyPhone);
+    });
+    byId("copyWarrantyUnitButton").addEventListener("click", async () => {
+      await copyContactValue("质保单位", selectedWarrantyUnit);
+    });
+    byId("copySubcontractUnitButton").addEventListener("click", async () => {
+      await copyContactValue("分包单位", selectedSubcontractUnit);
     });
     byId("copyFileButton").addEventListener("click", async () => {
       hideFileMenu();

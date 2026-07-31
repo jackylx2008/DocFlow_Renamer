@@ -17,6 +17,7 @@ from src.warranty_application_archive.approval_review_web import (
     _file_drop_clipboard_data,
     copy_file_to_macos_clipboard,
     export_approval_review_html,
+    open_path_with_default_application,
     save_and_apply_review_payload,
     save_review_payload,
 )
@@ -25,9 +26,13 @@ from src.warranty_application_archive.constants import (
     APPROVAL_REVIEW_HTML_FILE_NAME,
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
     APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
+    CONFINED_SPACE_ROLE,
     RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     DATA_FILE_NAME,
+    HIGH_ALTITUDE_ROLE,
     LEGACY_SUMMARY_EXCEL_FILE_NAME,
+    SIGNED_APPLICATION_ROLE,
+    SPECIAL_WORK_ROLE,
     SUMMARY_LAUNCHER_FILE_NAME,
     SUMMARY_MACOS_LAUNCHER_FILE_NAME,
     TEMPLATE_FILE_NAME,
@@ -46,10 +51,13 @@ from src.warranty_application_archive.summary_html import (
 )
 from src.warranty_application_archive.validation import validate_summary_html
 from src.warranty_application_archive.workflows import (
+    _classify_recognized_image,
     _find_duplicate_application,
+    _work_option_is_checked,
     intake_applications,
     ingest_approval_pdfs,
     ingest_worker_lists,
+    reclassify_historical_materials,
     route_input_files,
 )
 
@@ -90,6 +98,136 @@ class MigrationTest(unittest.TestCase):
         ):
             plan = build_migration_plan(primary)
         return primary, apply_migration_plan(plan), stem
+
+    def test_image_classification_respects_checked_work_options(
+        self,
+    ) -> None:
+        unchecked_form = (
+            "质保作业申请单 "
+            "动火作业□ 有限空间作业□ 5米以上高处作业□ "
+            "危大工程□ 配电室接电□"
+        )
+        self.assertEqual(
+            _classify_recognized_image(unchecked_form),
+            SIGNED_APPLICATION_ROLE,
+        )
+        self.assertFalse(
+            _work_option_is_checked(
+                "动火作业□ 有限空间作业□",
+                "有限空间作业",
+            )
+        )
+        self.assertTrue(
+            _work_option_is_checked(
+                "动火作业□ 有限空间作业☑",
+                "有限空间作业",
+            )
+        )
+        self.assertTrue(
+            _work_option_is_checked(
+                "动火作业□ 有限空间作业□√",
+                "有限空间作业",
+            )
+        )
+        self.assertFalse(
+            _work_option_is_checked(
+                "动火作业☑ 有限空间作业□",
+                "有限空间作业",
+            )
+        )
+        self.assertEqual(
+            _classify_recognized_image("专项作业 有限空间作业☑"),
+            CONFINED_SPACE_ROLE,
+        )
+        self.assertEqual(
+            _classify_recognized_image("专项作业 5米以上高空作业☒"),
+            HIGH_ALTITUDE_ROLE,
+        )
+        self.assertEqual(
+            _classify_recognized_image("专项作业 动火作业：已勾选"),
+            SPECIAL_WORK_ROLE,
+        )
+
+    def test_reclassify_historical_materials_corrects_false_positive(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            application = dataset["applications"][0]
+            case_directory = (
+                primary / Path(str(application["case_directory"]))
+            )
+            misclassified = case_directory / "历史误判有限空间.png"
+            misclassified.write_bytes(b"misclassified signed form")
+            misclassified_hash = sha256_file(misclassified)
+            materials = application["materials"]
+            materials[CONFINED_SPACE_ROLE].append(
+                file_record(
+                    misclassified,
+                    misclassified,
+                    primary,
+                    CONFINED_SPACE_ROLE,
+                )
+            )
+
+            missing_source = case_directory / "已经不存在的误判图片.png"
+            missing_source.write_bytes(b"missing signed form")
+            missing_record = file_record(
+                missing_source,
+                missing_source,
+                primary,
+                CONFINED_SPACE_ROLE,
+            )
+            missing_hash = sha256_file(missing_source)
+            missing_source.unlink()
+            materials[CONFINED_SPACE_ROLE].append(missing_record)
+            recognition_cache = dataset.setdefault(
+                "recognition_cache",
+                {},
+            )
+            unchecked_form = (
+                "质保作业申请单 动火作业□ 有限空间作业□ "
+                "5米以上高处作业□ 危大工程□ 配电室接电□"
+            )
+            recognition_cache[misclassified_hash] = {
+                "text": unchecked_form,
+                "method": "test",
+            }
+            recognition_cache[missing_hash] = {
+                "text": unchecked_form,
+                "method": "test",
+            }
+
+            summary = reclassify_historical_materials(
+                dataset,
+                primary,
+            )
+
+            self.assertEqual(summary["records_checked"], 2)
+            self.assertEqual(summary["records_reclassified"], 2)
+            self.assertEqual(summary["files_moved"], 1)
+            self.assertEqual(summary["missing_references_removed"], 1)
+            self.assertEqual(materials[CONFINED_SPACE_ROLE], [])
+            signed_hashes = {
+                item["sha256"]
+                for item in materials[SIGNED_APPLICATION_ROLE]
+            }
+            self.assertIn(misclassified_hash, signed_hashes)
+            self.assertNotIn(missing_hash, signed_hashes)
+            self.assertFalse(misclassified.exists())
+            self.assertTrue(
+                any(
+                    item["action"] == "reclassify_historical_material"
+                    and item["role"]
+                    == (
+                        f"{CONFINED_SPACE_ROLE}->"
+                        f"{SIGNED_APPLICATION_ROLE}"
+                    )
+                    for item in dataset["changes"]
+                )
+            )
 
     def test_migration_builds_case_directory_and_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -152,10 +290,12 @@ class MigrationTest(unittest.TestCase):
             html = html_path.read_text(encoding="utf-8")
             self.assertIn("材料齐全，待审批PDF", html)
             self.assertIn("维修冷塔", html)
-            self.assertIn("质保负责人及联系电话", html)
-            self.assertIn("施工负责人及联系电话", html)
-            self.assertIn("负责人 13800000000", html)
-            self.assertIn("施工负责人 13900000000", html)
+            self.assertIn("质保负责人及\\n联系电话", html)
+            self.assertIn("施工负责人及\\n联系电话", html)
+            self.assertIn("质保单位和分包单位", html)
+            self.assertIn("质保：测试单位", html)
+            self.assertIn("负责人\\n13800000000", html)
+            self.assertIn("施工负责人\\n13900000000", html)
             self.assertNotIn('"缺少材料", "Word申请单"', html)
             self.assertNotIn('"审批编号"', html)
             self.assertNotIn('"案卷目录"', html)
@@ -171,11 +311,15 @@ class MigrationTest(unittest.TestCase):
             self.assertIn("右键分别复制姓名或电话", html)
             self.assertIn("复制姓名", html)
             self.assertIn("复制电话", html)
+            self.assertIn("复制质保单位", html)
+            self.assertIn("复制分包单位", html)
             self.assertIn("复制内容", html)
             self.assertIn("dataset.copyText", html)
             self.assertIn("dataset.copyName", html)
             self.assertIn("dataset.copyPhone", html)
             self.assertIn("/api/copy-file", html)
+            self.assertIn("/api/open-path", html)
+            self.assertIn("打开文件失败", html)
             summary_launcher = primary / SUMMARY_LAUNCHER_FILE_NAME
             self.assertTrue(summary_launcher.is_file())
             self.assertIn(
@@ -240,7 +384,7 @@ class MigrationTest(unittest.TestCase):
                 for sheet in view["sheets"]
             }
             row = sheets["申请汇总"]["rows"][0]
-            self.assertEqual(row[0]["text"], "终止")
+            self.assertEqual(row[0]["text"], "终止；\n材料完整")
             self.assertTrue(
                 all(cell["tone"] == "terminated" for cell in row)
             )
@@ -251,9 +395,9 @@ class MigrationTest(unittest.TestCase):
             html_path = export_summary_html(dataset, primary)
             html = html_path.read_text(encoding="utf-8")
             self.assertIn("td.tone-terminated", html)
-            self.assertIn('"text": "终止"', html)
+            self.assertIn('"text": "终止；\\n材料完整"', html)
 
-    def test_summary_contacts_are_copyable_and_missing_roles_are_in_status(
+    def test_summary_business_fields_are_ordered_and_copyable(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -263,6 +407,7 @@ class MigrationTest(unittest.TestCase):
             application = dataset["applications"][0]
             application["status"] = "materials_incomplete"
             application["missing_material_types"] = ["worker_list"]
+            application["application"]["分包单位"] = "测试分包"
 
             view = build_summary_view(dataset)
             sheet = view["sheets"][0]
@@ -275,27 +420,88 @@ class MigrationTest(unittest.TestCase):
             self.assertNotIn("案卷目录", headers)
             self.assertNotIn("案卷ID", headers)
             self.assertEqual(
-                headers[8:10],
+                headers[:10],
                 [
-                    "质保负责人及联系电话",
-                    "施工负责人及联系电话",
+                    "案卷状态及\n材料完整性",
+                    "项目名称",
+                    "质保单位和分包单位",
+                    "质保负责人及\n联系电话",
+                    "施工区域",
+                    "施工开始时间",
+                    "施工结束时间",
+                    "施工内容",
+                    "施工负责人及\n联系电话",
+                    "危险作业及专项材料核对",
                 ],
             )
             self.assertIn("施工人员名单", row[0]["text"])
-            self.assertEqual(row[2]["copy_text"], "测试项目")
-            self.assertEqual(row[3]["copy_text"], "冷却塔")
-            self.assertEqual(row[6]["copy_text"], "维修冷塔")
-            self.assertEqual(row[8]["text"], "负责人 13800000000")
-            self.assertTrue(row[8]["copyable"])
-            self.assertEqual(row[8]["copy_name"], "负责人")
-            self.assertEqual(row[8]["copy_phone"], "13800000000")
+            self.assertEqual(row[1]["copy_text"], "测试项目")
             self.assertEqual(
-                row[9]["text"],
-                "施工负责人 13900000000",
+                row[2]["text"],
+                "质保：测试单位；\n分包：测试分包",
             )
-            self.assertTrue(row[9]["copyable"])
-            self.assertEqual(row[9]["copy_name"], "施工负责人")
-            self.assertEqual(row[9]["copy_phone"], "13900000000")
+            self.assertEqual(
+                row[2]["copy_warranty_unit"],
+                "测试单位",
+            )
+            self.assertEqual(
+                row[2]["copy_subcontract_unit"],
+                "测试分包",
+            )
+            self.assertEqual(row[3]["text"], "负责人\n13800000000")
+            self.assertTrue(row[3]["copyable"])
+            self.assertEqual(row[3]["copy_name"], "负责人")
+            self.assertEqual(row[3]["copy_phone"], "13800000000")
+            self.assertEqual(row[4]["copy_text"], "冷却塔")
+            self.assertEqual(row[7]["copy_text"], "维修冷塔")
+            self.assertEqual(
+                row[8]["text"],
+                "施工负责人\n13900000000",
+            )
+            self.assertTrue(row[8]["copyable"])
+            self.assertEqual(row[8]["copy_name"], "施工负责人")
+            self.assertEqual(row[8]["copy_phone"], "13900000000")
+            self.assertIn(
+                "影响、改动消防设备设施：否",
+                row[9]["text"],
+            )
+            self.assertIn(
+                "影响、堵塞应急疏散通道：否",
+                row[9]["text"],
+            )
+            self.assertIn("危险作业：无", row[9]["text"])
+            self.assertIn(
+                "专项材料核对：相符（无需专项作业材料）",
+                row[9]["text"],
+            )
+            self.assertEqual(row[9]["tone"], "success")
+
+            business = application["application"]
+            business["影响改动消防设备设施"] = "是"
+            business["危险作业"] = (
+                "动火作业、有限空间作业、5米以上高空作业、"
+                "危大工程、配电室接电"
+            )
+            danger_cell = build_summary_view(dataset)["sheets"][0][
+                "rows"
+            ][0][9]
+            self.assertIn("有限空间申请", danger_cell["text"])
+            self.assertIn("高处作业申请", danger_cell["text"])
+            self.assertIn("专项作业材料", danger_cell["text"])
+            self.assertEqual(danger_cell["tone"], "warning")
+
+            materials = application["materials"]
+            materials["confined_space"] = [{"path": "confined.pdf"}]
+            materials["high_altitude"] = [{"path": "height.pdf"}]
+            materials["special_work"] = [{"path": "special.pdf"}]
+            matched_danger_cell = build_summary_view(dataset)[
+                "sheets"
+            ][0]["rows"][0][9]
+            self.assertIn(
+                "专项材料核对：相符",
+                matched_danger_cell["text"],
+            )
+            self.assertEqual(matched_danger_cell["tone"], "success")
 
     def test_worker_list_and_approval_pdf_subworkflows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -1026,10 +1232,16 @@ class MigrationTest(unittest.TestCase):
             self.assertIn("overflow-wrap: anywhere", html)
             self.assertIn("复制文件（可直接粘贴）", html)
             self.assertIn("/api/copy-file", html)
+            self.assertIn("/api/open-path", html)
+            self.assertIn("使用默认程序打开审批 PDF", html)
             launcher = primary / APPROVAL_REVIEW_LAUNCHER_FILE_NAME
             self.assertTrue(launcher.is_file())
             self.assertIn(
                 "approval-review-server",
+                launcher.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "--port 0",
                 launcher.read_text(encoding="utf-8"),
             )
             macos_launcher = (
@@ -1045,6 +1257,7 @@ class MigrationTest(unittest.TestCase):
                 '--input-dir "$SCRIPT_DIR" approval-review-server',
                 macos_script,
             )
+            self.assertIn("--port 0", macos_script)
             self.assertNotIn(str(primary), macos_script)
 
             self.assertFalse(retired_excel.exists())
@@ -1110,6 +1323,24 @@ class MigrationTest(unittest.TestCase):
             payload[20:].decode("utf-16le"),
             f"{path.resolve()}\0\0",
         )
+
+    def test_windows_opens_file_with_default_application(self) -> None:
+        path = Path("资料") / "申请单.docx"
+        with (
+            patch(
+                "src.warranty_application_archive."
+                "approval_review_web.sys.platform",
+                "win32",
+            ),
+            patch(
+                "src.warranty_application_archive."
+                "approval_review_web.os.startfile",
+                create=True,
+            ) as startfile,
+        ):
+            open_path_with_default_application(path)
+
+        startfile.assert_called_once_with(str(path.resolve()))
 
     def test_macos_file_clipboard_uses_alias_list(self) -> None:
         path = Path("资料") / "审批单.pdf"

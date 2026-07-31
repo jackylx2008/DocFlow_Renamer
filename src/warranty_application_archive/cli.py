@@ -34,6 +34,7 @@ from .workflows import (
     intake_applications,
     ingest_approval_pdfs,
     ingest_worker_lists,
+    reclassify_historical_materials,
     route_input_files,
 )
 
@@ -121,6 +122,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="读取审核 JSON 中的人工决定并同步正式 JSON/HTML",
     )
     subparsers.add_parser("worker-lists", help="处理待入库施工人员名单")
+    subparsers.add_parser(
+        "reclassify-materials",
+        help="按 OCR 方框勾选状态重新判断既往专项材料",
+    )
     subparsers.add_parser("run", help="执行完整增量工作流")
     return parser
 
@@ -287,6 +292,54 @@ def main(argv: Sequence[str] | None = None) -> int:
                 indent=2,
             )
         )
+        return 0
+
+    if command == "reclassify-materials":
+        data = repository.load()
+        if not repository.path.is_file():
+            raise FileNotFoundError(
+                "尚未建立正式 JSON 数据，请先执行 migrate"
+            )
+        summary = reclassify_historical_materials(
+            data,
+            config.data_root,
+            checkpoint=repository.save,
+        )
+        if summary["records_reclassified"]:
+            data["dataset_revision"] = int(
+                data.get("dataset_revision") or 0
+            ) + 1
+        append_run(data, command, summary)
+        repository.save(data)
+        formal_html = export_summary_html(data, config.data_root)
+        review = build_approval_review(
+            data,
+            config.data_root,
+            repo_root,
+            existing=review_repository.load(),
+        )
+        repository.save(data)
+        review_path = review_repository.save(review)
+        review_html = export_approval_review_html(
+            review,
+            config.data_root,
+        )
+        LOGGER.info("历史专项材料重新判断完成")
+        LOGGER.info(
+            "已检查 %s 条；重新分类 %s 条；移动文件 %s 个",
+            summary["records_checked"],
+            summary["records_reclassified"],
+            summary["files_moved"],
+        )
+        LOGGER.info(
+            "清理不存在的旧文件引用 %s 条；缺少 OCR 缓存 %s 条",
+            summary["missing_references_removed"],
+            summary["recognition_cache_missing"],
+        )
+        LOGGER.info("正式数据文件: %s", repository.path)
+        LOGGER.info("申请汇总页面: %s", formal_html)
+        LOGGER.info("待人工审核数据: %s", review_path)
+        LOGGER.info("待人工审核页面: %s", review_html)
         return 0
 
     if command == "approval-review":

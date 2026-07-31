@@ -21,8 +21,10 @@ AI/OCR 识别、统一命名、重复申请合并、材料完整性判断、审�
 名单入库）、``approval-pdfs``（审批 PDF 归档）、``approval-review``
 （生成人工审核数据和页面）、``apply-approval-review``（执行审核结果）、
 ``export``（重新生成汇总 HTML）、``status``（查看状态）和 ``validate``
-（校验 JSON、案卷文件及 HTML）。Windows 和 macOS 用户也可以运行资料
-目录中的独立 ``.cmd`` 或 ``.command`` 启动器打开汇总及人工审核页面。
+（校验 JSON、案卷文件及 HTML）。``reclassify-materials`` 可根据 OCR 中
+专项作业选项后的方框勾选状态，重新判断既往材料。Windows 和 macOS 用户
+也可以运行资料目录中的独立 ``.cmd`` 或 ``.command`` 启动器打开汇总及
+人工审核页面。
 
 主要成果文件
 ------------

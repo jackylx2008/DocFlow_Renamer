@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import os
 import struct
 import subprocess
 import sys
@@ -157,10 +158,10 @@ def copy_path_to_system_clipboard(path: Path) -> None:
     raise RuntimeError("直接粘贴文件功能目前仅支持 Windows 和 macOS")
 
 
-def open_path_in_file_manager(path: Path) -> None:
+def open_path_with_default_application(path: Path) -> None:
     if sys.platform == "win32":
-        command = ["explorer.exe", str(path)]
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        os.startfile(str(path.resolve()))
+        return
     elif sys.platform == "darwin":
         command = ["open", str(path)]
         creationflags = 0
@@ -267,8 +268,10 @@ def export_approval_review_html(
             "--input-dir",
             str(root),
             "approval-review-server",
+            "--port",
+            "0",
         ],
-        ["approval-review-server"],
+        ["approval-review-server", "--port", "0"],
         windows_name=APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
         macos_name=APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
     )
@@ -460,12 +463,22 @@ def serve_approval_review(
                 if request_path == "/api/open-path":
                     relative = str(payload.get("path") or "").strip()
                     if not relative:
-                        raise ValueError("缺少待打开文件夹路径")
+                        raise ValueError("缺少待打开路径")
                     target = ensure_within(root / Path(relative), root)
-                    if not target.is_dir():
-                        raise ValueError(f"文件夹不存在: {relative}")
-                    open_path_in_file_manager(target)
-                    self._send_json({"ok": True})
+                    if not target.exists():
+                        raise ValueError(f"文件或文件夹不存在: {relative}")
+                    open_path_with_default_application(target)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "name": target.name,
+                            "kind": (
+                                "directory"
+                                if target.is_dir()
+                                else "file"
+                            ),
+                        }
+                    )
                     return
                 if request_path == "/api/copy-file":
                     relative = str(payload.get("path") or "").strip()
@@ -801,7 +814,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       addField(pdfList, "开始时间", pdf.start);
       addField(pdfList, "结束时间", pdf.end);
       addField(pdfList, "施工内容", pdf.content);
-      const pdfLink = text("a", "在浏览器中打开审批 PDF");
+      const pdfLink = text("a", "使用默认程序打开审批 PDF");
       pdfLink.href = fileUrl(pdf.path);
       pdfLink.target = "_blank";
       pdfLink.rel = "noopener";
@@ -885,7 +898,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         addField(list, "开始时间", pdf.start);
         addField(list, "结束时间", pdf.end);
         addField(list, "施工内容", pdf.content);
-        const link = text("a", "在浏览器中打开审批 PDF");
+        const link = text("a", "使用默认程序打开审批 PDF");
         link.href = fileUrl(pdf.path);
         link.target = "_blank";
         link.rel = "noopener";
@@ -1037,6 +1050,37 @@ _HTML_TEMPLATE = r"""<!doctype html>
     byId("saveButton").addEventListener("click", save);
     let selectedFilePath = "";
     const hideFileMenu = () => { byId("fileMenu").hidden = true; };
+    document.addEventListener("click", async (event) => {
+      const anchor = event.target.closest("a[data-file-path]");
+      if (
+        !anchor
+        || !anchor.dataset.filePath
+        || location.protocol === "file:"
+      ) return;
+      event.preventDefault();
+      try {
+        const response = await fetch("/api/open-path", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({path: anchor.dataset.filePath}),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          if (
+            String(result.error || "").startsWith("文件夹不存在")
+          ) {
+            throw new Error(
+              "后台服务仍是旧版本，请关闭旧启动器窗口，"
+              + "再重新双击人工审核启动器"
+            );
+          }
+          throw new Error(result.error || "打开文件失败");
+        }
+        setMessage(`已使用默认程序打开：${result.name}`, "ok");
+      } catch (error) {
+        setMessage(error.message || "打开文件失败", "error");
+      }
+    });
     document.addEventListener("contextmenu", (event) => {
       const anchor = event.target.closest("a[data-file-path]");
       if (!anchor || !anchor.dataset.filePath) return;

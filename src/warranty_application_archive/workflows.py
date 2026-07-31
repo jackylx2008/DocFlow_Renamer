@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import uuid
 from datetime import datetime
@@ -573,11 +574,46 @@ def _classify_recognized_image(text: str) -> str | None:
         return WORKER_LIST_ROLE
     if "质保作业申请单" in normalized or "质保申请单" in normalized:
         return SIGNED_APPLICATION_ROLE
-    if "有限空间" in normalized:
+    if (
+        "有限空间作业申请" in normalized
+        or _work_option_is_checked(text, "有限空间作业")
+    ):
         return CONFINED_SPACE_ROLE
-    if "高处作业" in normalized or "高空作业" in normalized:
+    if (
+        "高处作业申请" in normalized
+        or "高空作业申请" in normalized
+        or _work_option_is_checked(text, "5米以上高处作业")
+        or _work_option_is_checked(text, "5米以上高空作业")
+    ):
         return HIGH_ALTITUDE_ROLE
+    if any(
+        phrase in normalized
+        for phrase in (
+            "动火作业申请",
+            "危大工程专项方案",
+            "配电室接电申请",
+        )
+    ) or any(
+        _work_option_is_checked(text, option)
+        for option in ("动火作业", "危大工程", "配电室接电")
+    ):
+        return SPECIAL_WORK_ROLE
     return None
+
+
+def _work_option_is_checked(text: str, option: str) -> bool:
+    normalized = legacy.normalize_match_text(text)
+    checked_markers = "☑☒✓✔√■●◆⊠▣▩◉x×"
+    escaped_option = re.escape(legacy.normalize_match_text(option))
+    separators = r"[：:;；,、\[\](){}【】□☐○◇]{0,3}"
+    patterns = (
+        (
+            rf"{escaped_option}{separators}"
+            rf"[{re.escape(checked_markers)}]"
+        ),
+        rf"{escaped_option}[：:]?(?:已勾选|是)",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
 
 
 def _is_approval_pdf(path: Path, text: str) -> tuple[bool, str]:
@@ -706,6 +742,124 @@ def _archive_material_once(
         return False
     _archive_material(application, source, role, root, changes)
     return True
+
+
+def reclassify_historical_materials(
+    dataset: dict[str, Any],
+    root: Path,
+    checkpoint: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, int]:
+    root = root.resolve()
+    cache = dataset.get("recognition_cache") or {}
+    changes = dataset.setdefault("changes", [])
+    summary = {
+        "records_checked": 0,
+        "records_reclassified": 0,
+        "missing_references_removed": 0,
+        "files_moved": 0,
+        "recognition_cache_missing": 0,
+    }
+    special_roles = (
+        CONFINED_SPACE_ROLE,
+        HIGH_ALTITUDE_ROLE,
+        SPECIAL_WORK_ROLE,
+    )
+    for application in dataset.get("applications") or []:
+        application_changed = False
+        materials = application.setdefault("materials", {})
+        for current_role in special_roles:
+            role_files = materials.setdefault(current_role, [])
+            for file_item in list(role_files):
+                if not isinstance(file_item, dict):
+                    continue
+                summary["records_checked"] += 1
+                fingerprint = str(file_item.get("sha256") or "")
+                recognition = cache.get(fingerprint) or {}
+                text = str(recognition.get("text") or "")
+                if not text:
+                    summary["recognition_cache_missing"] += 1
+                    continue
+                resolved_role = _classify_recognized_image(text)
+                if resolved_role is None or resolved_role == current_role:
+                    continue
+
+                relative = str(file_item.get("path") or "")
+                try:
+                    source = ensure_within(root / Path(relative), root)
+                except ValueError:
+                    LOGGER.warning(
+                        "历史材料路径越界，跳过重判: 案卷=%s；路径=%s",
+                        application.get("case_name") or "",
+                        relative,
+                    )
+                    continue
+                role_files.remove(file_item)
+                target = source
+                result = "source_missing_record_removed"
+                if source.is_file():
+                    before_changes = len(changes)
+                    archived = _archive_material_once(
+                        application,
+                        source,
+                        resolved_role,
+                        root,
+                        changes,
+                    )
+                    if archived:
+                        target_item = materials[resolved_role][-1]
+                        target = ensure_within(
+                            root / Path(str(target_item["path"])),
+                            root,
+                        )
+                        summary["files_moved"] += 1
+                        result = "file_reclassified"
+                    elif len(changes) > before_changes:
+                        target = Path(str(changes[-1]["target"]))
+                        result = "duplicate_file_quarantined"
+                else:
+                    summary["missing_references_removed"] += 1
+
+                changes.append(
+                    _change(
+                        "reclassify_historical_material",
+                        source,
+                        target,
+                        f"{current_role}->{resolved_role}",
+                        str(application.get("case_id") or ""),
+                        result,
+                    )
+                )
+                summary["records_reclassified"] += 1
+                application_changed = True
+                LOGGER.warning(
+                    "历史申请材料重新分类: 案卷=%s；原类型=%s；"
+                    "新类型=%s；处理结果=%s；文件=%s",
+                    application.get("case_name") or "",
+                    ROLE_LABELS_FOR_LOG.get(current_role, current_role),
+                    ROLE_LABELS_FOR_LOG.get(resolved_role, resolved_role),
+                    RESULT_LABELS_FOR_LOG.get(result, result),
+                    source.name,
+                )
+        if application_changed:
+            _refresh_status(application)
+            if checkpoint:
+                checkpoint(dataset)
+    return summary
+
+
+ROLE_LABELS_FOR_LOG = {
+    SIGNED_APPLICATION_ROLE: "手签申请单",
+    WORKER_LIST_ROLE: "施工人员名单",
+    CONFINED_SPACE_ROLE: "有限空间申请",
+    HIGH_ALTITUDE_ROLE: "高处作业申请",
+    SPECIAL_WORK_ROLE: "专项作业材料",
+}
+
+RESULT_LABELS_FOR_LOG = {
+    "source_missing_record_removed": "源文件不存在，已清理旧记录",
+    "file_reclassified": "文件已重新分类并规范命名",
+    "duplicate_file_quarantined": "重复文件已移入隔离区",
+}
 
 
 def _input_batch_files(
