@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Local HTML Review"
+  short_description: "Build auditable JSON-backed local HTML review workflows"
+  default_prompt: "Use $build-local-html-review to replace an Excel-based manual review sheet with a local HTML review and reporting workflow."

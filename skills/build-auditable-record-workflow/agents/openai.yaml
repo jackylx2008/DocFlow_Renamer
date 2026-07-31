@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Auditable Record Workflow"
+  short_description: "Design reliable record archives with human review and validation"
+  default_prompt: "Use $build-auditable-record-workflow to design an auditable archive workflow with formal data, duplicate handling, human fallback, migration, and validation."
