@@ -8,8 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import legacy
-from .constants import (
+from ..modules import legacy
+from ..modules.constants import (
     APPROVAL_PDF_ROLE,
     CASES_DIR_NAME,
     CONFINED_SPACE_ROLE,
@@ -26,15 +26,15 @@ from .constants import (
     WORD_ROLE,
     WORKER_LIST_ROLE,
 )
-from .file_utils import ensure_within, relative_posix, sha256_file
-from .naming import (
+from ..modules.file_utils import ensure_within, relative_posix, sha256_file
+from ..modules.naming import (
     application_prefix,
     approval_application_no,
     case_directory_name,
     material_file_name,
     material_role,
 )
-from .repository import empty_dataset
+from ..modules.repository import empty_dataset
 
 
 LOGGER = logging.getLogger(__name__)

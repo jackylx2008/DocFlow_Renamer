@@ -59,12 +59,17 @@
    案卷从汇总中移除，并整体移入隔离区以便恢复。
 5. 一次放入 `_input` 的申请材料默认属于同一个申请批次；同批只有一份
    Word 时，随机文件名的图片也关联到该 Word 对应案卷。重复 Word 不新建
-   案卷，但同批附件可以补充到已有原始案卷。
+   案卷，但同批附件可以补充到已有原始案卷。图片后续单独补投时，系统会
+   在已有未终止案卷中先严格匹配施工区域和起止日期，再按 OCR 施工内容的
+   严格命中或唯一高相似度结果关联；候选不唯一时仍保留在 `_inbox`。
 6. 图片 OCR 同时包含“姓名、性别、电话”时识别为施工人员名单；包含
    “质保申请单”或“质保作业申请单”时识别为手签申请单。有限空间、高处、
    动火、危大工程和配电室接电等专项材料，必须出现对应专用申请标题，或
    对应作业选项后的方框已明确勾选；申请单模板中的未勾选选项不再作为
-   专项材料分类依据。
+   专项材料分类依据。同批存在多份内容完全相同的施工人员名单时，如果名单
+   图片数与同批缺名单案卷数一致，则按案卷名稳定排序后一对一入库；补投时
+   可用图片修改日期对应施工开始日期恢复同样的唯一分配。数量不一致时不
+   强行分配，文件继续保留在 `_inbox`。
 7. 创建独立案卷目录并统一文件名。
 8. 关联手签图片、人员名单和有限空间/高处作业材料。
 9. 从 `_templates` 复制每份申请必需的安全协议。
@@ -85,8 +90,10 @@
 
 自动匹配要求唯一且证据完整；成功匹配的结果直接视为可信。只有 `_inbox` 第一层中仍未匹配的 PDF 才进入独立人工审核流程：
 
-1. 施工区域和施工内容必须同时通过严格文本匹配；日期不淘汰候选，
-   只根据相差天数降低候选自身匹配度。
+1. 施工区域必须通过严格文本匹配（位置代码中紧邻数字的 OCR `i/l` 混淆会先
+   归一化）；申请记录的施工内容经过规范化后，必须完整包含在审批 PDF 的
+   “施工内容”字段中，审批 PDF 可以带有额外补充说明。日期不淘汰候选，只
+   根据相差天数降低候选自身匹配度。
 2. 每个 PDF 只保留最高项；若存在第二名，再根据领先差值下调最终选择置信度。
 3. 没有严格候选的 PDF 写入 `unresolved_pdfs`，并在 HTML 的
    “无严格候选”页签单独显示，不强行推荐案卷。
@@ -118,16 +125,17 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-默认从 `common.env` 读取资料目录：
+复制 `common.env.example` 为本机私有的 `common.env`，并配置资料目录：
 
 ```env
-INPUT_PATH=D:\path\to\质保作业申请单
+CLOUDSTATION_ROOT_WINDOWS=D:\CloudStaion
+INPUT_PATH=${CLOUDSTATION_ROOT}/sample/project/input
 ```
 
 也可以使用 `--input-dir` 指定：
 
 ```powershell
-python warranty_application_archive.py --input-dir "D:\path\to\质保作业申请单" status
+python archive_status.py --input-dir "sample/project/input"
 ```
 
 ## 旧目录迁移
@@ -135,15 +143,15 @@ python warranty_application_archive.py --input-dir "D:\path\to\质保作业申�
 旧版平铺目录必须先演练。演练只生成计划，不移动资料：
 
 ```powershell
-python warranty_application_archive.py migrate
+python migrate_archive.py
 ```
 
 确认计划后，执行迁移时必须提供内容一致的备份目录：
 
 ```powershell
-python warranty_application_archive.py migrate `
+python migrate_archive.py `
   --apply `
-  --backup-dir "D:\path\to\质保作业申请单_backup"
+  --backup-dir "sample/project/input_backup"
 ```
 
 执行前会逐文件比较正式目录与备份的大小和 SHA-256。任何差异都会阻止迁移。迁移时还会在每次移动前后再次校验哈希。
@@ -155,7 +163,7 @@ python warranty_application_archive.py migrate `
 执行完整增量流程：
 
 ```powershell
-python warranty_application_archive.py run
+python run_archive.py
 ```
 
 日常只需将文件放入 `_input` 第一层。程序不递归扫描子目录；支持 `.docx`、
@@ -165,22 +173,22 @@ python warranty_application_archive.py run
 单独执行支流程：
 
 ```powershell
-python warranty_application_archive.py applications
-python warranty_application_archive.py worker-lists
-python warranty_application_archive.py approval-pdfs
+python archive_applications.py
+python archive_worker_lists.py
+python archive_approval_pdfs.py
 ```
 
 `approval-pdfs` 会自动刷新未匹配 PDF 的独立审核 JSON/HTML。也可以单独重新生成：
 
 ```powershell
-python warranty_application_archive.py approval-review
+python build_approval_review.py
 ```
 
 升级分类规则后，可使用已有 OCR 缓存重新判断全部既往专项材料，并同步
 更新正式 JSON、案卷状态、汇总 HTML 和人工审核页面：
 
 ```powershell
-python warranty_application_archive.py reclassify-materials
+python reclassify_materials.py
 ```
 
 该命令不会重复调用本地 AI。发生重新分类时会更新文件归类；旧记录指向的
@@ -199,14 +207,14 @@ HTML 页面；“保存并执行审核结果”固定更新同目录的
 也可以从命令行启动：
 
 ```powershell
-python warranty_application_archive.py approval-review-server
+python serve_archive_review.py
 ```
 
 正常使用网页时不再需要第二步应用命令。下面的命令只用于兼容处理旧版页面
 已经保存、但尚未执行的审核决定：
 
 ```powershell
-python warranty_application_archive.py apply-approval-review
+python apply_approval_review.py
 ```
 
 如果正式 JSON 在审核页面生成后发生过版本变化，页面保存和应用命令都会
@@ -215,14 +223,14 @@ python warranty_application_archive.py apply-approval-review
 仅从 JSON 重新生成汇总 HTML：
 
 ```powershell
-python warranty_application_archive.py export
+python export_archive.py
 ```
 
 查看状态及进行完整校验：
 
 ```powershell
-python warranty_application_archive.py status
-python warranty_application_archive.py validate
+python archive_status.py
+python validate_archive.py
 ```
 
 `validate` 会检查：
@@ -302,7 +310,8 @@ macOS 启动器不会保存 Windows 绝对路径。资料目录自动取 `.comma
 
 置信度规则：
 
-- 施工区域和施工内容严格命中占 80%，属于候选准入条件。
+- 施工区域严格命中，且审批 PDF 施工内容字段包含申请施工内容，占 80%，属于
+  候选准入条件。
 - 开始、结束日期合计占 20%；日期相差超过 31 天也不会淘汰候选，
   但日期部分不再加分。
 - 存在多个严格候选时，最终选择置信度还会根据第一名与第二名的
@@ -310,22 +319,24 @@ macOS 启动器不会保存 Windows 绝对路径。资料目录自动取 `.comma
 - PDF 没有足够的内嵌文字时，程序调用本地 AI OCR，并在审核产物中
   记录识别方式；已有 SHA-256 识别缓存会直接复用。
 
-## 统一入口
+## 独立入口
 
-项目根目录只保留一个 Python 入口：
+项目根目录按工作流提供独立 Python 入口：
 
 ```powershell
-python warranty_application_archive.py <command>
+python run_archive.py
+python migrate_archive.py
+python serve_archive_review.py
 ```
 
-入口文件头部的模块说明集中记录了项目功能、常用用法和主要成果文件，可在
-编辑器中直接查看。审批 PDF、人员名单和申请材料均通过子命令进入统一
-工作流，不再维护独立兼容脚本。
+每个入口文件头部均说明用途、配置、参数和输出。公共能力位于 `modules/`，
+完整步骤编排位于 `flows/`。旧 `warranty_application_archive.py` 仅作为过渡
+兼容入口，不再作为 README 推荐用法。
 
 最常用的完整增量处理命令是：
 
 ```powershell
-python warranty_application_archive.py run
+python run_archive.py
 ```
 
 处理完成后的主要成果包括：
@@ -339,27 +350,33 @@ python warranty_application_archive.py run
 ## 项目结构
 
 ```text
-warranty_application_archive.py   # 唯一命令入口
+run_archive.py                     # 完整增量归档入口
+migrate_archive.py                 # 旧目录迁移入口
+serve_archive_review.py            # 本地审核/汇总页面服务
+logging_config.py                  # 统一控制台与滚动文件日志
+config.yaml                        # app 与 flows 分层配置
+common.env.example                 # 脱敏的本机配置模板
+docs/                              # 架构、部署和开发文档
 src/warranty_application_archive/
-├─ cli.py                          # 命令编排
-├─ config.py                       # 配置
-├─ constants.py                    # 目录、状态和材料类型
-├─ repository.py                   # JSON 唯一数据源
-├─ naming.py                       # 案卷及材料命名
-├─ recognition.py                  # 共享 AI/OCR 与缓存
-├─ migration.py                    # 旧目录迁移计划与执行
-├─ workflows.py                    # 申报、人员名单、审批 PDF 支流程
-├─ approval_review.py              # 未匹配审批 PDF 候选、决定与正式回写
-├─ approval_review_web.py          # 本地 HTML 审核页与审核 JSON 回写服务
-├─ summary_html.py                 # JSON → 正式汇总 HTML
-├─ validation.py                   # 数据和成果校验
-└─ legacy.py                       # 迁移期间保留的解析/AI兼容层
+├─ config_loader.py                # 配置、环境变量和路径集中解析
+├─ context.py                      # 入口与编排共享上下文
+├─ modules/                        # 单一职责的基础能力
+│  ├─ naming.py                    # 案卷及材料命名
+│  ├─ repository.py                # JSON 唯一数据源
+│  ├─ recognition.py               # 共享 AI/OCR 与缓存
+│  ├─ summary_html.py              # JSON → 正式汇总 HTML
+│  └─ validation.py                # 数据和成果校验
+└─ flows/                          # 场景编排
+   ├─ archive_flow.py              # 申报、名单及审批 PDF 入库
+   ├─ migration_flow.py            # 旧目录迁移计划与执行
+   ├─ approval_review_flow.py      # 审批候选、决定与回写
+   └─ approval_review_web_flow.py  # 本地审核页面服务
 ```
 
 ## 开发验证
 
 ```powershell
-python -m compileall -q warranty_application_archive.py src tests
-python -m unittest discover -s tests -v
-python -m flake8 src tests warranty_application_archive.py
+python -m compileall -q src tests entry_bootstrap.py logging_config.py run_archive.py migrate_archive.py serve_archive_review.py archive_applications.py archive_approval_pdfs.py archive_worker_lists.py archive_status.py validate_archive.py export_archive.py build_approval_review.py apply_approval_review.py reclassify_materials.py warranty_application_archive.py
+python -m pytest -q
+python -m flake8 entry_bootstrap.py logging_config.py run_archive.py migrate_archive.py serve_archive_review.py archive_applications.py archive_approval_pdfs.py archive_worker_lists.py archive_status.py validate_archive.py export_archive.py build_approval_review.py apply_approval_review.py reclassify_materials.py warranty_application_archive.py src tests
 ```

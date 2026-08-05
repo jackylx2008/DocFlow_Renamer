@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from src.warranty_application_archive import legacy as archive_workflow
-from src.warranty_application_archive.recognition import RecognitionService
+from warranty_application_archive.modules import legacy as archive_workflow
+from warranty_application_archive.modules.recognition import RecognitionService
 
 
 class PdfTextCacheTest(unittest.TestCase):
@@ -126,7 +126,7 @@ class PdfTextCacheTest(unittest.TestCase):
                     return_value=client,
                 ),
                 self.assertLogs(
-                    "src.warranty_application_archive.recognition",
+                    "warranty_application_archive.modules.recognition",
                     level="INFO",
                 ) as captured,
             ):

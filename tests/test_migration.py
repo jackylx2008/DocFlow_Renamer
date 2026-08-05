@@ -7,13 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from src.warranty_application_archive.approval_review import (
+from warranty_application_archive.modules import legacy
+from warranty_application_archive.flows.approval_review_flow import (
     ApprovalReviewRepository,
     apply_review_decisions,
     build_approval_review,
     import_json_decisions,
 )
-from src.warranty_application_archive.approval_review_web import (
+from warranty_application_archive.flows.approval_review_web_flow import (
     _file_drop_clipboard_data,
     copy_file_to_macos_clipboard,
     export_approval_review_html,
@@ -21,7 +22,7 @@ from src.warranty_application_archive.approval_review_web import (
     save_and_apply_review_payload,
     save_review_payload,
 )
-from src.warranty_application_archive.constants import (
+from warranty_application_archive.modules.constants import (
     APPROVAL_REVIEW_DATA_FILE_NAME,
     APPROVAL_REVIEW_HTML_FILE_NAME,
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
@@ -36,21 +37,22 @@ from src.warranty_application_archive.constants import (
     SUMMARY_LAUNCHER_FILE_NAME,
     SUMMARY_MACOS_LAUNCHER_FILE_NAME,
     TEMPLATE_FILE_NAME,
+    WORKER_LIST_ROLE,
 )
-from src.warranty_application_archive.file_utils import sha256_file
-from src.warranty_application_archive.migration import (
+from warranty_application_archive.modules.file_utils import sha256_file
+from warranty_application_archive.flows.migration_flow import (
     apply_migration_plan,
     build_migration_plan,
     file_record,
     verify_backup,
 )
-from src.warranty_application_archive.repository import JsonRepository
-from src.warranty_application_archive.summary_html import (
+from warranty_application_archive.modules.repository import JsonRepository
+from warranty_application_archive.modules.summary_html import (
     build_summary_view,
     export_summary_html,
 )
-from src.warranty_application_archive.validation import validate_summary_html
-from src.warranty_application_archive.workflows import (
+from warranty_application_archive.modules.validation import validate_summary_html
+from warranty_application_archive.flows.archive_flow import (
     _classify_recognized_image,
     _find_duplicate_application,
     _work_option_is_checked,
@@ -93,7 +95,7 @@ class MigrationTest(unittest.TestCase):
         (primary / f"{stem}_工人名单.jpg").write_bytes(b"workers")
         (primary / TEMPLATE_FILE_NAME).write_bytes(b"agreement")
         with patch(
-            "src.warranty_application_archive.migration.legacy.parse_document",
+            "warranty_application_archive.flows.migration_flow.legacy.parse_document",
             return_value=PARSED_APPLICATION,
         ):
             plan = build_migration_plan(primary)
@@ -146,6 +148,69 @@ class MigrationTest(unittest.TestCase):
         self.assertEqual(
             _classify_recognized_image("专项作业 动火作业：已勾选"),
             SPECIAL_WORK_ROLE,
+        )
+
+    def test_approval_content_match_uses_only_construction_field(
+        self,
+    ) -> None:
+        approval = Path("approval.pdf")
+        common = (
+            "施工区域：冷却塔 "
+            "施工开始时间：2026年7月24日 "
+            "施工结束时间：2026年7月24日 "
+        )
+        contained = (
+            common
+            + "施工内容：维修冷塔（含设备调试及现场清理） "
+            + "施工负责人：测试人员"
+        )
+        self.assertEqual(
+            legacy.find_matching_pdf_paths(
+                "冷却塔",
+                "维修冷塔",
+                {approval: contained},
+                "2026-07-24",
+                "2026-07-24",
+            ),
+            [approval],
+        )
+
+        content_only_in_approval_comment = (
+            common
+            + "施工内容：更换照明灯具 施工负责人：测试人员 "
+            + "审批记录：备注中提到维修冷塔"
+        )
+        self.assertEqual(
+            legacy.find_matching_pdf_paths(
+                "冷却塔",
+                "维修冷塔",
+                {approval: content_only_in_approval_comment},
+                "2026-07-24",
+                "2026-07-24",
+            ),
+            [],
+        )
+
+    def test_approval_area_match_normalizes_ocr_location_code(
+        self,
+    ) -> None:
+        approval = Path("approval.pdf")
+        recognized = (
+            "施工区域：i3M1层南区冷却塔 "
+            "施工开始时间：2026年7月24日 "
+            "施工结束时间：2026年7月24日 "
+            "施工内容：维修冷塔及现场清理 "
+            "施工负责人：测试人员"
+        )
+        self.assertEqual(
+            legacy.find_matching_pdf_paths(
+                "L3M1层南区冷却塔",
+                "维修冷塔",
+                {approval: recognized},
+                "2026-07-24",
+                "2026-07-24",
+            ),
+            [approval],
         )
 
     def test_reclassify_historical_materials_corrects_false_positive(
@@ -244,7 +309,7 @@ class MigrationTest(unittest.TestCase):
 
             verify_backup(primary, backup)
             with patch(
-                "src.warranty_application_archive.migration.legacy.parse_document",
+                "warranty_application_archive.flows.migration_flow.legacy.parse_document",
                 return_value=PARSED_APPLICATION,
             ):
                 plan = build_migration_plan(primary)
@@ -543,12 +608,12 @@ class MigrationTest(unittest.TestCase):
             )
             recognized_text = (
                 "工程类-主体质保施工 申请编号：202607240001 "
-                "施工区域：冷却塔 施工内容：维修冷塔 "
+                "施工区域：冷却塔 施工内容：维修冷塔（含设备调试） "
                 "施工开始时间：2026年7月24日 "
                 "施工结束时间：2026年7月24日"
             )
             with patch(
-                "src.warranty_application_archive.workflows."
+                "warranty_application_archive.flows.archive_flow."
                 "RecognitionService.pdf_text",
                 return_value=recognized_text,
             ):
@@ -603,7 +668,7 @@ class MigrationTest(unittest.TestCase):
                 return "有限空间作业申请 施工区域：冷却塔"
 
             with patch(
-                "src.warranty_application_archive.workflows."
+                "warranty_application_archive.flows.archive_flow."
                 "RecognitionService.pdf_text",
                 side_effect=recognized_text,
             ):
@@ -675,7 +740,7 @@ class MigrationTest(unittest.TestCase):
             }
 
             with patch(
-                "src.warranty_application_archive.workflows."
+                "warranty_application_archive.flows.archive_flow."
                 "legacy.parse_document",
                 return_value=parsed,
             ):
@@ -709,6 +774,106 @@ class MigrationTest(unittest.TestCase):
                 ).is_file()
             )
 
+    def test_image_only_intake_matches_existing_case_with_ocr_content_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            application = dataset["applications"][0]
+            materials = application["materials"]
+            for file_item in materials[SIGNED_APPLICATION_ROLE]:
+                signed_path = primary / file_item["path"]
+                if signed_path.is_file():
+                    signed_path.unlink()
+            materials[SIGNED_APPLICATION_ROLE] = []
+
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+            incoming_image = inbox / "random-signed.png"
+            incoming_image.write_bytes(b"later signed application")
+            incoming_hash = sha256_file(incoming_image)
+            recognized_text = (
+                "质保作业申请单 "
+                "施工区域：冷却塔 "
+                "施工日期：2026年7月24日~2026年7月24日 "
+                "施工内容：维修水塔 "
+                "施工负责人：施工负责人 联系电话：13900000000"
+            )
+
+            with patch(
+                "warranty_application_archive.flows.archive_flow."
+                "RecognitionService.image_text",
+                return_value=recognized_text,
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            self.assertEqual(count, 0)
+            self.assertFalse(incoming_image.exists())
+            self.assertTrue(
+                any(
+                    item["sha256"] == incoming_hash
+                    for item in materials[SIGNED_APPLICATION_ROLE]
+                )
+            )
+
+    def test_image_only_intake_keeps_ambiguous_fuzzy_match_in_inbox(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            application = dataset["applications"][0]
+            materials = application["materials"]
+            for file_item in materials[SIGNED_APPLICATION_ROLE]:
+                signed_path = primary / file_item["path"]
+                if signed_path.is_file():
+                    signed_path.unlink()
+            materials[SIGNED_APPLICATION_ROLE] = []
+            application["application"]["施工内容"] = "风机烧坏维修"
+
+            competing = deepcopy(application)
+            competing["case_id"] = "competing-case"
+            competing["case_name"] = "2026-07-24_风机盘管清洗_质保作业申请单"
+            competing["case_directory"] = (
+                "_cases/2026-07-24_风机盘管清洗_质保作业申请单"
+            )
+            competing["application"]["施工内容"] = "风机盘管清洗"
+            dataset["applications"].append(competing)
+
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+            incoming_image = inbox / "ambiguous-signed.png"
+            incoming_image.write_bytes(b"ambiguous signed application")
+            recognized_text = (
+                "质保作业申请单 "
+                "施工区域：冷却塔 "
+                "施工日期：2026年7月24日~2026年7月24日 "
+                "施工内容：风机盘管维修 "
+                "施工负责人：施工负责人 联系电话：13900000000"
+            )
+
+            with patch(
+                "warranty_application_archive.flows.archive_flow."
+                "RecognitionService.image_text",
+                return_value=recognized_text,
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            self.assertEqual(count, 0)
+            self.assertTrue(incoming_image.is_file())
+            self.assertFalse(materials[SIGNED_APPLICATION_ROLE])
+
     def test_duplicate_application_is_quarantined_and_not_added(
         self,
     ) -> None:
@@ -724,12 +889,12 @@ class MigrationTest(unittest.TestCase):
 
             with (
                 patch(
-                    "src.warranty_application_archive.workflows."
+                    "warranty_application_archive.flows.archive_flow."
                     "legacy.parse_document",
                     return_value=deepcopy(PARSED_APPLICATION),
                 ),
                 self.assertLogs(
-                    "src.warranty_application_archive.workflows",
+                    "warranty_application_archive.flows.archive_flow",
                     level="WARNING",
                 ) as captured,
             ):
@@ -808,7 +973,7 @@ class MigrationTest(unittest.TestCase):
             self.assertIs(selected, more_complete)
 
             with patch(
-                "src.warranty_application_archive.workflows."
+                "warranty_application_archive.flows.archive_flow."
                 "legacy.parse_document",
                 return_value=deepcopy(PARSED_APPLICATION),
             ):
@@ -875,12 +1040,12 @@ class MigrationTest(unittest.TestCase):
 
             with (
                 patch(
-                    "src.warranty_application_archive.workflows."
+                    "warranty_application_archive.flows.archive_flow."
                     "legacy.parse_document",
                     return_value=deepcopy(PARSED_APPLICATION),
                 ),
                 patch(
-                    "src.warranty_application_archive.workflows."
+                    "warranty_application_archive.flows.archive_flow."
                     "RecognitionService.image_text",
                     side_effect=recognized_text,
                 ),
@@ -923,6 +1088,122 @@ class MigrationTest(unittest.TestCase):
                 "_inbox/random-workers.jpg",
             )
 
+    def test_identical_worker_lists_are_distributed_one_per_existing_case(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            prototype = dataset["applications"][0]
+            for file_item in prototype["materials"][WORKER_LIST_ROLE]:
+                worker_path = primary / file_item["path"]
+                if worker_path.is_file():
+                    worker_path.unlink()
+            prototype["materials"][WORKER_LIST_ROLE] = []
+            prototype["application"]["施工开始时间"] = "2026-08-05"
+
+            applications = []
+            for index in range(4):
+                application = deepcopy(prototype)
+                application["case_id"] = f"worker-batch-{index}"
+                application["case_name"] = (
+                    f"2026-08-05_批次{index + 1}_质保作业申请单"
+                )
+                application["case_directory"] = (
+                    f"_cases/{application['case_name']}"
+                )
+                (primary / application["case_directory"]).mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+                applications.append(application)
+            dataset["applications"] = applications
+
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+            modified_at = datetime(2026, 8, 5, 10, 38).timestamp()
+            worker_bytes = b"same worker list for four cases"
+            for index in range(4):
+                image = inbox / f"random-worker-{index}.jpg"
+                image.write_bytes(worker_bytes)
+                os.utime(image, (modified_at, modified_at))
+            worker_hash = sha256_file(inbox / "random-worker-0.jpg")
+
+            with patch(
+                "warranty_application_archive.flows.archive_flow."
+                "RecognitionService.image_text",
+                return_value="姓名 性别 电话 张三 男 13800000000",
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            self.assertEqual(count, 0)
+            self.assertFalse(any(inbox.iterdir()))
+            for application in applications:
+                worker_files = application["materials"][WORKER_LIST_ROLE]
+                self.assertEqual(len(worker_files), 1)
+                self.assertEqual(worker_files[0]["sha256"], worker_hash)
+
+    def test_identical_worker_lists_stay_when_case_count_does_not_match(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            prototype = dataset["applications"][0]
+            for file_item in prototype["materials"][WORKER_LIST_ROLE]:
+                worker_path = primary / file_item["path"]
+                if worker_path.is_file():
+                    worker_path.unlink()
+            prototype["materials"][WORKER_LIST_ROLE] = []
+            prototype["application"]["施工开始时间"] = "2026-08-05"
+
+            applications = []
+            for index in range(3):
+                application = deepcopy(prototype)
+                application["case_id"] = f"ambiguous-worker-{index}"
+                application["case_name"] = (
+                    f"2026-08-05_候选{index + 1}_质保作业申请单"
+                )
+                application["case_directory"] = (
+                    f"_cases/{application['case_name']}"
+                )
+                applications.append(application)
+            dataset["applications"] = applications
+
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+            modified_at = datetime(2026, 8, 5, 10, 38).timestamp()
+            for index in range(4):
+                image = inbox / f"ambiguous-worker-{index}.jpg"
+                image.write_bytes(b"same ambiguous worker list")
+                os.utime(image, (modified_at, modified_at))
+
+            with patch(
+                "warranty_application_archive.flows.archive_flow."
+                "RecognitionService.image_text",
+                return_value="姓名 性别 电话 张三 男 13800000000",
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            self.assertEqual(count, 0)
+            self.assertEqual(len(list(inbox.iterdir())), 4)
+            self.assertTrue(
+                all(
+                    not application["materials"][WORKER_LIST_ROLE]
+                    for application in applications
+                )
+            )
+
     def test_same_content_with_different_end_date_is_not_duplicate(
         self,
     ) -> None:
@@ -940,7 +1221,7 @@ class MigrationTest(unittest.TestCase):
             }
 
             with patch(
-                "src.warranty_application_archive.workflows."
+                "warranty_application_archive.flows.archive_flow."
                 "legacy.parse_document",
                 return_value=parsed,
             ):
@@ -980,7 +1261,7 @@ class MigrationTest(unittest.TestCase):
                     "工程类主体质保施工申请编号202607240099"
                     "施工区域冷却塔施工开始时间施工结束时间"
                     "2026~07~23至2026~07~25时长3天"
-                    "施工内容维修冷塔施工负责人测试人员"
+                    "施工内容维修冷塔及现场清理施工负责人测试人员"
                 ),
                 "method": "test",
             }
@@ -1154,6 +1435,7 @@ class MigrationTest(unittest.TestCase):
                     "施工区域冷却塔施工开始时间2026年7月24日"
                     "施工结束时间2026年7月24日"
                     "施工内容更换UV灯管施工负责人测试人员"
+                    "审批记录备注中提到维修冷塔"
                 ),
                 "method": "plain",
             }
@@ -1237,7 +1519,7 @@ class MigrationTest(unittest.TestCase):
             launcher = primary / APPROVAL_REVIEW_LAUNCHER_FILE_NAME
             self.assertTrue(launcher.is_file())
             self.assertIn(
-                "approval-review-server",
+                "serve_archive_review.py",
                 launcher.read_text(encoding="utf-8"),
             )
             self.assertIn(
@@ -1254,7 +1536,7 @@ class MigrationTest(unittest.TestCase):
                 macos_script,
             )
             self.assertIn(
-                '--input-dir "$SCRIPT_DIR" approval-review-server',
+                '--input-dir "$SCRIPT_DIR" --port 0',
                 macos_script,
             )
             self.assertIn("--port 0", macos_script)
@@ -1328,13 +1610,13 @@ class MigrationTest(unittest.TestCase):
         path = Path("资料") / "申请单.docx"
         with (
             patch(
-                "src.warranty_application_archive."
-                "approval_review_web.sys.platform",
+                "warranty_application_archive.flows."
+                "approval_review_web_flow.sys.platform",
                 "win32",
             ),
             patch(
-                "src.warranty_application_archive."
-                "approval_review_web.os.startfile",
+                "warranty_application_archive.flows."
+                "approval_review_web_flow.os.startfile",
                 create=True,
             ) as startfile,
         ):
@@ -1350,7 +1632,7 @@ class MigrationTest(unittest.TestCase):
             stdout="",
         )
         with patch(
-            "src.warranty_application_archive.approval_review_web."
+            "warranty_application_archive.flows.approval_review_web_flow."
             "subprocess.run",
             return_value=completed,
         ) as run:

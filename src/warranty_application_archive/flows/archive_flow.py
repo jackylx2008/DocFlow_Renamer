@@ -5,11 +5,12 @@ import re
 import shutil
 import uuid
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
 
-from . import legacy
-from .constants import (
+from ..modules import legacy
+from ..modules.constants import (
     APPROVAL_PDF_ROLE,
     CASES_DIR_NAME,
     CONFINED_SPACE_ROLE,
@@ -27,21 +28,23 @@ from .constants import (
     WORD_ROLE,
     WORKER_LIST_ROLE,
 )
-from .file_utils import ensure_within, relative_posix, sha256_file
-from .migration import CASE_NAMESPACE, _required_roles, file_record
-from .naming import (
+from ..modules.file_utils import ensure_within, relative_posix, sha256_file
+from .migration_flow import CASE_NAMESPACE, _required_roles, file_record
+from ..modules.naming import (
     application_prefix,
     approval_application_no,
     material_file_name,
     material_role,
 )
-from .recognition import RecognitionService
+from ..modules.recognition import RecognitionService
 
 
 LOGGER = logging.getLogger(__name__)
 INPUT_ROUTE_VERSION = "input-router-v1"
 APPLICATION_MATERIAL_ROUTE = "application_material"
 APPROVAL_PDF_ROUTE = "approval_pdf"
+IMAGE_CONTENT_SIMILARITY_MIN = 0.60
+IMAGE_CONTENT_SIMILARITY_MARGIN = 0.15
 
 
 def _change(
@@ -601,6 +604,100 @@ def _classify_recognized_image(text: str) -> str | None:
     return None
 
 
+def _match_recognized_image_application(
+    text: str,
+    applications: list[dict[str, Any]],
+    role: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Find one existing case from strong form fields in recognized image text."""
+    normalized_text = legacy.normalize_match_text(text)
+    image_content = legacy.extract_pdf_construction_content(normalized_text)
+    if not image_content:
+        return None, "OCR 未提取到施工内容字段"
+
+    ranked: list[tuple[float, bool, dict[str, Any]]] = []
+    for application in applications:
+        if application.get("status") == "terminated":
+            continue
+        business = application.get("application") or {}
+        area_key = legacy.normalize_pdf_ocr_match_text(
+            str(business.get("施工区域") or "")
+        )
+        if not area_key or area_key not in legacy.normalize_pdf_ocr_match_text(
+            normalized_text
+        ):
+            continue
+        if not legacy.pdf_construction_dates_match(
+            normalized_text,
+            str(business.get("施工开始时间") or ""),
+            str(business.get("施工结束时间") or ""),
+        ):
+            continue
+
+        content_key = legacy.normalize_match_text(
+            str(business.get("施工内容") or "")
+        )
+        if not content_key:
+            continue
+        exact_content = (
+            content_key in image_content or image_content in content_key
+        )
+        similarity = (
+            1.0
+            if exact_content
+            else SequenceMatcher(None, content_key, image_content).ratio()
+        )
+        role_missing = not bool(
+            ((application.get("materials") or {}).get(role) or [])
+        )
+        ranked.append((similarity, role_missing, application))
+
+    if not ranked:
+        return None, "没有同时命中施工区域和起止日期的已有案卷"
+
+    exact_matches = [item for item in ranked if item[0] == 1.0]
+    if len(exact_matches) == 1:
+        return exact_matches[0][2], "施工区域、起止日期和施工内容严格命中"
+    if len(exact_matches) > 1:
+        missing_exact = [item for item in exact_matches if item[1]]
+        if len(missing_exact) == 1:
+            return (
+                missing_exact[0][2],
+                "多个案卷字段严格命中，仅该案卷缺少当前材料类型",
+            )
+        return None, f"施工内容严格命中多个已有案卷: {len(exact_matches)}"
+
+    ranked.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+            str(item[2].get("case_name") or ""),
+        ),
+        reverse=True,
+    )
+    best_similarity, best_role_missing, best_application = ranked[0]
+    runner_up_similarity = ranked[1][0] if len(ranked) > 1 else 0.0
+    if (
+        best_similarity >= IMAGE_CONTENT_SIMILARITY_MIN
+        and best_similarity - runner_up_similarity
+        >= IMAGE_CONTENT_SIMILARITY_MARGIN
+    ):
+        missing_note = "，且缺少当前材料类型" if best_role_missing else ""
+        return (
+            best_application,
+            "施工区域和起止日期命中；"
+            f"施工内容相似度 {best_similarity:.0%}，"
+            f"领先次选 {best_similarity - runner_up_similarity:.0%}"
+            f"{missing_note}",
+        )
+    return (
+        None,
+        "施工区域和起止日期命中，但施工内容无法唯一确认："
+        f"最高相似度 {best_similarity:.0%}，"
+        f"次高 {runner_up_similarity:.0%}",
+    )
+
+
 def _work_option_is_checked(text: str, option: str) -> bool:
     normalized = legacy.normalize_match_text(text)
     checked_markers = "☑☒✓✔√■●◆⊠▣▩◉x×"
@@ -742,6 +839,124 @@ def _archive_material_once(
         return False
     _archive_material(application, source, role, root, changes)
     return True
+
+
+def _applications_missing_worker_list(
+    applications: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        application
+        for application in applications
+        if application.get("status") != "terminated"
+        and not (
+            ((application.get("materials") or {}).get(WORKER_LIST_ROLE) or [])
+        )
+    ]
+
+
+def _unique_applications(
+    applications: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for application in applications:
+        key = str(
+            application.get("case_id")
+            or application.get("case_name")
+            or id(application)
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(application)
+    return unique
+
+
+def _archive_identical_worker_list_groups(
+    images: list[Path],
+    applications: list[dict[str, Any]],
+    batch_applications: list[dict[str, Any]],
+    root: Path,
+    changes: list[dict[str, Any]],
+) -> int:
+    """Assign identical worker-list copies one-to-one to a provable case set."""
+    groups: dict[str, list[Path]] = {}
+    for image in images:
+        groups.setdefault(sha256_file(image), []).append(image)
+
+    archived = 0
+    for fingerprint, group in sorted(groups.items()):
+        sources = sorted(group, key=lambda path: path.name)
+        batch_candidates = _applications_missing_worker_list(
+            _unique_applications(batch_applications)
+        )
+        candidates: list[dict[str, Any]] = []
+        evidence = ""
+        if len(batch_candidates) == len(sources):
+            candidates = batch_candidates
+            evidence = "同批 Word 案卷数与相同名单图片数一致"
+        else:
+            modified_dates = {
+                datetime.fromtimestamp(source.stat().st_mtime)
+                .date()
+                .isoformat()
+                for source in sources
+            }
+            if len(modified_dates) == 1:
+                modified_date = next(iter(modified_dates))
+                date_candidates = [
+                    application
+                    for application in _applications_missing_worker_list(
+                        applications
+                    )
+                    if str(
+                        (application.get("application") or {}).get(
+                            "施工开始时间"
+                        )
+                        or ""
+                    )
+                    == modified_date
+                ]
+                if len(date_candidates) == len(sources):
+                    candidates = date_candidates
+                    evidence = (
+                        f"图片修改日期 {modified_date} 对应的缺名单案卷数"
+                        "与图片数一致"
+                    )
+
+        if not candidates:
+            LOGGER.warning(
+                "相同工人名单无法一对一关联案卷，保留在 _inbox: "
+                "SHA-256=%s；图片数=%d；同批缺名单案卷数=%d",
+                fingerprint,
+                len(sources),
+                len(batch_candidates),
+            )
+            continue
+
+        ordered_candidates = sorted(
+            candidates,
+            key=lambda application: str(application.get("case_name") or ""),
+        )
+        LOGGER.info(
+            "相同工人名单按批次一对一入库: SHA-256=%s；图片数=%d；"
+            "案卷数=%d（%s）",
+            fingerprint,
+            len(sources),
+            len(ordered_candidates),
+            evidence,
+        )
+        for source, application in zip(sources, ordered_candidates):
+            if _archive_material_once(
+                application,
+                source,
+                WORKER_LIST_ROLE,
+                root,
+                changes,
+            ):
+                archived += 1
+                _refresh_status(application)
+    return archived
 
 
 def reclassify_historical_materials(
@@ -1043,6 +1258,7 @@ def intake_applications(
     repo_root: Path,
     checkpoint: Callable[[dict[str, Any]], None] | None = None,
     input_batch_id: str = "",
+    intake_stats: dict[str, int] | None = None,
 ) -> int:
     root = root.resolve()
     inbox = root / "_inbox"
@@ -1053,15 +1269,15 @@ def intake_applications(
         for path in inbox.glob("*.docx")
         if path.is_file() and not path.name.startswith("~$")
     )
-    if not word_files:
-        return 0
 
     applications = dataset.setdefault("applications", [])
     changes = dataset.setdefault("changes", [])
     template = root / TEMPLATES_DIR_NAME / TEMPLATE_FILE_NAME
-    if not template.is_file():
-        raise FileNotFoundError(f"缺少安全协议模板: {template}")
-    template_hash = sha256_file(template)
+    template_hash = ""
+    if word_files:
+        if not template.is_file():
+            raise FileNotFoundError(f"缺少安全协议模板: {template}")
+        template_hash = sha256_file(template)
     created: list[dict[str, Any]] = []
     claimed: set[Path] = set()
     batch_files = _input_batch_files(dataset, root, input_batch_id)
@@ -1076,6 +1292,7 @@ def intake_applications(
         else None
     )
     batch_application: dict[str, Any] | None = None
+    batch_applications: list[dict[str, Any]] = []
 
     for source_word in word_files:
         parsed = legacy.parse_document(source_word)
@@ -1109,6 +1326,8 @@ def intake_applications(
                 and source_word.resolve() == single_batch_word
             ):
                 batch_application = duplicate
+            if source_word.resolve() in batch_word_files:
+                batch_applications.append(duplicate)
             duplicate_business = duplicate.get("application") or {}
             LOGGER.warning(
                 "检测到重复质保申请，已跳过写入 JSON: 文件=%s；"
@@ -1207,6 +1426,8 @@ def intake_applications(
             and source_word.resolve() == single_batch_word
         ):
             batch_application = application
+        if source_word.resolve() in batch_word_files:
+            batch_applications.append(application)
 
         direct_candidates = sorted(
             path
@@ -1267,6 +1488,7 @@ def intake_applications(
         and path.suffix.lower() in IMAGE_SUFFIXES
         and path.resolve() not in claimed
     )
+    pending_worker_lists: list[Path] = []
     with RecognitionService(dataset, repo_root) as recognition:
         for image in remaining_images:
             try:
@@ -1283,6 +1505,12 @@ def intake_applications(
                     image.name,
                 )
                 continue
+            if role == WORKER_LIST_ROLE and not (
+                batch_application is not None
+                and image.resolve() in batch_files
+            ):
+                pending_worker_lists.append(image)
+                continue
             if (
                 batch_application is not None
                 and image.resolve() in batch_files
@@ -1294,6 +1522,7 @@ def intake_applications(
                     batch_application.get("case_name") or "",
                 )
             else:
+                normalized_text = legacy.normalize_match_text(text)
                 candidates = [
                     application
                     for application in created
@@ -1305,8 +1534,32 @@ def intake_applications(
                             or ""
                         )
                     )
-                    in text
+                    in normalized_text
                 ]
+                if len(candidates) != 1:
+                    matched_application, match_reason = (
+                        _match_recognized_image_application(
+                            text,
+                            applications,
+                            role,
+                        )
+                    )
+                    candidates = (
+                        [matched_application] if matched_application else []
+                    )
+                    if matched_application is not None:
+                        LOGGER.info(
+                            "按图片识别字段关联申请材料: %s -> %s (%s)",
+                            image.name,
+                            matched_application.get("case_name") or "",
+                            match_reason,
+                        )
+                    else:
+                        LOGGER.warning(
+                            "图片识别字段未能唯一关联案卷: %s (%s)",
+                            image.name,
+                            match_reason,
+                        )
             if len(candidates) != 1:
                 LOGGER.warning(
                     "申请材料图片无法唯一关联案卷，保留在 _inbox: %s",
@@ -1321,6 +1574,17 @@ def intake_applications(
                 changes,
             )
             _refresh_status(candidates[0])
+    worker_lists_archived = _archive_identical_worker_list_groups(
+        pending_worker_lists,
+        applications,
+        batch_applications,
+        root,
+        changes,
+    )
+    if worker_lists_archived and checkpoint:
+        checkpoint(dataset)
+    if intake_stats is not None:
+        intake_stats["worker_lists_ingested"] = worker_lists_archived
     return len(created)
 
 

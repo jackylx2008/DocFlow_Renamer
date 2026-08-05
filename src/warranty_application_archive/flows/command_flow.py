@@ -8,27 +8,28 @@ import uuid
 from pathlib import Path
 from typing import Sequence
 
-from . import legacy
-from .approval_review import (
+from logging_config import setup_logger
+
+from .approval_review_flow import (
     ApprovalReviewRepository,
     apply_review_decisions,
     build_approval_review,
     import_json_decisions,
 )
-from .approval_review_web import (
+from .approval_review_web_flow import (
     export_approval_review_html,
     serve_approval_review,
 )
-from .config import AppConfig
-from .migration import (
+from ..config_loader import AppConfig
+from .migration_flow import (
     apply_migration_plan,
     build_migration_plan,
     verify_backup,
 )
-from .repository import JsonRepository
-from .summary_html import export_summary_html
-from .validation import validate_dataset, validate_summary_html
-from .workflows import (
+from ..modules.repository import JsonRepository
+from ..modules.summary_html import export_summary_html
+from ..modules.validation import validate_dataset, validate_summary_html
+from .archive_flow import (
     append_run,
     deduplicate_applications,
     intake_applications,
@@ -53,7 +54,7 @@ def _repo_root() -> Path:
     current_directory = Path.cwd().resolve()
     if (current_directory / "common.env").is_file():
         return current_directory
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -202,11 +203,11 @@ def _log_workflow_summary(
 
 def main(argv: Sequence[str] | None = None) -> int:
     repo_root = _repo_root()
-    legacy.setup_logging(repo_root)
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     command = args.command or "run"
     config = AppConfig.resolve(repo_root, args.input_dir)
+    setup_logger(log_level=config.log_level, log_dir=config.log_dir)
     if not config.data_root.is_dir():
         raise NotADirectoryError(f"资料根目录不存在: {config.data_root}")
     repository = JsonRepository(config.data_root)
@@ -215,7 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "migrate":
         plan = build_migration_plan(config.data_root)
         plan_output = args.plan_output or (
-            repo_root / "output" / "migration_plan.json"
+            config.output_dir / "migration_plan.json"
         )
         _write_json(plan_output, plan.to_dict())
         LOGGER.info(
@@ -474,6 +475,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         approval_count = 0
         worker_list_count = 0
         application_count = 0
+        intake_stats: dict[str, int] = {}
         duplicate_application_count = deduplicate_applications(
             data,
             config.data_root,
@@ -494,6 +496,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repo_root,
                 checkpoint=repository.save,
                 input_batch_id=input_batch_id,
+                intake_stats=intake_stats,
+            )
+            worker_list_count += intake_stats.get(
+                "worker_lists_ingested", 0
             )
         if command in {"approval-pdfs", "run"}:
             approval_count = ingest_approval_pdfs(
@@ -503,7 +509,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 checkpoint=repository.save,
             )
         if command in {"worker-lists", "run"}:
-            worker_list_count = ingest_worker_lists(data, config.data_root)
+            worker_list_count += ingest_worker_lists(data, config.data_root)
         changed = (
             application_count
             + approval_count

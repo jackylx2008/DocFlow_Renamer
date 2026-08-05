@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
-from .approval_review import (
+from .approval_review_flow import (
     ApprovalReviewRepository,
     DECISION_OPTIONS,
     _archive_legacy_artifact,
@@ -25,7 +25,7 @@ from .approval_review import (
     build_approval_review,
     import_json_decisions,
 )
-from .constants import (
+from ..modules.constants import (
     APPROVAL_REVIEW_HTML_FILE_NAME,
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
     APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
@@ -34,11 +34,11 @@ from .constants import (
     SUMMARY_HTML_FILE_NAME,
     TRASH_DIR_NAME,
 )
-from .file_utils import atomic_replace_text, ensure_within
-from .launchers import write_page_launchers
-from .repository import JsonRepository
-from .summary_html import export_summary_html
-from .workflows import append_run
+from ..modules.file_utils import atomic_replace_text, ensure_within
+from ..modules.launchers import write_page_launchers
+from ..modules.repository import JsonRepository
+from ..modules.summary_html import export_summary_html
+from .archive_flow import append_run
 
 
 LOGGER = logging.getLogger(__name__)
@@ -256,8 +256,8 @@ def export_approval_review_html(
     output = root / APPROVAL_REVIEW_HTML_FILE_NAME
     atomic_replace_text(output, html)
     entry_point = (
-        Path(__file__).resolve().parents[2]
-        / "warranty_application_archive.py"
+        Path(__file__).resolve().parents[3]
+        / "serve_archive_review.py"
     )
     write_page_launchers(
         root,
@@ -267,11 +267,10 @@ def export_approval_review_html(
             str(entry_point),
             "--input-dir",
             str(root),
-            "approval-review-server",
             "--port",
             "0",
         ],
-        ["approval-review-server", "--port", "0"],
+        ["--port", "0"],
         windows_name=APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
         macos_name=APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
     )
@@ -358,7 +357,7 @@ def serve_approval_review(
 ) -> None:
     root = root.resolve()
     review_repository = ApprovalReviewRepository(root)
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     lock = threading.Lock()
 
     class ReviewHandler(BaseHTTPRequestHandler):

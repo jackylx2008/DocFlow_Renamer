@@ -49,7 +49,7 @@ def write_page_launchers(
                 '  SEARCH_ROOT="$SCRIPT_DIR"',
                 '  while [[ "$SEARCH_ROOT" != "/" ]]; do',
                 '    CANDIDATE="$SEARCH_ROOT/Python/Project/DocFlow_Renamer"',
-                '    if [[ -f "$CANDIDATE/warranty_application_archive.py" ]]; then',
+                '    if [[ -f "$CANDIDATE/serve_archive_review.py" ]]; then',
                 '      PROJECT_ROOT="$CANDIDATE"',
                 "      break",
                 "    fi",
@@ -61,13 +61,13 @@ def write_page_launchers(
                 '    "$HOME/Clooustation/Python/Project/DocFlow_Renamer" \\',
                 '    "$HOME/CloudStation/Python/Project/DocFlow_Renamer" \\',
                 '    "$HOME/Cloudstation/Python/Project/DocFlow_Renamer"; do',
-                '    if [[ -f "$CANDIDATE/warranty_application_archive.py" ]]; then',
+                '    if [[ -f "$CANDIDATE/serve_archive_review.py" ]]; then',
                 '      PROJECT_ROOT="$CANDIDATE"',
                 "      break",
                 "    fi",
                 "  done",
                 "fi",
-                'if [[ ! -f "$PROJECT_ROOT/warranty_application_archive.py" ]]; then',
+                'if [[ ! -f "$PROJECT_ROOT/serve_archive_review.py" ]]; then',
                 '  echo "未找到 DocFlow_Renamer 项目目录。"',
                 '  echo "可设置 DOCFLOW_PROJECT_ROOT 后重新运行。"',
                 "  exit 1",
@@ -93,7 +93,7 @@ def write_page_launchers(
                 'cd "$PROJECT_ROOT"',
                 (
                     'exec "$PYTHON_BIN" '
-                    '"$PROJECT_ROOT/warranty_application_archive.py" '
+                    '"$PROJECT_ROOT/serve_archive_review.py" '
                     '--input-dir "$SCRIPT_DIR" '
                     f"{macos_arguments}"
                 ),

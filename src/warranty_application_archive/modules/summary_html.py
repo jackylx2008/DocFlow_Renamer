@@ -434,8 +434,8 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
     output = root / SUMMARY_HTML_FILE_NAME
     atomic_replace_text(output, content)
     entry_point = (
-        Path(__file__).resolve().parents[2]
-        / "warranty_application_archive.py"
+        Path(__file__).resolve().parents[3]
+        / "serve_archive_review.py"
     )
     write_page_launchers(
         root,
@@ -445,14 +445,12 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
             str(entry_point),
             "--input-dir",
             str(root),
-            "approval-review-server",
             "--page",
             "summary",
             "--port",
             "0",
         ],
         [
-            "approval-review-server",
             "--page",
             "summary",
             "--port",

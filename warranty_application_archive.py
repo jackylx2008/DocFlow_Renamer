@@ -1,4 +1,4 @@
-"""质保作业申请案卷归档工具的统一命令行入口。
+"""质保作业申请案卷归档工具的兼容入口。
 
 项目功能
 --------
@@ -17,7 +17,9 @@ AI/OCR 识别、统一命名、重复申请合并、材料完整性判断、审�
 
     python warranty_application_archive.py --input-dir "资料目录" run
 
-常用子命令包括 ``applications``（申请材料入库）、``worker-lists``（人员
+该入口保留旧版子命令兼容。新调用应使用根目录下的独立入口脚本，例如
+``run_archive.py``、``migrate_archive.py`` 和 ``serve_archive_review.py``。
+旧版常用子命令包括 ``applications``（申请材料入库）、``worker-lists``（人员
 名单入库）、``approval-pdfs``（审批 PDF 归档）、``approval-review``
 （生成人工审核数据和页面）、``apply-approval-review``（执行审核结果）、
 ``export``（重新生成汇总 HTML）、``status``（查看状态）和 ``validate``
@@ -40,7 +42,7 @@ AI/OCR 识别、统一命名、重复申请合并、材料完整性判断、审�
     可恢复的重复文件及较少资料的重复案卷隔离区。
 """
 
-from src.warranty_application_archive.cli import main
+from entry_bootstrap import run_command as main
 
 
 if __name__ == "__main__":

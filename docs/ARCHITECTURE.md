@@ -2,8 +2,8 @@
 
 ## Boundaries
 
-The application has one orchestration entry point and three business
-subworkflows:
+The application uses independent root entry scripts, a `flows/` orchestration
+layer, and reusable capabilities under `modules/`. The main business flows are:
 
 1. Application-material intake.
 2. Worker-list intake.
@@ -59,9 +59,22 @@ Legacy migration is intentionally plan-first:
 Incremental workflows also record their file operations. Duplicate evidence is
 moved to quarantine rather than deleted.
 
+## Package layout
+
+- `src/warranty_application_archive/modules/`: parsing, naming, storage,
+  recognition, rendering, validation, and filesystem adapters.
+- `src/warranty_application_archive/flows/`: archive intake, migration,
+  approval review, and local review-page orchestration.
+- root `*.py` files: one explicit entry per operator workflow.
+- `logging_config.py`: the only logging-handler configuration point; rolling
+  log files are written to `logs/`.
+- `config_loader.py` and `context.py`: centralized configuration, path
+  expansion, and shared entry/flow context.
+
 ## Compatibility layer
 
-`legacy.py` temporarily supplies the mature Word parser, llama.cpp client and
-PDF matching primitives. New entry points and workflows do not live there.
-Future refactoring can move these components into focused modules without
-changing the JSON schema or CLI contract.
+`modules/legacy.py` temporarily supplies the mature Word parser, llama.cpp
+client and PDF matching primitives. `warranty_application_archive.py` keeps
+the former subcommand interface only for transition; documented operation uses
+the independent root entry scripts. Future refactoring can split the legacy
+module further without changing the JSON schema.

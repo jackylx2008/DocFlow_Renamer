@@ -276,7 +276,7 @@ class LlamaCppClient:
         if mmproj_path:
             command[3:3] = ["--mmproj", str(mmproj_path)]
 
-        log_dir = self.repo_root / "log"
+        log_dir = resolve_log_dir(self.repo_root)
         log_dir.mkdir(parents=True, exist_ok=True)
         stdout_handle = (log_dir / "llama_server.out.log").open("a", encoding="utf-8")
         stderr_handle = (log_dir / "llama_server.err.log").open("a", encoding="utf-8")
@@ -433,6 +433,12 @@ def normalize_match_text(value: str) -> str:
         .replace("，", ",")
         .replace("、", ",")
     )
+
+
+def normalize_pdf_ocr_match_text(value: str) -> str:
+    """Normalize a narrow OCR confusion used in location codes."""
+    normalized = normalize_match_text(value)
+    return re.sub(r"(?<![a-z])i(?=\d)", "l", normalized)
 
 
 def count_cjk_chars(value: str) -> int:
@@ -1100,6 +1106,42 @@ def pdf_construction_dates_match(
     return expected_start in pdf_dates and expected_end in pdf_dates
 
 
+def extract_pdf_field_value(
+    pdf_text: str,
+    label: str,
+    end_labels: tuple[str, ...],
+) -> str:
+    """Return one normalized labeled field from recognized PDF text."""
+    normalized = normalize_match_text(pdf_text)
+    normalized_label = normalize_match_text(label)
+    start_index = normalized.find(normalized_label)
+    if start_index < 0:
+        return ""
+    value_start = start_index + len(normalized_label)
+    value_end = len(normalized)
+    for end_label in end_labels:
+        normalized_end = normalize_match_text(end_label)
+        index = normalized.find(normalized_end, value_start)
+        if index >= 0:
+            value_end = min(value_end, index)
+    return normalized[value_start:value_end].strip("~:：-—")
+
+
+def extract_pdf_construction_content(pdf_text: str) -> str:
+    return extract_pdf_field_value(
+        pdf_text,
+        "施工内容",
+        (
+            "施工负责人",
+            "影响改动消防",
+            "影响堵塞",
+            "危险作业",
+            "附件",
+            "审批记录",
+        ),
+    )
+
+
 def find_matching_pdf_paths(
     construction_area: str,
     work_content: str,
@@ -1107,21 +1149,16 @@ def find_matching_pdf_paths(
     construction_start_date: str = "",
     construction_end_date: str = "",
 ) -> list[Path]:
-    area_key = normalize_match_text(construction_area)
+    area_key = normalize_pdf_ocr_match_text(construction_area)
     content_key = normalize_match_text(work_content)
     if not area_key or not content_key:
         return []
 
-    content_keys = [content_key]
-    if content_key.startswith(area_key):
-        short_content_key = content_key[len(area_key) :]
-        if short_content_key:
-            content_keys.append(short_content_key)
-
     matched_paths = [
         pdf_path
         for pdf_path, pdf_text in pdf_texts.items()
-        if area_key in pdf_text and any(key in pdf_text for key in content_keys)
+        if area_key in normalize_pdf_ocr_match_text(pdf_text)
+        and content_key in extract_pdf_construction_content(pdf_text)
         and pdf_construction_dates_match(
             pdf_text, construction_start_date, construction_end_date
         )
@@ -1983,15 +2020,9 @@ def process_documents(
 
 
 def resolve_input_dir(repo_root: Path) -> Path:
-    env_values = load_env_file(repo_root / "common.env")
-    yaml_config = load_yaml_config(repo_root / "config.yaml")
-    raw_input = env_values.get("INPUT_PATH") or resolve_setting(
-        yaml_config.get("input_path"), env_values, "input"
-    )
-    input_dir = Path(raw_input)
-    if not input_dir.is_absolute():
-        input_dir = repo_root / input_dir
-    return input_dir
+    from ..config_loader import AppConfig
+
+    return AppConfig.resolve(repo_root).data_root
 
 
 def resolve_skipped_pdf_names(repo_root: Path) -> set[str]:
@@ -2000,38 +2031,26 @@ def resolve_skipped_pdf_names(repo_root: Path) -> set[str]:
 
 
 def resolve_log_dir(repo_root: Path) -> Path:
-    env_values = load_env_file(repo_root / "common.env")
-    yaml_config = load_yaml_config(repo_root / "config.yaml")
-    raw_log_dir = env_values.get("LOG_DIR") or resolve_setting(
-        yaml_config.get("log_dir"), env_values, "log"
-    )
-    log_dir = Path(raw_log_dir)
-    if not log_dir.is_absolute():
-        log_dir = repo_root / log_dir
-    return log_dir
+    from ..config_loader import AppConfig
+
+    return AppConfig.resolve(repo_root).log_dir
 
 
 def setup_logging(repo_root: Path, script_name: str | None = None) -> Path:
-    log_dir = resolve_log_dir(repo_root)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_stem = script_name or Path(sys.argv[0]).stem or Path(__file__).stem
-    log_stem = re.sub(r'[\\/:*?"<>|]+', "_", log_stem)
-    log_path = log_dir / f"{log_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    log_handle = log_path.open("a", encoding="utf-8")
-    sys.stdout = TeeStream(sys.stdout, log_handle)  # type: ignore[assignment]
-    sys.stderr = TeeStream(sys.stderr, log_handle)  # type: ignore[assignment]
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-        force=True,
+    from logging_config import setup_logger
+
+    from ..config_loader import AppConfig
+
+    config = AppConfig.resolve(repo_root)
+    return setup_logger(
+        log_level=config.log_level,
+        log_dir=config.log_dir,
+        entry_name=script_name,
     )
-    return log_path
 
 
 def main() -> int:
-    repo_root = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[3]
     log_path = setup_logging(repo_root)
     parser = argparse.ArgumentParser(
         description="重命名质保作业申请单并导出 Excel 汇总"

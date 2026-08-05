@@ -8,8 +8,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from . import legacy
-from .constants import (
+from ..modules import legacy
+from ..modules.constants import (
     APPROVAL_PDF_ROLE,
     APPROVAL_REVIEW_DATA_FILE_NAME,
     APPROVAL_REVIEW_SCHEMA_VERSION,
@@ -19,14 +19,14 @@ from .constants import (
     LEGACY_DIR_NAME,
     TRASH_DIR_NAME,
 )
-from .file_utils import atomic_replace_text, ensure_within, sha256_file
-from .migration import CASE_NAMESPACE
-from .recognition import RecognitionService
-from .workflows import archive_reviewed_approval_pdf
+from ..modules.file_utils import atomic_replace_text, ensure_within, sha256_file
+from .migration_flow import CASE_NAMESPACE
+from ..modules.recognition import RecognitionService
+from .archive_flow import archive_reviewed_approval_pdf
 
 
 DECISION_OPTIONS = ("待审核", "确认匹配", "排除", "移至_trash")
-MATCH_RULE_VERSION = "strict-non-date-relaxed-date-v1"
+MATCH_RULE_VERSION = "area-strict-content-contains-relaxed-date-v2"
 NON_DATE_CONFIDENCE = 80
 CASE_STATUS_LABELS = {
     "materials_incomplete": "材料待补充",
@@ -193,24 +193,20 @@ def _date_delta(first: str, second: str) -> int | None:
         return None
 
 
-def _strict_non_date_match(
+def _required_non_date_match(
     pdf_text: str,
+    pdf_values: dict[str, str],
     case_values: dict[str, str],
 ) -> tuple[bool, bool]:
-    normalized_pdf = legacy.normalize_match_text(pdf_text)
-    area_key = legacy.normalize_match_text(case_values["area"])
+    normalized_pdf = legacy.normalize_pdf_ocr_match_text(pdf_text)
+    pdf_content = legacy.normalize_match_text(pdf_values["content"])
+    area_key = legacy.normalize_pdf_ocr_match_text(case_values["area"])
     content_key = legacy.normalize_match_text(case_values["content"])
     if not area_key or not content_key:
         return False, False
-
-    content_keys = [content_key]
-    if content_key.startswith(area_key):
-        shortened = content_key[len(area_key) :]
-        if shortened:
-            content_keys.append(shortened)
     return (
         area_key in normalized_pdf,
-        any(key in normalized_pdf for key in content_keys),
+        content_key in pdf_content,
     )
 
 
@@ -242,7 +238,12 @@ def _candidate_confidence(
         + _date_points(start_delta, 12)
         + _date_points(end_delta, 8)
     )
-    evidence.extend(["施工内容严格命中", "施工区域严格命中"])
+    evidence.extend(
+        [
+            "审批PDF施工内容包含申请施工内容",
+            "施工区域严格命中（已归一化常见OCR字符）",
+        ]
+    )
     if start_delta is None:
         evidence.append("开始日期缺失，不参与淘汰")
     else:
@@ -385,8 +386,9 @@ def build_approval_review(
             strict_matches = 0
             for application in applications:
                 case_values = _case_values(application)
-                area_match, content_match = _strict_non_date_match(
+                area_match, content_match = _required_non_date_match(
                     text,
+                    values,
                     case_values,
                 )
                 any_area_match = any_area_match or area_match
@@ -419,7 +421,7 @@ def build_approval_review(
                 elif not applications:
                     reason = "没有可匹配的未审批案卷"
                 elif not any_content_match:
-                    reason = "施工内容没有严格文本命中"
+                    reason = "审批PDF施工内容未包含申请施工内容"
                 elif not any_area_match:
                     reason = "施工区域没有严格文本命中"
                 else:

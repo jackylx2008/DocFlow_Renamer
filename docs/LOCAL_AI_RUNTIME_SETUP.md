@@ -15,8 +15,8 @@
 
 代码结构遵循 `COMMON_PROJECT_SKILLS.md`：
 
-- `src/localai/modules/`：基础能力模块
-- `src/localai/flows/`：场景编排层
+- `src/warranty_application_archive/modules/`：基础能力模块
+- `src/warranty_application_archive/flows/`：场景编排层
 - 项目根目录 `.py` 文件：独立入口脚本
 
 ## 1. CUDA 基础检查
@@ -308,14 +308,14 @@ Invoke-RestMethod `
 项目日志：
 
 ```text
-log/<entry_name>.log
+logs/<entry_name>.log
 ```
 
 `llama-server` 输出：
 
 ```text
-log/llama_server.out.log
-log/llama_server.err.log
+logs/llama_server.out.log
+logs/llama_server.err.log
 ```
 
 常见问题：
@@ -366,7 +366,7 @@ finally:
 
 1. 调用 `bootstrap_context(__file__)`
 2. 初始化配置、日志和上下文
-3. 调用 `src/localai/flows/` 中对应的 `run(...)`
+3. 调用 `src/warranty_application_archive/flows/` 中对应的 `run(...)`
 4. 用 `print_json(...)` 输出结构化结果
 
 需要调用本地模型时，优先在 `flows` 中组合：
