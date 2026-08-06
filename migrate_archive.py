@@ -9,9 +9,17 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from entry_bootstrap import run_command
+
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from warranty_application_archive.flows.application_flow import (  # noqa: E402
+    migrate_archive,
+)
 
 
 def main() -> int:
@@ -24,17 +32,14 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="执行迁移")
     parser.add_argument("--backup-dir", type=Path, help="迁移前核对的备份目录")
     args = parser.parse_args()
-    forwarded: list[str] = []
-    if args.input_dir:
-        forwarded.extend(["--input-dir", str(args.input_dir)])
-    forwarded.append("migrate")
-    if args.plan_output:
-        forwarded.extend(["--plan-output", str(args.plan_output)])
-    if args.apply:
-        forwarded.append("--apply")
-    if args.backup_dir:
-        forwarded.extend(["--backup-dir", str(args.backup_dir)])
-    return run_command(forwarded)
+    if args.apply and not args.backup_dir:
+        parser.error("执行迁移必须提供 --backup-dir")
+    return migrate_archive(
+        input_dir=args.input_dir,
+        plan_output=args.plan_output,
+        apply=args.apply,
+        backup_dir=args.backup_dir,
+    )
 
 
 if __name__ == "__main__":

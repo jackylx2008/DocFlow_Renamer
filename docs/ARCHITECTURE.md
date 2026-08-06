@@ -65,7 +65,8 @@ moved to quarantine rather than deleted.
   recognition, rendering, validation, and filesystem adapters.
 - `src/warranty_application_archive/flows/`: archive intake, migration,
   approval review, and local review-page orchestration.
-- root `*.py` files: one explicit entry per operator workflow.
+- root `run_archive.py`, `migrate_archive.py`, and
+  `serve_archive_review.py`: the only operator-facing Python entries.
 - `logging_config.py`: the only logging-handler configuration point; rolling
   log files are written to `logs/`.
 - `config_loader.py` and `context.py`: centralized configuration, path
@@ -74,7 +75,7 @@ moved to quarantine rather than deleted.
 ## Compatibility layer
 
 `modules/legacy.py` temporarily supplies the mature Word parser, llama.cpp
-client and PDF matching primitives. `warranty_application_archive.py` keeps
-the former subcommand interface only for transition; documented operation uses
-the independent root entry scripts. Future refactoring can split the legacy
-module further without changing the JSON schema.
+client and PDF matching primitives. The former unified subcommand entry has
+been removed; internal operations remain in `flows/` and are reached only
+through the three documented root interfaces. Future refactoring can split the
+legacy module further without changing the JSON schema.

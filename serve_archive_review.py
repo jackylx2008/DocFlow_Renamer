@@ -9,9 +9,17 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from entry_bootstrap import run_command
+
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from warranty_application_archive.flows.application_flow import (  # noqa: E402
+    serve_archive_pages,
+)
 
 
 def main() -> int:
@@ -30,23 +38,13 @@ def main() -> int:
     )
     parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     args = parser.parse_args()
-    forwarded: list[str] = []
-    if args.input_dir:
-        forwarded.extend(["--input-dir", str(args.input_dir)])
-    forwarded.extend(
-        [
-            "approval-review-server",
-            "--host",
-            args.host,
-            "--port",
-            str(args.port),
-            "--page",
-            args.page,
-        ]
+    return serve_archive_pages(
+        input_dir=args.input_dir,
+        host=args.host,
+        port=args.port,
+        page=args.page,
+        open_browser=not args.no_open,
     )
-    if args.no_open:
-        forwarded.append("--no-open")
-    return run_command(forwarded)
 
 
 if __name__ == "__main__":

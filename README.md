@@ -135,7 +135,7 @@ INPUT_PATH=${CLOUDSTATION_ROOT}/sample/project/input
 也可以使用 `--input-dir` 指定：
 
 ```powershell
-python archive_status.py --input-dir "sample/project/input"
+python run_archive.py --input-dir "sample/project/input"
 ```
 
 ## 旧目录迁移
@@ -170,30 +170,11 @@ python run_archive.py
 `.jpg`、`.jpeg`、`.png` 和 `.pdf`。PDF 分类结果保存在正式 JSON 的
 `input_routes` 中，识别文本按 SHA-256 缓存。
 
-单独执行支流程：
-
-```powershell
-python archive_applications.py
-python archive_worker_lists.py
-python archive_approval_pdfs.py
-```
-
-`approval-pdfs` 会自动刷新未匹配 PDF 的独立审核 JSON/HTML。也可以单独重新生成：
-
-```powershell
-python build_approval_review.py
-```
-
-升级分类规则后，可使用已有 OCR 缓存重新判断全部既往专项材料，并同步
-更新正式 JSON、案卷状态、汇总 HTML 和人工审核页面：
-
-```powershell
-python reclassify_materials.py
-```
-
-该命令不会重复调用本地 AI。发生重新分类时会更新文件归类；旧记录指向的
-文件已经不存在时，会清理失效引用。所有处理均写入正式 JSON 的 `changes`
-和 `runs`，终端同时显示带时间戳的中文处理日志。
+申请材料、施工人员名单、审批 PDF、人工审核数据和汇总 HTML 均由这个入口
+按顺序处理。各支流程属于内部业务编排，统一位于
+`src/warranty_application_archive/flows/`，不再为每个内部步骤在项目根目录
+增加启动脚本。所有处理均写入正式 JSON 的 `changes` 和 `runs`，终端同时
+显示带时间戳的中文处理日志。
 
 Windows 双击 `打开待人工审核匹配PDF.cmd`，macOS 双击
 `打开待人工审核匹配PDF.command` 启动审核。程序会自动在浏览器中打开
@@ -210,35 +191,9 @@ HTML 页面；“保存并执行审核结果”固定更新同目录的
 python serve_archive_review.py
 ```
 
-正常使用网页时不再需要第二步应用命令。下面的命令只用于兼容处理旧版页面
-已经保存、但尚未执行的审核决定：
-
-```powershell
-python apply_approval_review.py
-```
-
-如果正式 JSON 在审核页面生成后发生过版本变化，页面保存和应用命令都会
-拒绝过期结果，须先重新生成审核文件。
-
-仅从 JSON 重新生成汇总 HTML：
-
-```powershell
-python export_archive.py
-```
-
-查看状态及进行完整校验：
-
-```powershell
-python archive_status.py
-python validate_archive.py
-```
-
-`validate` 会检查：
-
-- 案卷 ID 和文件 ID 是否重复。
-- JSON 中的目录和文件是否存在。
-- 文件大小和 SHA-256 是否一致。
-- HTML 页签结构、汇总行数和本地链接是否与 JSON 一致。
+正常使用网页时不需要第二个根目录命令；审核结果保存、正式 JSON 回写和页面
+刷新由 `serve_archive_review.py` 对应的服务流程完成。如果正式 JSON 在审核
+页面生成后发生过版本变化，页面会拒绝过期结果，须先重新执行完整归档流程。
 
 ## HTML 人工审查视图
 
@@ -329,9 +284,9 @@ python migrate_archive.py
 python serve_archive_review.py
 ```
 
-每个入口文件头部均说明用途、配置、参数和输出。公共能力位于 `modules/`，
-完整步骤编排位于 `flows/`。旧 `warranty_application_archive.py` 仅作为过渡
-兼容入口，不再作为 README 推荐用法。
+根目录只保留以上三个实际操作入口。每个入口文件头部均说明用途、配置、
+参数和输出；公共能力位于 `modules/`，所有业务步骤和完整流程编排均位于
+`flows/`。不再保留统一子命令兼容入口，也不为内部支流程创建根目录脚本。
 
 最常用的完整增量处理命令是：
 
@@ -367,6 +322,7 @@ src/warranty_application_archive/
 │  ├─ summary_html.py              # JSON → 正式汇总 HTML
 │  └─ validation.py                # 数据和成果校验
 └─ flows/                          # 场景编排
+   ├─ application_flow.py          # 完整归档、迁移和页面服务入口编排
    ├─ archive_flow.py              # 申报、名单及审批 PDF 入库
    ├─ migration_flow.py            # 旧目录迁移计划与执行
    ├─ approval_review_flow.py      # 审批候选、决定与回写
@@ -376,7 +332,7 @@ src/warranty_application_archive/
 ## 开发验证
 
 ```powershell
-python -m compileall -q src tests entry_bootstrap.py logging_config.py run_archive.py migrate_archive.py serve_archive_review.py archive_applications.py archive_approval_pdfs.py archive_worker_lists.py archive_status.py validate_archive.py export_archive.py build_approval_review.py apply_approval_review.py reclassify_materials.py warranty_application_archive.py
+python -m compileall -q src tests logging_config.py run_archive.py migrate_archive.py serve_archive_review.py
 python -m pytest -q
-python -m flake8 entry_bootstrap.py logging_config.py run_archive.py migrate_archive.py serve_archive_review.py archive_applications.py archive_approval_pdfs.py archive_worker_lists.py archive_status.py validate_archive.py export_archive.py build_approval_review.py apply_approval_review.py reclassify_materials.py warranty_application_archive.py src tests
+python -m flake8 logging_config.py run_archive.py migrate_archive.py serve_archive_review.py src tests
 ```
