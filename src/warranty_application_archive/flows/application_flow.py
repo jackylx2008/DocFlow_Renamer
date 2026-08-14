@@ -187,7 +187,11 @@ def run_archive(input_dir: Path | None = None) -> int:
         repo_root,
         checkpoint=repository.save,
     )
-    worker_list_count += ingest_worker_lists(data, config.data_root)
+    worker_list_count += ingest_worker_lists(
+        data,
+        config.data_root,
+        input_batch_id=input_batch_id,
+    )
     changed = (
         application_count
         + approval_count

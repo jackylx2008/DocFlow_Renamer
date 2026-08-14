@@ -53,6 +53,7 @@ from warranty_application_archive.modules.summary_html import (
 )
 from warranty_application_archive.modules.validation import validate_summary_html
 from warranty_application_archive.flows.archive_flow import (
+    _archive_named_worker_list_batch,
     _classify_recognized_image,
     _find_duplicate_application,
     _work_option_is_checked,
@@ -652,10 +653,12 @@ class MigrationTest(unittest.TestCase):
             material_pdf = input_root / f"{stem}_有限空间申请.pdf"
             image = input_root / f"{stem}_补充图片.jpg"
             word = input_root / "新增质保申请.docx"
+            worker_image = input_root / "工人名单.jpg"
             approval_pdf.write_bytes(b"approval")
             material_pdf.write_bytes(b"confined space")
             image.write_bytes(b"image")
             word.write_bytes(b"word")
+            worker_image.write_bytes(b"workers")
 
             def recognized_text(path: Path) -> str:
                 if path.name == approval_pdf.name:
@@ -683,14 +686,17 @@ class MigrationTest(unittest.TestCase):
                     Path(__file__).resolve().parents[1],
                 )
 
-            self.assertEqual(summary["input_files_routed"], 4)
+            self.assertEqual(summary["input_files_routed"], 5)
             self.assertEqual(summary["approval_pdfs_routed"], 1)
-            self.assertEqual(summary["application_files_routed"], 3)
+            self.assertEqual(summary["application_files_routed"], 4)
             self.assertEqual(approval_count, 1)
             self.assertFalse(any(input_root.iterdir()))
             self.assertTrue((primary / "_inbox" / material_pdf.name).is_file())
             self.assertTrue((primary / "_inbox" / image.name).is_file())
             self.assertTrue((primary / "_inbox" / word.name).is_file())
+            self.assertTrue(
+                (primary / "_inbox" / worker_image.name).is_file()
+            )
             self.assertFalse(
                 any(
                     item.get("path", "").endswith(material_pdf.name)
@@ -1003,7 +1009,7 @@ class MigrationTest(unittest.TestCase):
                 )
             )
 
-    def test_one_input_batch_adds_random_named_images_to_duplicate_case(
+    def test_one_input_batch_adds_named_worker_image_to_duplicate_case(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -1016,7 +1022,7 @@ class MigrationTest(unittest.TestCase):
             inbox.mkdir(exist_ok=True)
             incoming_word = input_dir / "重复申请.docx"
             signed_image = input_dir / "random-signed.png"
-            worker_image = input_dir / "random-workers.jpg"
+            worker_image = input_dir / "工人名单.jpg"
             incoming_word.write_bytes(b"duplicate word")
             signed_image.write_bytes(b"new signed application")
             worker_image.write_bytes(b"new worker list")
@@ -1085,7 +1091,7 @@ class MigrationTest(unittest.TestCase):
             )
             self.assertEqual(
                 worker_route["processing_path"],
-                "_inbox/random-workers.jpg",
+                "_inbox/工人名单.jpg",
             )
 
     def test_identical_worker_lists_are_distributed_one_per_existing_case(
@@ -1203,6 +1209,113 @@ class MigrationTest(unittest.TestCase):
                     for application in applications
                 )
             )
+
+    def test_filename_marked_worker_lists_are_assigned_one_to_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            inbox = root / "_inbox"
+            inbox.mkdir()
+            applications = []
+            words = set()
+            images = []
+            for index in range(4):
+                case_name = f"2026-08-15_任务{index + 1}_质保作业申请单"
+                case_dir = root / "_cases" / case_name
+                case_dir.mkdir(parents=True)
+                applications.append(
+                    {
+                        "case_id": f"case-{index}",
+                        "case_name": case_name,
+                        "case_directory": f"_cases/{case_name}",
+                        "status": "materials_incomplete",
+                        "required_material_types": [WORKER_LIST_ROLE],
+                        "materials": {WORKER_LIST_ROLE: []},
+                        "approval": {"pdfs": []},
+                    }
+                )
+                word = inbox / f"质保单-{index + 1}.docx"
+                word.write_bytes(f"word-{index}".encode())
+                words.add(word.resolve())
+                image = inbox / f"工人名单 - 副本 ({index + 1}).jpg"
+                image.write_bytes(b"same worker list")
+                images.append(image)
+
+            archived = _archive_named_worker_list_batch(
+                images,
+                words,
+                applications,
+                root,
+                [],
+            )
+
+            self.assertEqual(archived, 4)
+            self.assertTrue(all(not image.exists() for image in images))
+            self.assertTrue(
+                all(
+                    len(application["materials"][WORKER_LIST_ROLE]) == 1
+                    for application in applications
+                )
+            )
+
+    def test_filename_marked_worker_lists_raise_on_count_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            inbox = root / "_inbox"
+            inbox.mkdir()
+            application = {
+                "case_id": "case-1",
+                "case_name": "2026-08-15_任务1_质保作业申请单",
+                "case_directory": "_cases/2026-08-15_任务1_质保作业申请单",
+                "status": "materials_incomplete",
+                "required_material_types": [WORKER_LIST_ROLE],
+                "materials": {WORKER_LIST_ROLE: []},
+                "approval": {"pdfs": []},
+            }
+            words = {
+                (inbox / "质保单-1.docx").resolve(),
+                (inbox / "质保单-2.docx").resolve(),
+            }
+            images = [inbox / "工人名单.jpg"]
+            images[0].write_bytes(b"workers")
+
+            with self.assertRaisesRegex(ValueError, "停止文件保存和 JSON 入库"):
+                _archive_named_worker_list_batch(
+                    images,
+                    words,
+                    [application],
+                    root,
+                    [],
+                )
+
+            self.assertTrue(images[0].is_file())
+            self.assertEqual(application["materials"][WORKER_LIST_ROLE], [])
+
+    def test_input_count_mismatch_stops_before_routing_or_json_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            input_dir = root / "_input"
+            input_dir.mkdir()
+            (input_dir / "质保单-1.docx").write_bytes(b"word-1")
+            (input_dir / "质保单-2.docx").write_bytes(b"word-2")
+            (input_dir / "工人名单.jpg").write_bytes(b"workers")
+            dataset = {"applications": [], "changes": [], "input_routes": []}
+            before = deepcopy(dataset)
+
+            with self.assertRaisesRegex(ValueError, "工人名单=1；质保单=2"):
+                route_input_files(
+                    dataset,
+                    root,
+                    Path(__file__).resolve().parents[1],
+                    input_batch_id="mismatch-batch",
+                )
+
+            self.assertEqual(dataset, before)
+            self.assertEqual(len(list(input_dir.iterdir())), 3)
+            self.assertFalse((root / "_inbox").exists())
 
     def test_same_content_with_different_end_date_is_not_duplicate(
         self,

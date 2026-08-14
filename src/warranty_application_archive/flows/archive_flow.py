@@ -872,6 +872,53 @@ def _unique_applications(
     return unique
 
 
+def _archive_named_worker_list_batch(
+    images: list[Path],
+    batch_word_files: set[Path],
+    batch_applications: list[dict[str, Any]],
+    root: Path,
+    changes: list[dict[str, Any]],
+) -> int:
+    """Assign filename-marked worker lists only when the batch is one-to-one."""
+    if not images:
+        return 0
+
+    applications = _unique_applications(batch_applications)
+    if (
+        len(images) != len(batch_word_files)
+        or len(applications) != len(batch_word_files)
+    ):
+        raise ValueError(
+            "本批次工人名单与质保单无法一一对应，已停止文件保存和 JSON "
+            "入库："
+            f"工人名单={len(images)}；质保单={len(batch_word_files)}；"
+            f"可入库案卷={len(applications)}"
+        )
+        return 0
+
+    sources = sorted(images, key=lambda path: path.name)
+    targets = sorted(
+        applications,
+        key=lambda application: str(application.get("case_name") or ""),
+    )
+    archived = 0
+    LOGGER.info(
+        "本批次文件名标记的工人名单与质保单数量一致，按稳定顺序一一入库: %d 份",
+        len(sources),
+    )
+    for source, application in zip(sources, targets):
+        if _archive_material_once(
+            application,
+            source,
+            WORKER_LIST_ROLE,
+            root,
+            changes,
+        ):
+            archived += 1
+            _refresh_status(application)
+    return archived
+
+
 def _archive_identical_worker_list_groups(
     images: list[Path],
     applications: list[dict[str, Any]],
@@ -1121,7 +1168,6 @@ def route_input_files(
     input_root = root / INPUT_DIR_NAME
     inbox = root / "_inbox"
     input_root.mkdir(parents=True, exist_ok=True)
-    inbox.mkdir(parents=True, exist_ok=True)
     sources = sorted(
         path
         for path in input_root.iterdir()
@@ -1138,6 +1184,24 @@ def route_input_files(
     }
     if not sources:
         return summary
+
+    input_word_count = sum(
+        path.suffix.lower() == ".docx" for path in sources
+    )
+    named_worker_list_count = sum(
+        path.suffix.lower() in IMAGE_SUFFIXES and "工人名单" in path.stem
+        for path in sources
+    )
+    if named_worker_list_count != input_word_count:
+        message = (
+            "_input 中工人名单与质保单数量不一致，已停止文件保存和 JSON "
+            f"入库：工人名单={named_worker_list_count}；"
+            f"质保单={input_word_count}"
+        )
+        LOGGER.error(message)
+        raise ValueError(message)
+
+    inbox.mkdir(parents=True, exist_ok=True)
 
     resolved_batch_id = input_batch_id or str(uuid.uuid4())
     routes = dataset.setdefault("input_routes", [])
@@ -1293,6 +1357,16 @@ def intake_applications(
     )
     batch_application: dict[str, Any] | None = None
     batch_applications: list[dict[str, Any]] = []
+    named_batch_worker_lists = sorted(
+        path
+        for path in batch_files
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_SUFFIXES
+        and "工人名单" in path.stem
+    )
+    named_worker_list_paths = {
+        path.resolve() for path in named_batch_worker_lists
+    }
 
     for source_word in word_files:
         parsed = legacy.parse_document(source_word)
@@ -1348,6 +1422,7 @@ def intake_applications(
                 for path in inbox.iterdir()
                 if path.is_file()
                 and path.resolve() not in claimed
+                and path.resolve() not in named_worker_list_paths
                 and path.suffix.lower()
                 in {*IMAGE_SUFFIXES, ".pdf"}
             )
@@ -1434,6 +1509,7 @@ def intake_applications(
             for path in inbox.iterdir()
             if path.is_file()
             and path.resolve() not in claimed
+            and path.resolve() not in named_worker_list_paths
             and path.suffix.lower()
             in {*IMAGE_SUFFIXES, ".pdf"}
         )
@@ -1481,6 +1557,16 @@ def intake_applications(
         )
         _refresh_status(application)
 
+    named_worker_lists_archived = _archive_named_worker_list_batch(
+        named_batch_worker_lists,
+        batch_word_files,
+        batch_applications,
+        root,
+        changes,
+    )
+    if named_worker_lists_archived:
+        claimed.update(named_worker_list_paths)
+
     remaining_images = sorted(
         path
         for path in inbox.iterdir()
@@ -1491,6 +1577,8 @@ def intake_applications(
     pending_worker_lists: list[Path] = []
     with RecognitionService(dataset, repo_root) as recognition:
         for image in remaining_images:
+            if image.resolve() in named_worker_list_paths:
+                continue
             try:
                 text = recognition.image_text(image)
             except Exception as exc:
@@ -1574,7 +1662,8 @@ def intake_applications(
                 changes,
             )
             _refresh_status(candidates[0])
-    worker_lists_archived = _archive_identical_worker_list_groups(
+    worker_lists_archived = named_worker_lists_archived
+    worker_lists_archived += _archive_identical_worker_list_groups(
         pending_worker_lists,
         applications,
         batch_applications,
@@ -1890,17 +1979,24 @@ def ingest_approval_pdfs(
     return ingested
 
 
-def ingest_worker_lists(dataset: dict[str, Any], root: Path) -> int:
+def ingest_worker_lists(
+    dataset: dict[str, Any],
+    root: Path,
+    *,
+    input_batch_id: str = "",
+) -> int:
     root = root.resolve()
     inbox = root / "_inbox"
     if not inbox.is_dir():
         return 0
+    current_batch_files = _input_batch_files(dataset, root, input_batch_id)
     sources = sorted(
         path
         for path in inbox.iterdir()
         if path.is_file()
         and path.suffix.lower() in {*IMAGE_SUFFIXES, PDF_SUFFIX}
         and ("工人名单" in path.stem or "人员名单" in path.stem)
+        and path.resolve() not in current_batch_files
     )
     ingested = 0
     changes = dataset.setdefault("changes", [])
