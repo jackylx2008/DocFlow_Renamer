@@ -1006,6 +1006,141 @@ def _archive_identical_worker_list_groups(
     return archived
 
 
+def _input_words_replace_existing_applications(
+    sources: list[Path],
+    applications: list[dict[str, Any]],
+    root: Path,
+) -> bool:
+    word_files = [path for path in sources if path.suffix.lower() == ".docx"]
+    return bool(word_files) and all(
+        _find_duplicate_application(
+            legacy.parse_document(path),
+            applications,
+            root,
+        )
+        is not None
+        for path in word_files
+    )
+
+
+def _replace_application_word(
+    application: dict[str, Any],
+    source: Path,
+    parsed: dict[str, Any],
+    canonical_word_name: str,
+    template: Path,
+    template_hash: str,
+    root: Path,
+    changes: list[dict[str, Any]],
+) -> Path:
+    """Replace the stored Word and refresh its existing JSON application."""
+    case_name = str(application.get("case_name") or "").strip()
+    if not case_name:
+        raise ValueError("已有质保申请缺少 case_name，无法覆盖")
+    relative_case_dir = str(application.get("case_directory") or "").strip()
+    if not relative_case_dir:
+        relative_case_dir = str(Path(CASES_DIR_NAME) / case_name)
+        application["case_directory"] = relative_case_dir
+    case_dir = ensure_within(root / relative_case_dir, root / CASES_DIR_NAME)
+    target = case_dir / f"{case_name}.docx"
+    fingerprint = sha256_file(source)
+    replacement_record = file_record(
+        source,
+        target,
+        root,
+        WORD_ROLE,
+        fingerprint=fingerprint,
+    )
+
+    case_dir.mkdir(parents=True, exist_ok=True)
+    materials = application.setdefault("materials", {})
+    existing_words: set[Path] = set()
+    for item in materials.get(WORD_ROLE) or []:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        old_word = ensure_within(
+            root / str(item["path"]),
+            root / CASES_DIR_NAME,
+        )
+        if old_word.is_file():
+            existing_words.add(old_word)
+    if target.is_file():
+        existing_words.add(target)
+    backup_dir = (
+        root
+        / INTERNAL_DIR_NAME
+        / QUARANTINE_DIR_NAME
+        / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        / "replaced_words"
+    )
+    for old_word in sorted(existing_words):
+        backup = _unique_inbox_target(backup_dir, old_word)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(old_word), str(backup))
+        changes.append(
+            _change(
+                "backup_replaced_application_word",
+                old_word,
+                backup,
+                WORD_ROLE,
+                str(application.get("case_id") or ""),
+            )
+        )
+
+    _move_verified(source, target, root)
+    for role, role_files in list(materials.items()):
+        materials[role] = [
+            item
+            for item in (role_files or [])
+            if role == WORD_ROLE
+            or _application_file_exists(application, item, root)
+        ]
+    materials[WORD_ROLE] = [replacement_record]
+    application["application"] = _business_data(parsed)
+    application["required_material_types"] = _required_roles(parsed)
+    changes.append(
+        _change(
+            "replace_application_word",
+            source,
+            target,
+            WORD_ROLE,
+            str(application.get("case_id") or ""),
+        )
+    )
+
+    safety_files = materials.setdefault(SAFETY_AGREEMENT_ROLE, [])
+    if not safety_files:
+        agreement_target = (
+            case_dir
+            / f"{application_prefix(Path(canonical_word_name))}_{TEMPLATE_FILE_NAME}"
+        )
+        shutil.copy2(template, agreement_target)
+        if sha256_file(agreement_target) != template_hash:
+            raise RuntimeError(f"安全协议复制校验失败: {agreement_target}")
+        safety_files.append(
+            file_record(
+                agreement_target,
+                agreement_target,
+                root,
+                SAFETY_AGREEMENT_ROLE,
+                fingerprint=template_hash,
+                derived=True,
+            )
+        )
+        changes.append(
+            _change(
+                "copy",
+                template,
+                agreement_target,
+                SAFETY_AGREEMENT_ROLE,
+                str(application.get("case_id") or ""),
+            )
+        )
+
+    _refresh_status(application)
+    return target
+
+
 def reclassify_historical_materials(
     dataset: dict[str, Any],
     root: Path,
@@ -1192,7 +1327,15 @@ def route_input_files(
         path.suffix.lower() in IMAGE_SUFFIXES and "工人名单" in path.stem
         for path in sources
     )
-    if named_worker_list_count != input_word_count:
+    replacement_only = (
+        named_worker_list_count == 0
+        and _input_words_replace_existing_applications(
+            sources,
+            dataset.get("applications") or [],
+            root,
+        )
+    )
+    if named_worker_list_count != input_word_count and not replacement_only:
         message = (
             "_input 中工人名单与质保单数量不一致，已停止文件保存和 JSON "
             f"入库：工人名单={named_worker_list_count}；"
@@ -1200,6 +1343,11 @@ def route_input_files(
         )
         LOGGER.error(message)
         raise ValueError(message)
+    if replacement_only:
+        LOGGER.info(
+            "_input 中 %d 份质保单均命中已有申请，按覆盖更新批次处理",
+            input_word_count,
+        )
 
     inbox.mkdir(parents=True, exist_ok=True)
 
@@ -1357,6 +1505,7 @@ def intake_applications(
     )
     batch_application: dict[str, Any] | None = None
     batch_applications: list[dict[str, Any]] = []
+    updated_count = 0
     named_batch_worker_lists = sorted(
         path
         for path in batch_files
@@ -1388,13 +1537,18 @@ def intake_applications(
                     changes,
                 )
             )
-            quarantined = _quarantine_duplicate_application_sources(
-                [source_word],
+            target_word = _replace_application_word(
+                duplicate,
+                source_word,
+                parsed,
+                canonical_word_name,
+                template,
+                template_hash,
                 root,
                 changes,
-                str(duplicate.get("case_id") or ""),
             )
             claimed.add(source_word.resolve())
+            updated_count += 1
             if (
                 single_batch_word is not None
                 and source_word.resolve() == single_batch_word
@@ -1403,17 +1557,17 @@ def intake_applications(
             if source_word.resolve() in batch_word_files:
                 batch_applications.append(duplicate)
             duplicate_business = duplicate.get("application") or {}
-            LOGGER.warning(
-                "检测到重复质保申请，已跳过写入 JSON: 文件=%s；"
+            LOGGER.info(
+                "检测到已有质保申请，已用新文件覆盖 JSON 和案卷 Word: 文件=%s；"
                 "已有案卷=%s；施工开始时间=%s；施工结束时间=%s；"
-                "施工内容=%s；施工区域=%s；重复文件已移至=%s",
+                "施工内容=%s；施工区域=%s；保存位置=%s",
                 source_word.name,
                 duplicate.get("case_name") or "",
                 duplicate_business.get("施工开始时间") or "",
                 duplicate_business.get("施工结束时间") or "",
                 duplicate_business.get("施工内容") or "",
                 duplicate_business.get("施工区域") or "",
-                quarantined[0].parent,
+                target_word,
             )
             if removed_duplicates and checkpoint:
                 checkpoint(dataset)
@@ -1674,7 +1828,7 @@ def intake_applications(
         checkpoint(dataset)
     if intake_stats is not None:
         intake_stats["worker_lists_ingested"] = worker_lists_archived
-    return len(created)
+    return len(created) + updated_count
 
 
 def _approval_candidates(

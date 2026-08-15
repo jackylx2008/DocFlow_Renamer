@@ -32,11 +32,13 @@ from warranty_application_archive.modules.constants import (
     DATA_FILE_NAME,
     HIGH_ALTITUDE_ROLE,
     LEGACY_SUMMARY_EXCEL_FILE_NAME,
+    SAFETY_AGREEMENT_ROLE,
     SIGNED_APPLICATION_ROLE,
     SPECIAL_WORK_ROLE,
     SUMMARY_LAUNCHER_FILE_NAME,
     SUMMARY_MACOS_LAUNCHER_FILE_NAME,
     TEMPLATE_FILE_NAME,
+    WORD_ROLE,
     WORKER_LIST_ROLE,
 )
 from warranty_application_archive.modules.file_utils import sha256_file
@@ -880,7 +882,7 @@ class MigrationTest(unittest.TestCase):
             self.assertTrue(incoming_image.is_file())
             self.assertFalse(materials[SIGNED_APPLICATION_ROLE])
 
-    def test_duplicate_application_is_quarantined_and_not_added(
+    def test_existing_application_word_is_replaced_and_json_is_updated(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -891,17 +893,21 @@ class MigrationTest(unittest.TestCase):
             inbox.mkdir(exist_ok=True)
             incoming_word = inbox / "重复申请.docx"
             incoming_word.write_bytes(b"duplicate word")
+            incoming_hash = sha256_file(incoming_word)
             original_count = len(dataset["applications"])
+            application = dataset["applications"][0]
+            parsed = deepcopy(PARSED_APPLICATION)
+            parsed["质保负责人联系电话"] = "13911112222"
 
             with (
                 patch(
                     "warranty_application_archive.flows.archive_flow."
                     "legacy.parse_document",
-                    return_value=deepcopy(PARSED_APPLICATION),
+                    return_value=parsed,
                 ),
                 self.assertLogs(
                     "warranty_application_archive.flows.archive_flow",
-                    level="WARNING",
+                    level="INFO",
                 ) as captured,
             ):
                 count = intake_applications(
@@ -910,25 +916,76 @@ class MigrationTest(unittest.TestCase):
                     Path(__file__).resolve().parents[1],
                 )
 
-            self.assertEqual(count, 0)
+            self.assertEqual(count, 1)
             self.assertEqual(len(dataset["applications"]), original_count)
             self.assertFalse(incoming_word.exists())
-            quarantined = list(
-                (primary / ".docflow" / "quarantine").rglob("*")
+            target = (
+                primary
+                / application["case_directory"]
+                / f"{application['case_name']}.docx"
             )
-            self.assertTrue(
-                any(path.name == incoming_word.name for path in quarantined)
+            self.assertEqual(target.read_bytes(), b"duplicate word")
+            self.assertEqual(
+                application["application"]["质保负责人联系电话"],
+                "13911112222",
+            )
+            self.assertEqual(
+                application["materials"]["word"][0]["sha256"],
+                incoming_hash,
             )
             messages = "\n".join(captured.output)
-            self.assertIn("检测到重复质保申请", messages)
-            self.assertIn("已跳过写入 JSON", messages)
+            self.assertIn("检测到已有质保申请", messages)
+            self.assertIn("已用新文件覆盖 JSON 和案卷 Word", messages)
             self.assertIn(PARSED_APPLICATION["施工开始时间"], messages)
             self.assertTrue(
                 any(
                     change.get("action")
-                    == "quarantine_duplicate_application"
+                    == "replace_application_word"
                     for change in dataset["changes"]
                 )
+            )
+            self.assertTrue(
+                any(
+                    change.get("action")
+                    == "backup_replaced_application_word"
+                    for change in dataset["changes"]
+                )
+            )
+
+    def test_existing_application_creates_missing_case_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            application = dataset["applications"][0]
+            case_dir = primary / application["case_directory"]
+            shutil.rmtree(case_dir)
+            inbox = primary / "_inbox"
+            inbox.mkdir(exist_ok=True)
+            incoming_word = inbox / "更新申请.docx"
+            incoming_word.write_bytes(b"updated word")
+
+            with patch(
+                "warranty_application_archive.flows.archive_flow."
+                "legacy.parse_document",
+                return_value=deepcopy(PARSED_APPLICATION),
+            ):
+                count = intake_applications(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                )
+
+            target = case_dir / f"{application['case_name']}.docx"
+            self.assertEqual(count, 1)
+            self.assertTrue(case_dir.is_dir())
+            self.assertEqual(target.read_bytes(), b"updated word")
+            self.assertEqual(
+                application["materials"][WORD_ROLE][0]["path"],
+                target.relative_to(primary).as_posix(),
+            )
+            self.assertTrue(
+                application["materials"][SAFETY_AGREEMENT_ROLE]
             )
 
     def test_duplicate_application_retains_more_complete_case(
@@ -989,7 +1046,7 @@ class MigrationTest(unittest.TestCase):
                     Path(__file__).resolve().parents[1],
                 )
 
-            self.assertEqual(count, 0)
+            self.assertEqual(count, 1)
             self.assertEqual(dataset["applications"], [more_complete])
             self.assertTrue(more_complete_dir.is_dir())
             self.assertFalse(
@@ -1063,7 +1120,7 @@ class MigrationTest(unittest.TestCase):
                     input_batch_id=batch_id,
                 )
 
-            self.assertEqual(count, 0)
+            self.assertEqual(count, 1)
             application = dataset["applications"][0]
             materials = application["materials"]
             self.assertTrue(
@@ -1316,6 +1373,32 @@ class MigrationTest(unittest.TestCase):
             self.assertEqual(dataset, before)
             self.assertEqual(len(list(input_dir.iterdir())), 3)
             self.assertFalse((root / "_inbox").exists())
+
+    def test_existing_application_update_does_not_require_worker_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            input_dir = primary / "_input"
+            input_dir.mkdir()
+            incoming_word = input_dir / "已有申请更新.docx"
+            incoming_word.write_bytes(b"updated existing application")
+
+            with patch(
+                "warranty_application_archive.flows.archive_flow."
+                "legacy.parse_document",
+                return_value=deepcopy(PARSED_APPLICATION),
+            ):
+                summary = route_input_files(
+                    dataset,
+                    primary,
+                    Path(__file__).resolve().parents[1],
+                    input_batch_id="replacement-only",
+                )
+
+            self.assertEqual(summary["input_files_routed"], 1)
+            self.assertFalse(incoming_word.exists())
+            self.assertTrue((primary / "_inbox" / incoming_word.name).is_file())
 
     def test_same_content_with_different_end_date_is_not_duplicate(
         self,
