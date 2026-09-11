@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import uuid
 from pathlib import Path
 
@@ -68,7 +69,11 @@ def _open_runtime(
 ]:
     repo_root = _repo_root()
     config = AppConfig.resolve(repo_root, input_dir)
-    setup_logger(log_level=config.log_level, log_dir=config.log_dir)
+    entry_name = Path(sys.argv[0]).stem or "app"
+    setup_logger(
+        log_level=config.log_level,
+        log_file=config.log_dir / f"{entry_name}.log",
+    )
     if not config.data_root.is_dir():
         raise NotADirectoryError(f"资料根目录不存在: {config.data_root}")
     return (

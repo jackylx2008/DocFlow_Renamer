@@ -15,8 +15,8 @@
 
 代码结构遵循 `COMMON_PROJECT_SKILLS.md`：
 
-- `src/warranty_application_archive/modules/`：基础能力模块
-- `src/warranty_application_archive/flows/`：场景编排层
+- `src/localai/modules/`：基础能力模块
+- `src/localai/flows/`：场景编排层
 - 项目根目录 `.py` 文件：独立入口脚本
 
 ## 1. CUDA 基础检查
@@ -139,17 +139,38 @@ LLAMACPP_REASONING_BUDGET=0
 
 ```dotenv
 LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
-LLAMACPP_MODEL=Qwen3.6-27B-Q4_K_M
+LLAMACPP_MODEL=Qwen3.8-27B-Q4_K_M
 LLAMACPP_AUTOSTART=true
 LLAMACPP_SERVER_PATH=D:\llama-cpp-cu12\llama-server.exe
-LLAMACPP_MODEL_PATH=C:\Users\bcjt_\.lmstudio\models\lmstudio-community\Qwen3.6-27B-GGUF\Qwen3.6-27B-Q4_K_M.gguf
-LLAMACPP_MMPROJ_PATH=C:\Users\bcjt_\.lmstudio\models\lmstudio-community\Qwen3.6-27B-GGUF\mmproj-Qwen3.6-27B-BF16.gguf
+LLAMACPP_MODEL_PATH=C:\Users\bcjt_\.lmstudio\models\lmstudio-community\Qwen3.8-27B-GGUF\Qwen3.8-27B-Q4_K_M.gguf
+LLAMACPP_MMPROJ_PATH=C:\Users\bcjt_\.lmstudio\models\lmstudio-community\Qwen3.8-27B-GGUF\mmproj-Qwen3.8-27B-BF16.gguf
 LLAMACPP_EXTRA_DLL_DIRS=./vendor/cuda12
 LLAMACPP_N_GPU_LAYERS=999
 LLAMACPP_CTX_SIZE=8192
 LLAMACPP_REASONING=off
 LLAMACPP_REASONING_BUDGET=0
 ```
+
+### Qwen3.8 模型版本选择
+
+启动本地 AI 时，默认使用经过审核的 Qwen3.8 模型：
+
+```text
+C:\Users\bcjt_\.lmstudio\models\lmstudio-community\Qwen3.8-27B-GGUF
+```
+
+默认主模型为 `Qwen3.8-27B-Q4_K_M.gguf`，多模态投影文件为 `mmproj-Qwen3.8-27B-BF16.gguf`。除非在配置中明确指定其他模型，否则项目应使用这个审核版本。
+
+如需使用非审核版 Qwen3.8，可在项目的 `config.yaml` 中将 `llamacpp` 配置为：
+
+```yaml
+llamacpp:
+  model: ${LLAMACPP_MODEL:-Qwen3.8-27B-Uncensored-Q5_K_M}
+  model_path: '${LLAMACPP_MODEL_PATH:-C:\Users\bcjt_\.lmstudio\models\JonathanColetti\Qwen3.8-27B-Uncensored-GGUF\Qwen3.8-27B-Uncensored-Q5_K_M.gguf}'
+  mmproj_path: '${LLAMACPP_MMPROJ_PATH:-C:\Users\bcjt_\.lmstudio\models\JonathanColetti\Qwen3.8-27B-Uncensored-GGUF\mmproj-Qwen3.8-27B-Uncensored-F16.gguf}'
+```
+
+这段 YAML 仍允许通过同名环境变量覆盖配置。非审核版仅在项目明确配置上述模型时启用；移除这些覆盖项后，应恢复使用默认的审核版 Qwen3.8。非审核版可能生成未经安全对齐或内容过滤的输出，调用方需要自行进行输入校验、输出审查和使用范围控制。
 
 ## 4. 自动启动流程
 
@@ -366,7 +387,7 @@ finally:
 
 1. 调用 `bootstrap_context(__file__)`
 2. 初始化配置、日志和上下文
-3. 调用 `src/warranty_application_archive/flows/` 中对应的 `run(...)`
+3. 调用 `src/localai/flows/` 中对应的 `run(...)`
 4. 用 `print_json(...)` 输出结构化结果
 
 需要调用本地模型时，优先在 `flows` 中组合：

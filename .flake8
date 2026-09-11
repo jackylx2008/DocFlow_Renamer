@@ -1,6 +1,7 @@
 [flake8]
 # 设置最大行长度
 max-line-length = 120
+exclude = .git,__pycache__,.venv,.conda,.pytest_cache,.pytest_tmp,output,logs
 
 # 忽略以下检查:
 # E501 - 行长度检查

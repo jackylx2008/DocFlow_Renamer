@@ -36,7 +36,10 @@ from ..modules.naming import (
     material_file_name,
     material_role,
 )
-from ..modules.recognition import RecognitionService
+from ..modules.recognition import (
+    RecognitionService,
+    approval_result_from_text,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -429,7 +432,7 @@ def _merge_duplicate_case_files(
             )
         )
     if retained_approval_files:
-        for field in ("application_no", "match_source"):
+        for field in ("application_no", "match_source", "result"):
             if not retained_approval.get(field) and source_approval.get(
                 field
             ):
@@ -1960,6 +1963,7 @@ def archive_reviewed_approval_pdf(
         {
             "application_no": application_no,
             "match_source": "human_review",
+            "result": approval_result_from_text(text),
             "status": "approved",
             "review_id": review_id,
             "review_note": review_note,
@@ -2123,6 +2127,7 @@ def ingest_approval_pdfs(
                 )
             approval["application_no"] = application_no
             approval["match_source"] = "content_recognition"
+            approval["result"] = approval_result_from_text(text)
             approval["status"] = "approved"
             _refresh_status(application)
             ingested += 1

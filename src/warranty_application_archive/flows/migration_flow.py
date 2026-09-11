@@ -372,6 +372,7 @@ def build_migration_plan(root: Path) -> MigrationPlan:
                 "materials": materials,
                 "approval": {
                     "status": "approved" if approval_files else "not_received",
+                    "result": "approved" if approval_files else "",
                     "application_no": (
                         approval_application_no(approval_files[0]["current_name"])
                         if approval_files

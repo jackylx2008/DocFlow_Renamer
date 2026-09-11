@@ -24,10 +24,10 @@ def bootstrap_context(
     entry_path = Path(entry_file).resolve()
     repo_root = entry_path.parent
     config = AppConfig.resolve(repo_root, explicit_data_root)
-    log_path = setup_logger(
+    log_path = config.log_dir / f"{entry_path.stem}.log"
+    setup_logger(
         log_level=config.log_level,
-        log_dir=config.log_dir,
-        entry_name=entry_path.stem,
+        log_file=log_path,
     )
     return ProjectContext(
         config=config,

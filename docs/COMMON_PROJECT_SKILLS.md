@@ -252,7 +252,7 @@ parser = argparse.ArgumentParser(
 约定：
 
 - 每个项目都必须配置 CloudStation 根目录，用于在不同操作系统上访问或处理同步范围内的数据。
-- Windows 系统的 CloudStation 根目录固定为 `D:\CloudStaion`。
+- Windows 系统的 CloudStation 根目录固定为 `D:\CloudStation`。
 - macOS 系统的 CloudStation 根目录固定为 `~/SynologyDrive/`。
 - 源码和 `config.yaml` 中不要直接写死上述路径或其他本机绝对路径，应统一通过 CloudStation 根目录配置引用。
 - 路径字段中使用 `${CLOUDSTATION_ROOT}` 作为标记符，例如 `${CLOUDSTATION_ROOT}/Python/Project/<project_name>/data/input.xlsx`。
@@ -266,7 +266,7 @@ parser = argparse.ArgumentParser(
 `common.env` 或 `.env` 示例：
 
 ```dotenv
-CLOUDSTATION_ROOT_WINDOWS=D:\CloudStaion
+CLOUDSTATION_ROOT_WINDOWS=D:\CloudStation
 CLOUDSTATION_ROOT_MACOS=~/SynologyDrive/
 CLOUDSTATION_ROOT_LINUX=~/CloudStation
 ```

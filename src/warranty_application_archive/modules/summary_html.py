@@ -54,6 +54,7 @@ SUMMARY_HEADERS = [
     "施工人员名单",
     "专项作业材料",
     "安全协议",
+    "审批结果",
     "审批PDF",
 ]
 SUMMARY_SHEET_NAMES = [
@@ -238,6 +239,21 @@ def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
         *_files(application, "special_work"),
     ]
     approval_files = list(approval.get("pdfs") or [])
+    approval_result = str(approval.get("result") or "")
+    if (
+        not approval_result
+        and approval_files
+        and approval.get("status") == "approved"
+    ):
+        approval_result = "approved"
+    approval_result_text = {
+        "approved": "通过",
+        "rejected": "被拒绝",
+    }.get(approval_result, "")
+    approval_result_tone = {
+        "approved": "success",
+        "rejected": "danger",
+    }.get(approval_result, "")
     missing = [
         ROLE_LABELS.get(role, role)
         for role in application.get("missing_material_types") or []
@@ -312,11 +328,15 @@ def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
         _cell(links=_file_links(worker_files)),
         _cell(links=_file_links(special_files)),
         _cell(links=_file_links(safety_files)),
+        _cell(approval_result_text, tone=approval_result_tone),
         _cell(links=_file_links(approval_files)),
     ]
     if status == "terminated":
         for cell in cells:
             cell["tone"] = "terminated"
+    if status == "approved":
+        for cell in cells:
+            cell["compact"] = True
     return cells
 
 
@@ -629,6 +649,26 @@ _HTML_TEMPLATE = r"""<!doctype html>
     tbody tr:nth-child(odd) td { background: var(--blue-row); }
     tbody tr:nth-child(even) td { background: white; }
     tbody tr:hover td { background: #fff4d7; }
+    tbody tr.compact-row { height: 54px; }
+    tbody tr.compact-row td {
+      height: 54px;
+      padding: 4px 5px;
+      vertical-align: top;
+    }
+    .compact-cell-content {
+      max-height: 44px;
+      overflow-x: hidden;
+      overflow-y: auto;
+      scrollbar-color: #8799ad transparent;
+      scrollbar-width: thin;
+    }
+    .compact-cell-content::-webkit-scrollbar { width: 5px; }
+    .compact-cell-content::-webkit-scrollbar-track { background: transparent; }
+    .compact-cell-content::-webkit-scrollbar-thumb {
+      border-radius: 999px;
+      background: #8799ad;
+    }
+    .compact-row .links { gap: 2px; }
     td.tone-success { color: var(--success); background: var(--success-bg) !important; font-weight: 700; }
     td.tone-warning { color: var(--warning); background: var(--warning-bg) !important; font-weight: 700; }
     td.tone-danger { color: var(--danger); background: var(--danger-bg) !important; font-weight: 700; }
@@ -692,6 +732,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
       body, main, .workspace { margin: 0; width: 100%; background: white; box-shadow: none; border: 0; }
       .table-wrap { max-height: none; overflow: visible; }
       th { position: static; }
+      tbody tr.compact-row, tbody tr.compact-row td { height: auto; }
+      .compact-cell-content { max-height: none; overflow: visible; }
     }
   </style>
 </head>
@@ -832,9 +874,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
           }
           links.append(anchor);
         });
-        td.append(links);
+        if (cell.compact) {
+          const content = text("div", "", "compact-cell-content");
+          content.append(links);
+          td.append(content);
+        } else {
+          td.append(links);
+        }
       } else {
-        td.textContent = cell.text || "";
+        if (cell.compact) {
+          td.append(text("div", cell.text || "", "compact-cell-content"));
+        } else {
+          td.textContent = cell.text || "";
+        }
       }
       return td;
     }
@@ -855,6 +907,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       body.replaceChildren();
       rows.forEach((row) => {
         const tr = document.createElement("tr");
+        if (row.some((cell) => cell.compact)) tr.classList.add("compact-row");
         row.forEach((cell) => tr.append(renderCell(cell)));
         body.append(tr);
       });

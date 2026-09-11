@@ -12,6 +12,26 @@ from .file_utils import sha256_file
 
 LOGGER = logging.getLogger(__name__)
 
+APPROVAL_RESULT_APPROVED = "approved"
+APPROVAL_RESULT_REJECTED = "rejected"
+
+
+def approval_result_from_text(text: str) -> str:
+    """Read the final result only from the labeled approval-status field."""
+    normalized = legacy.normalize_match_text(text)
+    label_index = normalized.find("审批状态")
+    if label_index < 0:
+        return ""
+    value = normalized[label_index + len("审批状态") :]
+    value = value.lstrip(":：,，;；")
+    for token in ("已拒绝", "被拒绝", "未通过", "拒绝"):
+        if value.startswith(token):
+            return APPROVAL_RESULT_REJECTED
+    for token in ("已通过", "通过"):
+        if value.startswith(token):
+            return APPROVAL_RESULT_APPROVED
+    return ""
+
 
 class RecognitionService:
     """One shared OCR service and one persistent cache for every workflow."""

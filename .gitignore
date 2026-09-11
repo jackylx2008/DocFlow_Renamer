@@ -7,5 +7,6 @@ logs/
 # 旧版本遗留目录；新代码不再写入，待占用进程退出后可移除。
 log/
 output/
+tmp/
 dist/
 build/

@@ -21,7 +21,10 @@ from ..modules.constants import (
 )
 from ..modules.file_utils import atomic_replace_text, ensure_within, sha256_file
 from .migration_flow import CASE_NAMESPACE
-from ..modules.recognition import RecognitionService
+from ..modules.recognition import (
+    RecognitionService,
+    approval_result_from_text,
+)
 from .archive_flow import archive_reviewed_approval_pdf
 
 
@@ -369,6 +372,7 @@ def build_approval_review(
                 "sha256": pdf_hash,
                 "application_no": application_no,
                 "recognition_method": recognition_method,
+                "approval_result": approval_result_from_text(text),
                 **values,
             }
             ranked: list[

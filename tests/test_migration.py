@@ -49,6 +49,9 @@ from warranty_application_archive.flows.migration_flow import (
     verify_backup,
 )
 from warranty_application_archive.modules.repository import JsonRepository
+from warranty_application_archive.modules.recognition import (
+    approval_result_from_text,
+)
 from warranty_application_archive.modules.summary_html import (
     build_summary_view,
     export_summary_html,
@@ -103,6 +106,24 @@ class MigrationTest(unittest.TestCase):
         ):
             plan = build_migration_plan(primary)
         return primary, apply_migration_plan(plan), stem
+
+    def test_approval_result_uses_only_labeled_status_field(self) -> None:
+        self.assertEqual(
+            approval_result_from_text(
+                "审批状态：已通过 审批记录 任宏 / 拒绝 / 2026-08-17"
+            ),
+            "approved",
+        )
+        self.assertEqual(
+            approval_result_from_text(
+                "审批记录 王玉昆 / 已通过 审批状态：已拒绝 审批详情"
+            ),
+            "rejected",
+        )
+        self.assertEqual(
+            approval_result_from_text("审批记录 任宏 / 拒绝"),
+            "",
+        )
 
     def test_image_classification_respects_checked_work_options(
         self,
@@ -465,6 +486,32 @@ class MigrationTest(unittest.TestCase):
             self.assertIn("td.tone-terminated", html)
             self.assertIn('"text": "终止；\\n材料完整"', html)
 
+    def test_approved_rows_use_compact_scrollable_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            application = dataset["applications"][0]
+            application["status"] = "approved"
+            application["approval"]["status"] = "approved"
+
+            view = build_summary_view(dataset)
+            sheets = {
+                sheet["title"]: sheet
+                for sheet in view["sheets"]
+            }
+            summary_row = sheets["申请汇总"]["rows"][0]
+            completed_row = sheets["已完成"]["rows"][0]
+            self.assertTrue(all(cell["compact"] for cell in summary_row))
+            self.assertTrue(all(cell["compact"] for cell in completed_row))
+
+            html = export_summary_html(dataset, primary).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("tbody tr.compact-row { height: 54px; }", html)
+            self.assertIn("max-height: 44px", html)
+            self.assertIn('tr.classList.add("compact-row")', html)
+
     def test_summary_business_fields_are_ordered_and_copyable(
         self,
     ) -> None:
@@ -476,13 +523,14 @@ class MigrationTest(unittest.TestCase):
             application["status"] = "materials_incomplete"
             application["missing_material_types"] = ["worker_list"]
             application["application"]["分包单位"] = "测试分包"
+            application["approval"]["result"] = "rejected"
 
             view = build_summary_view(dataset)
             sheet = view["sheets"][0]
             headers = sheet["headers"]
             row = sheet["rows"][0]
 
-            self.assertEqual(len(headers), 16)
+            self.assertEqual(len(headers), 17)
             self.assertNotIn("缺少材料", headers)
             self.assertNotIn("审批编号", headers)
             self.assertNotIn("案卷目录", headers)
@@ -543,6 +591,9 @@ class MigrationTest(unittest.TestCase):
                 row[9]["text"],
             )
             self.assertEqual(row[9]["tone"], "success")
+            self.assertEqual(headers[-2], "审批结果")
+            self.assertEqual(row[-2]["text"], "被拒绝")
+            self.assertEqual(row[-2]["tone"], "danger")
 
             business = application["application"]
             business["影响改动消防设备设施"] = "是"
@@ -611,6 +662,7 @@ class MigrationTest(unittest.TestCase):
             )
             recognized_text = (
                 "工程类-主体质保施工 申请编号：202607240001 "
+                "审批状态：已拒绝 审批详情 "
                 "施工区域：冷却塔 施工内容：维修冷塔（含设备调试） "
                 "施工开始时间：2026年7月24日 "
                 "施工结束时间：2026年7月24日"
@@ -638,6 +690,10 @@ class MigrationTest(unittest.TestCase):
             self.assertEqual(
                 application["approval"]["application_no"],
                 "202607240001",
+            )
+            self.assertEqual(
+                application["approval"]["result"],
+                "rejected",
             )
 
     def test_input_router_separates_approval_and_application_files(

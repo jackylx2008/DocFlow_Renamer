@@ -75,7 +75,8 @@ MANUAL_MATCH_ENV_NAME = "manual_matches.env"
 IMAGE_TEXT_PROMPT = "请识别这张图片里的所有可见中文文字。只输出识别到的文字，不要解释，不要总结。"
 PDF_PAGE_TEXT_PROMPT = (
     "请识别这页 PDF 截图里的所有可见中文文字。"
-    "尽量保留原文中的日期、编号、施工内容、区域和单位名称，"
+    "尽量保留原文中的日期、编号、施工内容、区域、单位名称和审批状态，"
+    "特别要准确保留顶部审批状态字段及其已通过或已拒绝的值，"
     "特别要准确保留施工开始时间、施工结束时间及其字段标签。"
     "只输出识别到的文字，不要解释，不要总结。"
 )
@@ -2042,11 +2043,13 @@ def setup_logging(repo_root: Path, script_name: str | None = None) -> Path:
     from ..config_loader import AppConfig
 
     config = AppConfig.resolve(repo_root)
-    return setup_logger(
+    entry_name = script_name or Path(sys.argv[0]).stem or "app"
+    log_path = config.log_dir / f"{entry_name}.log"
+    setup_logger(
         log_level=config.log_level,
-        log_dir=config.log_dir,
-        entry_name=script_name,
+        log_file=log_path,
     )
+    return log_path
 
 
 def main() -> int:
