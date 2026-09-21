@@ -56,6 +56,7 @@ SUMMARY_HEADERS = [
     "安全协议",
     "审批结果",
     "审批PDF",
+    "人工审批及\n操作",
 ]
 SUMMARY_SHEET_NAMES = [
     "申请汇总",
@@ -111,6 +112,7 @@ def _cell(
     copy_warranty_unit: Any = "",
     copy_subcontract_unit: Any = "",
     multiline: bool = False,
+    action: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved_text = str(copy_text or "").strip()
     resolved_name = str(copy_name or "").strip()
@@ -134,6 +136,7 @@ def _cell(
         "copy_warranty_unit": resolved_warranty_unit,
         "copy_subcontract_unit": resolved_subcontract_unit,
         "multiline": multiline,
+        "action": action or {},
     }
 
 
@@ -329,7 +332,25 @@ def _summary_row(application: dict[str, Any]) -> list[dict[str, Any]]:
         _cell(links=_file_links(special_files)),
         _cell(links=_file_links(safety_files)),
         _cell(approval_result_text, tone=approval_result_tone),
-        _cell(links=_file_links(approval_files)),
+        _cell(
+            links=_file_links(approval_files),
+            action=(
+                {
+                    "kind": "approval_pdf_upload",
+                    "case_id": str(application.get("case_id") or ""),
+                    "case_name": str(application.get("case_name") or ""),
+                }
+                if not approval_files and status != "terminated"
+                else None
+            ),
+        ),
+        _cell(
+            action={
+                "case_id": str(application.get("case_id") or ""),
+                "case_name": str(application.get("case_name") or ""),
+                "approval_result": approval_result,
+            }
+        ),
     ]
     if status == "terminated":
         for cell in cells:
@@ -559,7 +580,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       background: #f7f9fc;
     }
     .tabs { display: flex; gap: 7px; flex-wrap: wrap; }
-    button, input { font: inherit; }
+    button, input, select { font: inherit; }
     .tab {
       padding: 9px 14px;
       border: 1px solid #c1ccda;
@@ -628,14 +649,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
     th:nth-child(12), td:nth-child(12),
     th:nth-child(13), td:nth-child(13),
     th:nth-child(15), td:nth-child(15),
-    th:nth-child(16), td:nth-child(16) { width: 6%; }
+    th:nth-child(16), td:nth-child(16) { width: 5%; }
     th:nth-child(2), td:nth-child(2),
     th:nth-child(6), td:nth-child(6),
     th:nth-child(7), td:nth-child(7),
-    th:nth-child(14), td:nth-child(14) { width: 5%; }
+    th:nth-child(14), td:nth-child(14) { width: 4.5%; }
     th:nth-child(3), td:nth-child(3),
-    th:nth-child(8), td:nth-child(8) { width: 8%; }
-    th:nth-child(10), td:nth-child(10) { width: 10%; }
+    th:nth-child(8), td:nth-child(8) { width: 7%; }
+    th:nth-child(10), td:nth-child(10) { width: 9%; }
+    th:nth-child(18), td:nth-child(18) { width: 7%; }
     th {
       position: sticky;
       top: 0;
@@ -681,6 +703,47 @@ _HTML_TEMPLATE = r"""<!doctype html>
     .multiline-cell { white-space: pre-line; }
     .copyable-cell { cursor: context-menu; }
     .copyable-cell:hover { box-shadow: inset 0 0 0 2px #5b87b4; }
+    .action-cell { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .action-cell select { grid-column: 1 / -1; }
+    .action-cell select,
+    .action-cell button {
+      width: 100%;
+      min-width: 0;
+      padding: 6px 5px;
+      border: 1px solid #9cabbc;
+      border-radius: 5px;
+      background: white;
+    }
+    .action-cell button { cursor: pointer; font-weight: 700; }
+    .action-cell .save-result { color: white; border-color: var(--navy); background: var(--navy); }
+    .action-cell .delete-case { color: #8b2724; border-color: #d6a5a2; background: #fff1f0; }
+    .action-cell button:disabled,
+    .action-cell select:disabled { cursor: wait; opacity: .65; }
+    .compact-row .action-cell { gap: 2px; }
+    .compact-row .action-cell select,
+    .compact-row .action-cell button {
+      padding: 1px 2px;
+      line-height: 16px;
+    }
+    .approval-upload { display: grid; gap: 5px; }
+    .approval-upload input[type="file"] { display: none; }
+    .approval-upload button {
+      width: 100%;
+      min-width: 0;
+      padding: 6px 5px;
+      border: 1px solid #9cabbc;
+      border-radius: 5px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .approval-upload .choose-pdf { color: var(--ink); background: white; }
+    .approval-upload .save-pdf { color: white; border-color: var(--navy); background: var(--navy); }
+    .approval-upload .selected-pdf {
+      color: var(--muted);
+      font-size: 11px;
+      overflow-wrap: anywhere;
+    }
+    .approval-upload button:disabled { cursor: wait; opacity: .65; }
     .file-menu {
       position: fixed;
       z-index: 20;
@@ -734,6 +797,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       th { position: static; }
       tbody tr.compact-row, tbody tr.compact-row td { height: auto; }
       .compact-cell-content { max-height: none; overflow: visible; }
+      .action-cell button { display: none; }
     }
   </style>
 </head>
@@ -833,7 +897,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
               : "右键分别复制姓名或电话"
           );
       }
-      if (cell.links && cell.links.length) {
+      if (cell.action && cell.action.case_id) {
+        td.append(
+          cell.action.kind === "approval_pdf_upload"
+            ? renderApprovalPdfUpload(cell.action)
+            : renderActionCell(cell.action)
+        );
+      } else if (cell.links && cell.links.length) {
         const links = text("div", "", "links");
         cell.links.forEach((item) => {
           const anchor = text("a", item.text || item.path || "打开");
@@ -889,6 +959,143 @@ _HTML_TEMPLATE = r"""<!doctype html>
         }
       }
       return td;
+    }
+    async function submitSummaryAction(payload, controls) {
+      if (location.protocol === "file:") {
+        showCopyMessage(
+          "请通过汇总页面启动器打开后再保存或删除",
+          true
+        );
+        return;
+      }
+      controls.forEach((control) => { control.disabled = true; });
+      try {
+        const response = await fetch("/api/summary-action", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            source_dataset_revision: data.dataset_revision,
+            ...payload,
+          }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.ok) {
+          throw new Error(result.error || "操作失败");
+        }
+        showCopyMessage(result.message || "操作已完成");
+        window.setTimeout(() => window.location.reload(), 350);
+      } catch (error) {
+        controls.forEach((control) => { control.disabled = false; });
+        showCopyMessage(error.message || "操作失败，请查看程序日志", true);
+      }
+    }
+    function renderApprovalPdfUpload(action) {
+      const wrap = text("div", "", "approval-upload");
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = ".pdf,application/pdf";
+      input.setAttribute("aria-label", `${action.case_name} 选择审批 PDF`);
+      const choose = text("button", "选择审批单", "choose-pdf");
+      choose.type = "button";
+      const selected = text("span", "尚未选择", "selected-pdf");
+      const save = text("button", "保存 PDF", "save-pdf");
+      save.type = "button";
+      save.disabled = true;
+      choose.addEventListener("click", () => input.click());
+      input.addEventListener("change", () => {
+        const file = input.files && input.files[0];
+        selected.textContent = file ? file.name : "尚未选择";
+        save.disabled = !file;
+      });
+      save.addEventListener("click", async () => {
+        const file = input.files && input.files[0];
+        if (!file) {
+          showCopyMessage("请先选择审批 PDF", true);
+          return;
+        }
+        if (!file.name.toLocaleLowerCase().endsWith(".pdf")) {
+          showCopyMessage("只能选择 PDF 格式的审批单", true);
+          return;
+        }
+        if (file.size > 50 * 1024 * 1024) {
+          showCopyMessage("审批 PDF 不能超过 50 MB", true);
+          return;
+        }
+        if (location.protocol === "file:") {
+          showCopyMessage("请通过汇总页面启动器打开后再保存审批 PDF", true);
+          return;
+        }
+        input.disabled = true;
+        choose.disabled = true;
+        save.disabled = true;
+        try {
+          const query = new URLSearchParams({
+            case_id: action.case_id,
+            source_dataset_revision: String(data.dataset_revision),
+            file_name: file.name,
+          });
+          const response = await fetch(`/api/summary-approval-pdf?${query}`, {
+            method: "POST",
+            headers: {"Content-Type": "application/pdf"},
+            body: file,
+          });
+          const result = await response.json();
+          if (!response.ok || !result.ok) {
+            throw new Error(result.error || "保存审批 PDF 失败");
+          }
+          showCopyMessage(result.message || "审批 PDF 已保存");
+          window.setTimeout(() => window.location.reload(), 350);
+        } catch (error) {
+          input.disabled = false;
+          choose.disabled = false;
+          save.disabled = false;
+          showCopyMessage(error.message || "保存审批 PDF 失败", true);
+        }
+      });
+      wrap.append(input, choose, selected, save);
+      return wrap;
+    }
+    function renderActionCell(action) {
+      const wrap = text("div", "", "action-cell");
+      const select = document.createElement("select");
+      select.setAttribute("aria-label", `${action.case_name} 人工审批结果`);
+      [
+        ["", "请选择"],
+        ["approved", "通过"],
+        ["rejected", "被拒绝"],
+      ].forEach(([value, label]) => {
+        const option = text("option", label);
+        option.value = value;
+        option.selected = value === (action.approval_result || "");
+        select.append(option);
+      });
+      const save = text("button", "保存", "save-result");
+      save.type = "button";
+      const remove = text("button", "删除", "delete-case");
+      remove.type = "button";
+      save.addEventListener("click", async () => {
+        if (!select.value) {
+          showCopyMessage("请选择“通过”或“被拒绝”", true);
+          return;
+        }
+        await submitSummaryAction(
+          {
+            action: "set_approval_result",
+            case_id: action.case_id,
+            approval_result: select.value,
+          },
+          [select, save, remove]
+        );
+      });
+      remove.addEventListener("click", async () => {
+        if (!window.confirm(`是否删除“${action.case_name}”？`)) return;
+        await submitSummaryAction(
+          {action: "delete_case", case_id: action.case_id},
+          [select, save, remove]
+        );
+      });
+      wrap.append(select, save, remove);
+      return wrap;
     }
     function renderSheet() {
       const sheet = data.sheets[activeIndex];

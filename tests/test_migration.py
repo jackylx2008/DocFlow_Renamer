@@ -16,6 +16,8 @@ from warranty_application_archive.flows.approval_review_flow import (
 )
 from warranty_application_archive.flows.approval_review_web_flow import (
     _file_drop_clipboard_data,
+    apply_summary_action,
+    attach_summary_approval_pdf,
     copy_file_to_macos_clipboard,
     export_approval_review_html,
     open_path_with_default_application,
@@ -530,7 +532,7 @@ class MigrationTest(unittest.TestCase):
             headers = sheet["headers"]
             row = sheet["rows"][0]
 
-            self.assertEqual(len(headers), 17)
+            self.assertEqual(len(headers), 18)
             self.assertNotIn("缺少材料", headers)
             self.assertNotIn("审批编号", headers)
             self.assertNotIn("案卷目录", headers)
@@ -591,9 +593,18 @@ class MigrationTest(unittest.TestCase):
                 row[9]["text"],
             )
             self.assertEqual(row[9]["tone"], "success")
-            self.assertEqual(headers[-2], "审批结果")
-            self.assertEqual(row[-2]["text"], "被拒绝")
-            self.assertEqual(row[-2]["tone"], "danger")
+            self.assertEqual(headers[-3], "审批结果")
+            self.assertEqual(headers[-1], "人工审批及\n操作")
+            self.assertEqual(row[-3]["text"], "被拒绝")
+            self.assertEqual(row[-3]["tone"], "danger")
+            self.assertEqual(
+                row[-1]["action"]["approval_result"],
+                "rejected",
+            )
+            self.assertEqual(
+                row[-1]["action"]["case_id"],
+                application["case_id"],
+            )
 
             business = application["application"]
             business["影响改动消防设备设施"] = "是"
@@ -621,6 +632,123 @@ class MigrationTest(unittest.TestCase):
                 matched_danger_cell["text"],
             )
             self.assertEqual(matched_danger_cell["tone"], "success")
+
+    def test_summary_action_saves_manual_approval_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            JsonRepository(primary).save(dataset)
+            current = JsonRepository(primary).load()
+            application = current["applications"][0]
+            initial_revision = int(current["dataset_revision"])
+
+            result = apply_summary_action(
+                primary,
+                Path(__file__).resolve().parents[1],
+                {
+                    "source_dataset_revision": initial_revision,
+                    "action": "set_approval_result",
+                    "case_id": application["case_id"],
+                    "approval_result": "rejected",
+                },
+            )
+
+            saved = JsonRepository(primary).load()
+            saved_application = saved["applications"][0]
+            self.assertEqual(result["dataset_revision"], initial_revision + 1)
+            self.assertEqual(
+                saved_application["approval"]["result"],
+                "rejected",
+            )
+            self.assertEqual(
+                saved_application["approval"]["result_source"],
+                "human_input",
+            )
+            html = (primary / "质保作业申请汇总.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("/api/summary-action", html)
+            self.assertIn('window.confirm(`是否删除“${action.case_name}”？`)', html)
+
+    def test_summary_attaches_user_selected_approval_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            JsonRepository(primary).save(dataset)
+            current = JsonRepository(primary).load()
+            application = current["applications"][0]
+            self.assertFalse((application.get("approval") or {}).get("pdfs"))
+            approval_cell = build_summary_view(current)["sheets"][0][
+                "rows"
+            ][0][16]
+            self.assertEqual(
+                approval_cell["action"]["kind"],
+                "approval_pdf_upload",
+            )
+
+            result = attach_summary_approval_pdf(
+                primary,
+                Path(__file__).resolve().parents[1],
+                case_id=application["case_id"],
+                source_dataset_revision=current["dataset_revision"],
+                file_name="人工选择审批单.pdf",
+                content=b"%PDF-1.4\n%%EOF\n",
+            )
+
+            saved = JsonRepository(primary).load()
+            saved_application = saved["applications"][0]
+            approval_files = saved_application["approval"]["pdfs"]
+            self.assertEqual(
+                result["dataset_revision"],
+                current["dataset_revision"] + 1,
+            )
+            self.assertEqual(saved_application["status"], "approved")
+            self.assertEqual(len(approval_files), 1)
+            archived = primary / approval_files[0]["path"]
+            self.assertTrue(archived.is_file())
+            self.assertEqual(archived.read_bytes(), b"%PDF-1.4\n%%EOF\n")
+            html = (primary / "质保作业申请汇总.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("人工选择审批单.pdf", html)
+            self.assertIn("/api/summary-approval-pdf", html)
+            self.assertFalse(
+                list((primary / ".docflow" / "manual_uploads").glob("*"))
+            )
+
+    def test_summary_action_deletes_case_to_recoverable_trash(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            primary, dataset, _stem = self._migrated_fixture(
+                Path(temporary_dir)
+            )
+            JsonRepository(primary).save(dataset)
+            current = JsonRepository(primary).load()
+            application = current["applications"][0]
+            case_directory = primary / application["case_directory"]
+            self.assertTrue(case_directory.is_dir())
+
+            apply_summary_action(
+                primary,
+                Path(__file__).resolve().parents[1],
+                {
+                    "source_dataset_revision": current["dataset_revision"],
+                    "action": "delete_case",
+                    "case_id": application["case_id"],
+                },
+            )
+
+            saved = JsonRepository(primary).load()
+            self.assertEqual(saved["applications"], [])
+            self.assertFalse(case_directory.exists())
+            trashed_cases = list((primary / "_trash" / "cases").iterdir())
+            self.assertEqual(len(trashed_cases), 1)
+            self.assertTrue(trashed_cases[0].is_dir())
+            self.assertEqual(
+                saved["changes"][-1]["action"],
+                "delete_case_to_trash",
+            )
 
     def test_worker_list_and_approval_pdf_subworkflows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

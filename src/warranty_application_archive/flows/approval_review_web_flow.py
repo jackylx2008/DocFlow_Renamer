@@ -4,18 +4,20 @@ import json
 import logging
 import mimetypes
 import os
+import shutil
 import struct
 import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from .approval_review_flow import (
     ApprovalReviewRepository,
@@ -29,6 +31,7 @@ from ..modules.constants import (
     APPROVAL_REVIEW_HTML_FILE_NAME,
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
     APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
+    INTERNAL_DIR_NAME,
     LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     SUMMARY_HTML_FILE_NAME,
@@ -38,11 +41,12 @@ from ..modules.file_utils import atomic_replace_text, ensure_within
 from ..modules.launchers import write_page_launchers
 from ..modules.repository import JsonRepository
 from ..modules.summary_html import export_summary_html
-from .archive_flow import append_run
+from .archive_flow import append_run, archive_reviewed_approval_pdf
 
 
 LOGGER = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 1024 * 1024
+MAX_APPROVAL_PDF_BYTES = 50 * 1024 * 1024
 CF_HDROP = 15
 GMEM_MOVEABLE_ZEROINIT = 0x0042
 
@@ -348,6 +352,210 @@ def save_and_apply_review_payload(
     }
 
 
+def apply_summary_action(
+    root: Path,
+    repo_root: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply one validated summary-page edit and rebuild derived pages."""
+    root = root.resolve()
+    data_repository = JsonRepository(root)
+    review_repository = ApprovalReviewRepository(root)
+    data = data_repository.load()
+    current_revision = int(data.get("dataset_revision") or 0)
+    submitted_revision = int(payload.get("source_dataset_revision") or 0)
+    if submitted_revision != current_revision:
+        raise ValueError("汇总页面已过期，请刷新页面后再操作")
+
+    case_id = str(payload.get("case_id") or "").strip()
+    if not case_id:
+        raise ValueError("缺少案卷 ID")
+    applications = data.get("applications") or []
+    matches = [
+        item for item in applications
+        if str(item.get("case_id") or "") == case_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("案卷不存在或案卷 ID 不唯一，请刷新页面")
+    application = matches[0]
+    action = str(payload.get("action") or "").strip()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    case_name = str(application.get("case_name") or case_id)
+
+    if action == "set_approval_result":
+        approval_result = str(payload.get("approval_result") or "").strip()
+        if approval_result not in {"approved", "rejected"}:
+            raise ValueError("人工审批结果只能是“通过”或“被拒绝”")
+        approval = application.setdefault("approval", {})
+        previous_result = str(approval.get("result") or "")
+        approval["result"] = approval_result
+        approval["result_source"] = "human_input"
+        approval["result_updated_at"] = now
+        application.setdefault("history", []).append(
+            {
+                "action": "set_approval_result",
+                "previous_result": previous_result,
+                "result": approval_result,
+                "at": now,
+            }
+        )
+        data.setdefault("changes", []).append(
+            {
+                "action": "set_approval_result",
+                "case_id": case_id,
+                "previous_result": previous_result,
+                "result": approval_result,
+                "at": now,
+            }
+        )
+        message = f"已保存“{case_name}”的人工审批结果"
+    elif action == "delete_case":
+        relative = str(application.get("case_directory") or "").strip()
+        if not relative:
+            raise ValueError("案卷目录为空，不能删除")
+        source = ensure_within(root / Path(relative), root)
+        cases_root = (root / "_cases").resolve()
+        try:
+            source.relative_to(cases_root)
+        except ValueError as exc:
+            raise ValueError("案卷目录不在 _cases 中，拒绝删除") from exc
+        target: Path | None = None
+        if source.exists():
+            if not source.is_dir():
+                raise ValueError("案卷路径不是文件夹，拒绝删除")
+            trash_root = root / TRASH_DIR_NAME / "cases"
+            trash_root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            target = ensure_within(trash_root / f"{stamp}_{source.name}", root)
+            shutil.move(str(source), str(target))
+        data["applications"] = [
+            item for item in applications
+            if str(item.get("case_id") or "") != case_id
+        ]
+        data.setdefault("changes", []).append(
+            {
+                "action": "delete_case_to_trash",
+                "source": str(source),
+                "target": str(target) if target else "",
+                "role": "case",
+                "case_id": case_id,
+                "result": "completed" if target else "record_only",
+                "at": now,
+            }
+        )
+        message = f"已删除“{case_name}”，案卷已移至 _trash"
+    else:
+        raise ValueError("不支持的汇总操作")
+
+    data["dataset_revision"] = current_revision + 1
+    append_run(
+        data,
+        "apply-summary-action",
+        {
+            "action": action,
+            "case_id": case_id,
+        },
+    )
+    data_repository.save(data)
+    export_summary_html(data, root)
+    review = build_approval_review(
+        data,
+        root,
+        repo_root,
+        existing=review_repository.load(),
+    )
+    data_repository.save(data)
+    review_repository.save(review)
+    export_approval_review_html(review, root)
+    return {
+        "dataset_revision": int(data["dataset_revision"]),
+        "message": message,
+    }
+
+
+def attach_summary_approval_pdf(
+    root: Path,
+    repo_root: Path,
+    *,
+    case_id: str,
+    source_dataset_revision: int,
+    file_name: str,
+    content: bytes,
+) -> dict[str, Any]:
+    """Attach one user-selected approval PDF to a summary-page case."""
+    root = root.resolve()
+    if not file_name.lower().endswith(".pdf"):
+        raise ValueError("只能选择 PDF 格式的审批单")
+    if b"%PDF-" not in content[:1024]:
+        raise ValueError("所选文件不是有效的 PDF")
+
+    data_repository = JsonRepository(root)
+    review_repository = ApprovalReviewRepository(root)
+    data = data_repository.load()
+    current_revision = int(data.get("dataset_revision") or 0)
+    if source_dataset_revision != current_revision:
+        raise ValueError("汇总页面已过期，请刷新页面后再操作")
+
+    matches = [
+        item for item in data.get("applications") or []
+        if str(item.get("case_id") or "") == case_id
+    ]
+    if len(matches) != 1:
+        raise ValueError("案卷不存在或案卷 ID 不唯一，请刷新页面")
+    application = matches[0]
+    if (application.get("approval") or {}).get("pdfs"):
+        raise ValueError("该案卷已有审批 PDF，请刷新页面")
+
+    safe_name = Path(file_name.replace("\\", "/")).name.strip()
+    if not safe_name or safe_name in {".", ".."}:
+        raise ValueError("审批 PDF 文件名无效")
+    upload_id = uuid.uuid4().hex
+    staging_dir = root / INTERNAL_DIR_NAME / "manual_uploads" / upload_id
+    staging_path = ensure_within(staging_dir / safe_name, root)
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        staging_path.write_bytes(content)
+        target = archive_reviewed_approval_pdf(
+            data,
+            root,
+            {
+                "path": staging_path.relative_to(root).as_posix(),
+                "sha256": "",
+            },
+            application,
+            f"summary-upload-{upload_id}",
+            "从质保作业申请汇总页面人工选择并保存",
+        )
+        data["dataset_revision"] = current_revision + 1
+        append_run(
+            data,
+            "attach-summary-approval-pdf",
+            {
+                "case_id": case_id,
+                "file_name": safe_name,
+                "target": str(target),
+            },
+        )
+        data_repository.save(data)
+        export_summary_html(data, root)
+        review = build_approval_review(
+            data,
+            root,
+            repo_root,
+            existing=review_repository.load(),
+        )
+        data_repository.save(data)
+        review_repository.save(review)
+        export_approval_review_html(review, root)
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    return {
+        "dataset_revision": int(data["dataset_revision"]),
+        "message": f"已为“{application.get('case_name') or case_id}”保存审批 PDF",
+    }
+
+
 def serve_approval_review(
     root: Path,
     host: str = "127.0.0.1",
@@ -442,18 +650,51 @@ def serve_approval_review(
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
-            request_path = urlparse(self.path).path
+            parsed_request = urlparse(self.path)
+            request_path = parsed_request.path
             if request_path not in {
                 "/api/decisions",
                 "/api/copy-file",
                 "/api/open-path",
+                "/api/summary-action",
+                "/api/summary-approval-pdf",
             }:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
-                if length <= 0 or length > MAX_REQUEST_BYTES:
+                request_limit = (
+                    MAX_APPROVAL_PDF_BYTES
+                    if request_path == "/api/summary-approval-pdf"
+                    else MAX_REQUEST_BYTES
+                )
+                if length <= 0 or length > request_limit:
                     raise ValueError("请求大小无效")
+                if request_path == "/api/summary-approval-pdf":
+                    query = parse_qs(parsed_request.query)
+                    case_id = str((query.get("case_id") or [""])[0]).strip()
+                    file_name = str(
+                        (query.get("file_name") or [""])[0]
+                    ).strip()
+                    try:
+                        source_revision = int(
+                            (query.get("source_dataset_revision") or [""])[0]
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("数据版本无效，请刷新页面") from exc
+                    if not case_id:
+                        raise ValueError("缺少案卷 ID")
+                    with lock:
+                        result = attach_summary_approval_pdf(
+                            root,
+                            repo_root,
+                            case_id=case_id,
+                            source_dataset_revision=source_revision,
+                            file_name=file_name,
+                            content=self.rfile.read(length),
+                        )
+                    self._send_json({"ok": True, **result})
+                    return
                 payload = json.loads(
                     self.rfile.read(length).decode("utf-8")
                 )
@@ -495,6 +736,15 @@ def serve_approval_review(
                         }
                     )
                     return
+                if request_path == "/api/summary-action":
+                    with lock:
+                        result = apply_summary_action(
+                            root,
+                            repo_root,
+                            payload,
+                        )
+                    self._send_json({"ok": True, **result})
+                    return
                 with lock:
                     result = save_and_apply_review_payload(
                         root,
@@ -502,7 +752,13 @@ def serve_approval_review(
                         payload,
                     )
                 self._send_json({"ok": True, **result})
-            except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            except (
+                FileExistsError,
+                FileNotFoundError,
+                RuntimeError,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
                 self._send_json(
                     {"ok": False, "error": str(exc)},
                     HTTPStatus.BAD_REQUEST,
