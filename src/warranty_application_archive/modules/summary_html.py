@@ -474,32 +474,33 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
     )
     output = root / SUMMARY_HTML_FILE_NAME
     atomic_replace_text(output, content)
-    entry_point = (
-        Path(__file__).resolve().parents[3]
-        / "serve_archive_review.py"
-    )
-    write_page_launchers(
-        root,
-        entry_point.parent,
-        [
-            sys.executable,
-            str(entry_point),
-            "--input-dir",
-            str(root),
-            "--page",
-            "summary",
-            "--port",
-            "0",
-        ],
-        [
-            "--page",
-            "summary",
-            "--port",
-            "0",
-        ],
-        windows_name=SUMMARY_LAUNCHER_FILE_NAME,
-        macos_name=SUMMARY_MACOS_LAUNCHER_FILE_NAME,
-    )
+    if not getattr(sys, "frozen", False):
+        entry_point = (
+            Path(__file__).resolve().parents[3]
+            / "serve_archive_review.py"
+        )
+        write_page_launchers(
+            root,
+            entry_point.parent,
+            [
+                sys.executable,
+                str(entry_point),
+                "--input-dir",
+                str(root),
+                "--page",
+                "summary",
+                "--port",
+                "0",
+            ],
+            [
+                "--page",
+                "summary",
+                "--port",
+                "0",
+            ],
+            windows_name=SUMMARY_LAUNCHER_FILE_NAME,
+            macos_name=SUMMARY_MACOS_LAUNCHER_FILE_NAME,
+        )
     return output
 
 

@@ -29,9 +29,10 @@ def setup_logger(
     root_logger.handlers.clear()
 
     formatter = logging.Formatter(LOG_FORMAT)
-    console = logging.StreamHandler()
-    console.setFormatter(formatter)
-    root_logger.addHandler(console)
+    if sys.stderr is not None:
+        console = logging.StreamHandler()
+        console.setFormatter(formatter)
+        root_logger.addHandler(console)
 
     file_handler = RotatingFileHandler(
         target,

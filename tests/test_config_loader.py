@@ -4,7 +4,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from warranty_application_archive.config_loader import AppConfig
+from warranty_application_archive.config_loader import (
+    AppConfig,
+    runtime_project_root,
+)
 
 
 CONFIG_TEXT = """app:
@@ -18,6 +21,15 @@ flows:
 
 
 class ConfigLoaderTest(unittest.TestCase):
+    def test_frozen_executable_finds_parent_project_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            (root / "config.yaml").write_text(CONFIG_TEXT, encoding="utf-8")
+            executable = root / "build" / "delivery" / "archive.exe"
+            executable.parent.mkdir(parents=True)
+
+            self.assertEqual(runtime_project_root(executable), root.resolve())
+
     def test_nested_cloudstation_path_and_platform_value_are_expanded(
         self,
     ) -> None:

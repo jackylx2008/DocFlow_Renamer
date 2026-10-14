@@ -8,7 +8,7 @@ from pathlib import Path
 
 from logging_config import setup_logger
 
-from ..config_loader import AppConfig
+from ..config_loader import AppConfig, runtime_project_root
 from ..modules.repository import JsonRepository
 from ..modules.summary_html import export_summary_html
 from .approval_review_flow import (
@@ -45,6 +45,8 @@ STATUS_LABELS = {
 
 
 def _repo_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return runtime_project_root()
     current_directory = Path.cwd().resolve()
     if (current_directory / "common.env").is_file():
         return current_directory

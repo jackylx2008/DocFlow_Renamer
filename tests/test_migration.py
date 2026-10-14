@@ -60,6 +60,7 @@ from warranty_application_archive.modules.summary_html import (
 )
 from warranty_application_archive.modules.validation import validate_summary_html
 from warranty_application_archive.flows.archive_flow import (
+    _approval_candidates,
     _archive_named_worker_list_batch,
     _classify_recognized_image,
     _find_duplicate_application,
@@ -913,6 +914,115 @@ class MigrationTest(unittest.TestCase):
                 / "工程类-主体质保施工_编号：202607240088.pdf"
             )
             self.assertTrue(archived_approval.is_file())
+
+    def test_new_approval_title_recovers_cached_material_routes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            inbox = root / "_inbox"
+            inbox.mkdir()
+            cases = [
+                {
+                    "case_id": "solar",
+                    "case_name": "维修太阳能",
+                    "case_directory": "_cases/solar",
+                    "status": "materials_ready",
+                    "application": {
+                        "施工区域": "屋面",
+                        "施工内容": "维修太阳能",
+                        "施工开始时间": "2026-10-13",
+                        "施工结束时间": "2026-10-31",
+                        "施工负责人联系电话": "19121927726",
+                    },
+                    "approval": {"pdfs": []},
+                },
+                {
+                    "case_id": "tower",
+                    "case_name": "维修冷塔",
+                    "case_directory": "_cases/tower",
+                    "status": "materials_ready",
+                    "application": {
+                        "施工区域": "L3M1层室外平台",
+                        "施工内容": "维修冷塔",
+                        "施工开始时间": "2026-10-13",
+                        "施工结束时间": "2026-10-31",
+                        "施工负责人联系电话": "19121927726",
+                    },
+                    "approval": {"pdfs": []},
+                },
+            ]
+            dataset = {
+                "applications": cases,
+                "input_routes": [],
+                "recognition_cache": {},
+                "unmatched_files": [],
+                "changes": [],
+            }
+            for index, content in enumerate(
+                ("维修太阳能", "维修冷却塔底部水盘"), start=1
+            ):
+                path = inbox / f"工程类-主体会展及商管区域质保施工{index}.pdf"
+                path.write_bytes(f"approval-{index}".encode())
+                fingerprint = sha256_file(path)
+                text = (
+                    "工程类~主体会展及商管区域质保施工"
+                    f"申请编号：20261014020{index}审批状态已通过"
+                    "施工区域l3m1层室外平台"
+                    "施工开始时间~施工结束时间2026~10~13至2026~10~31"
+                    f"施工内容{content}施工负责人联系电话+8619121927726"
+                    "影响,改动消防设备设施否"
+                )
+                dataset["recognition_cache"][fingerprint] = {
+                    "text": text,
+                    "method": "ocr",
+                }
+                dataset["input_routes"].append(
+                    {
+                        "sha256": fingerprint,
+                        "processing_path": f"_inbox/{path.name}",
+                        "kind": "application_material",
+                        "reason": "旧分类结果",
+                    }
+                )
+
+            count = ingest_approval_pdfs(dataset, root, root)
+
+            self.assertEqual(count, 2)
+            self.assertEqual(
+                [route["kind"] for route in dataset["input_routes"]],
+                ["approval_pdf", "approval_pdf"],
+            )
+            self.assertEqual(dataset["unmatched_files"], [])
+            for case in cases:
+                self.assertEqual(case["status"], "approved")
+                self.assertEqual(case["approval"]["result"], "approved")
+                self.assertEqual(len(case["approval"]["pdfs"]), 1)
+                self.assertTrue(
+                    (root / case["approval"]["pdfs"][0]["path"]).is_file()
+                )
+
+    def test_fallback_approval_match_requires_unique_case(self) -> None:
+        text = (
+            "工程类-主体会展及商管区域质保施工"
+            "申请编号：202610140210审批状态已通过"
+            "施工区域l3m1层室外平台"
+            "施工开始时间2026-10-13施工结束时间2026-10-31"
+            "施工内容维修太阳能施工负责人联系电话19121927726附件"
+        )
+        case = {
+            "status": "materials_ready",
+            "approval": {"pdfs": []},
+            "application": {
+                "施工区域": "屋面",
+                "施工内容": "维修太阳能",
+                "施工开始时间": "2026-10-13",
+                "施工结束时间": "2026-10-31",
+                "施工负责人联系电话": "19121927726",
+            },
+        }
+        self.assertEqual(
+            _approval_candidates(Path("a.pdf"), text, [case, deepcopy(case)]),
+            [],
+        )
 
     def test_new_application_intake_creates_case(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:

@@ -16,9 +16,10 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from ..config_loader import runtime_project_root
 from .approval_review_flow import (
     ApprovalReviewRepository,
     DECISION_OPTIONS,
@@ -259,25 +260,26 @@ def export_approval_review_html(
     )
     output = root / APPROVAL_REVIEW_HTML_FILE_NAME
     atomic_replace_text(output, html)
-    entry_point = (
-        Path(__file__).resolve().parents[3]
-        / "serve_archive_review.py"
-    )
-    write_page_launchers(
-        root,
-        entry_point.parent,
-        [
-            sys.executable,
-            str(entry_point),
-            "--input-dir",
-            str(root),
-            "--port",
-            "0",
-        ],
-        ["--port", "0"],
-        windows_name=APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
-        macos_name=APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
-    )
+    if not getattr(sys, "frozen", False):
+        entry_point = (
+            Path(__file__).resolve().parents[3]
+            / "serve_archive_review.py"
+        )
+        write_page_launchers(
+            root,
+            entry_point.parent,
+            [
+                sys.executable,
+                str(entry_point),
+                "--input-dir",
+                str(root),
+                "--port",
+                "0",
+            ],
+            ["--port", "0"],
+            windows_name=APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
+            macos_name=APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
+        )
     _archive_legacy_artifact(
         root,
         root / RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
@@ -562,10 +564,15 @@ def serve_approval_review(
     port: int = 8765,
     open_browser: bool = True,
     initial_page: str = "review",
+    on_server_ready: Callable[[ThreadingHTTPServer, str], None] | None = None,
 ) -> None:
     root = root.resolve()
     review_repository = ApprovalReviewRepository(root)
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = (
+        runtime_project_root()
+        if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parents[3]
+    )
     lock = threading.Lock()
 
     class ReviewHandler(BaseHTTPRequestHandler):
@@ -774,6 +781,8 @@ def serve_approval_review(
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     url = f"http://{display_host}:{server.server_port}/"
     LOGGER.info("本地文档页面服务已启动: %s", url)
+    if on_server_ready is not None:
+        on_server_ready(server, url)
     if initial_page == "review":
         LOGGER.info("审核结果将保存到: %s", review_repository.path)
     if open_browser:

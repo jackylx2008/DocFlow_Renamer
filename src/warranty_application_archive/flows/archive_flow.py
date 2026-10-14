@@ -723,6 +723,12 @@ def _is_approval_pdf(path: Path, text: str) -> tuple[bool, str]:
     if "工程类主体质保施工" in normalized_name:
         return True, "文件名包含工程类主体质保施工"
     normalized_text = legacy.normalize_match_text(text)
+    if (
+        re.search(r"工程类~?主体.{0,20}质保施工", normalized_text)
+        and re.search(r"(?:申请|审批)编号[：:]?\d{12}", normalized_text)
+        and approval_result_from_text(text)
+    ):
+        return True, "PDF 内容包含质保施工审批标题、编号及审批状态"
     if "工程类主体质保施工" in normalized_text:
         return True, "PDF 内容包含工程类主体质保施工"
     if (
@@ -1853,7 +1859,94 @@ def _approval_candidates(
         )
         if matched:
             candidates.append(application)
-    return candidates
+    if candidates:
+        return candidates
+
+    # Some returned approvals use a longer title and minor wording changes in
+    # the area or work content. Only accept a fallback when the approval has a
+    # final status and a single case also agrees on dates and worker phone.
+    if (
+        not approval_result_from_text(text)
+        or not legacy.extract_pdf_rename_application_no(text)
+    ):
+        return []
+    pdf_content = legacy.extract_pdf_construction_content(text)
+    pdf_area = legacy.extract_pdf_field_value(
+        text, "施工区域", ("施工开始时间", "施工结束时间", "施工内容")
+    )
+    pdf_phone = legacy.extract_pdf_field_value(
+        text, "施工负责人联系电话", ("影响", "危险作业", "附件")
+    )
+    phone = re.sub(r"\D", "", pdf_phone)[-11:]
+    if len(phone) != 11 or not pdf_content or not pdf_area:
+        return []
+    fallback: list[dict[str, Any]] = []
+    for application in applications:
+        if application.get("status") == "terminated" or (
+            application.get("approval") or {}
+        ).get("pdfs"):
+            continue
+        business = application.get("application") or {}
+        case_phone = re.sub(
+            r"\D", "", str(business.get("施工负责人联系电话") or "")
+        )[-11:]
+        if case_phone != phone or not legacy.pdf_construction_dates_match(
+            text,
+            str(business.get("施工开始时间") or ""),
+            str(business.get("施工结束时间") or ""),
+        ):
+            continue
+        area_key = legacy.normalize_pdf_ocr_match_text(
+            str(business.get("施工区域") or "")
+        )
+        area_matches = bool(
+            area_key and area_key in legacy.normalize_pdf_ocr_match_text(pdf_area)
+        )
+        content_key = legacy.normalize_match_text(
+            str(business.get("施工内容") or "")
+        )
+        content_matches = bool(content_key and content_key in pdf_content)
+        # Common short form: 冷塔 -> 冷却塔. The PDF may specify a smaller
+        # component, so keep the rest of the content as a prefix check.
+        expanded_content = content_key.replace("冷塔", "冷却塔")
+        content_variant_matches = bool(
+            content_key != expanded_content
+            and expanded_content in pdf_content
+        )
+        if content_matches or (area_matches and content_variant_matches):
+            fallback.append(application)
+    return fallback if len(fallback) == 1 else []
+
+
+def _reclassify_cached_approval_routes(
+    dataset: dict[str, Any], root: Path
+) -> int:
+    """Recover PDFs previously routed as materials by an older classifier."""
+    inbox = (root / "_inbox").resolve()
+    count = 0
+    for route in dataset.get("input_routes") or []:
+        if route.get("kind") != APPLICATION_MATERIAL_ROUTE:
+            continue
+        relative = Path(str(route.get("processing_path") or ""))
+        path = (root / relative).resolve()
+        if path.parent != inbox or path.suffix.lower() != PDF_SUFFIX:
+            continue
+        fingerprint = str(route.get("sha256") or "")
+        cached_text = str(
+            (dataset.get("recognition_cache") or {})
+            .get(fingerprint, {})
+            .get("text") or ""
+        )
+        if not cached_text or not path.is_file():
+            continue
+        is_approval, reason = _is_approval_pdf(path, cached_text)
+        if not is_approval or sha256_file(path) != fingerprint:
+            continue
+        route["kind"] = APPROVAL_PDF_ROUTE
+        route["reason"] = reason
+        count += 1
+        LOGGER.info("重新识别已分流 PDF 为审批单: %s (%s)", path.name, reason)
+    return count
 
 
 def _resolve_unmatched_path(root: Path, item: dict[str, Any]) -> Path:
@@ -1999,6 +2092,7 @@ def ingest_approval_pdfs(
     checkpoint: Callable[[dict[str, Any]], None] | None = None,
 ) -> int:
     root = root.resolve()
+    _reclassify_cached_approval_routes(dataset, root)
     applications = list(dataset.get("applications") or [])
     unmatched = list(dataset.get("unmatched_files") or [])
     known_paths = {str(item.get("path") or "") for item in unmatched}
@@ -2060,6 +2154,11 @@ def ingest_approval_pdfs(
                 continue
 
             application = candidates[0]
+            LOGGER.info(
+                "审批 PDF 自动唯一匹配: %s -> %s",
+                path.name,
+                application.get("case_name") or application.get("case_id"),
+            )
             application_no = (
                 approval_application_no(path.name)
                 or legacy.extract_pdf_rename_application_no(text)

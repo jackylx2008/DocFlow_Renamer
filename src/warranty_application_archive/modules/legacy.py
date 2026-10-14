@@ -845,7 +845,8 @@ def build_pdf_target_path(pdf_path: Path, application_no: str) -> Path:
 def extract_pdf_rename_application_no(pdf_text: str) -> str:
     normalized = normalize_digits(pdf_text or "")
     compact_text = re.sub(r"\s+", "", normalized)
-    if normalize_match_text("工程类-主体质保施工") not in normalize_match_text(normalized):
+    title = normalize_match_text(normalized)
+    if not re.search(r"工程类~?主体.{0,20}质保施工", title):
         return ""
 
     match = PDF_APPLICATION_NO_RE.search(compact_text)

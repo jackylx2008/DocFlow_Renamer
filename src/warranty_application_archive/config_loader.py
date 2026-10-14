@@ -13,6 +13,15 @@ import yaml
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
 
 
+def runtime_project_root(executable: Path | None = None) -> Path:
+    """Find project configuration beside a frozen EXE or its parent folders."""
+    directory = (executable or Path(sys.executable)).resolve().parent
+    for candidate in (directory, *list(directory.parents)[:3]):
+        if (candidate / "config.yaml").is_file():
+            return candidate
+    return directory
+
+
 def _read_env_file(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}

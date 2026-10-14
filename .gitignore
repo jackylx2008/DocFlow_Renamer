@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+.build-venv/
 common.env
 data/
 logs/
@@ -9,4 +10,8 @@ log/
 output/
 tmp/
 dist/
-build/
+build/*
+!build/build_run_archive_exe.ps1
+!build/delivery/
+build/delivery/*
+!build/delivery/质保作业申请归档.exe

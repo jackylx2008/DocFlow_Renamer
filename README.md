@@ -2,6 +2,10 @@
 
 质保作业申请案卷归档工具。项目以一份质保申请为一个案卷，完成申报材料入库、统一命名、审批 PDF 回传、JSON 归档和 HTML 人工审查视图生成。
 
+最近更新见 [更新记录](docs/CHANGELOG.md)。Windows 可直接运行
+`build/delivery/质保作业申请归档.exe`；源码默认命令行模式，使用
+`python run_archive.py --gui` 启动图形窗口。
+
 ## 核心原则
 
 - `质保作业申请数据.json` 是唯一事实数据源。
@@ -84,7 +88,8 @@
 
 1. 人工将飞书审批结束后生成的 PDF（通过或拒绝）放入 `_input`。
 2. 系统优先读取 PDF 文本，必要时调用本地多模态模型 OCR，判断是否为
-   “工程类-主体质保施工”审批 PDF。
+   “工程类-主体质保施工”或带有“会展及商管区域”等中间描述的质保施工审批 PDF；
+   新标题需同时识别到申请编号和最终审批状态。
 3. 审批 PDF 转入内部 `_inbox` 的审批归档流程；其他 PDF 标记为申请材料，
    不会进入审批匹配。
 4. 按施工区域、内容、开始时间和结束时间匹配已有案卷。
@@ -93,7 +98,10 @@
    被拒绝为 `rejected`，并更新案卷状态。
 7. 根据 JSON 更新汇总 HTML。
 
-自动匹配要求唯一且证据完整；成功匹配的结果直接视为可信。只有 `_inbox` 第一层中仍未匹配的 PDF 才进入独立人工审核流程：
+自动匹配优先要求施工区域、内容、起止日期严格命中。若区域写法不同，只有施工内容、
+起止日期和施工负责人电话一致且候选唯一时才自动匹配；若“冷塔”与“冷却塔”写法不同，
+还要求施工区域、起止日期和施工负责人电话一致且候选唯一。成功匹配的结果直接归档。
+只有 `_inbox` 第一层中仍未匹配的 PDF 才进入独立人工审核流程：
 
 1. 施工区域必须通过严格文本匹配（位置代码中紧邻数字的 OCR `i/l` 混淆会先
    归一化）；申请记录的施工内容经过规范化后，必须完整包含在审批 PDF 的
@@ -169,6 +177,26 @@ python migrate_archive.py `
 
 ```powershell
 python run_archive.py
+```
+
+Windows 图形模式使用同一个 `run_archive.py` 入口。启动后先执行增量归档，再显示本地服务控制
+窗口，可打开汇总页、人工审核页，或点击“更新归档”再次处理 `_input`：
+
+```powershell
+python run_archive.py --gui
+```
+
+项目图标位于 `assets/docflow_archive.png`，Windows 图标位于
+`assets/docflow_archive.ico`。双击 `build/delivery/质保作业申请归档.exe`
+可使用同一图形入口。EXE 向上定位项目根目录并读取其中的 `config.yaml` 和
+`common.env`，资料根目录仍由
+`INPUT_PATH` 决定；因此下载后应保留 `build/delivery` 相对项目根目录的
+位置，并在本机配置 `common.env`。窗口关闭时会停止本地页面服务。
+重新构建 EXE：
+
+```powershell
+python -m pip install -r requirements-build.txt
+.\build\build_run_archive_exe.ps1
 ```
 
 日常只需将文件放入 `_input` 第一层。程序不递归扫描子目录；支持 `.docx`、
@@ -336,7 +364,9 @@ python run_archive.py
 ## 项目结构
 
 ```text
-run_archive.py                     # 完整增量归档入口
+run_archive.py                     # 完整增量归档入口；--gui 打开图形窗口
+build/build_run_archive_exe.ps1    # Windows EXE 构建脚本
+assets/                            # PNG 与 ICO 项目图标
 migrate_archive.py                 # 旧目录迁移入口
 serve_archive_review.py            # 本地审核/汇总页面服务
 logging_config.py                  # 统一控制台与滚动文件日志
