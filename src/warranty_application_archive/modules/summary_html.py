@@ -583,6 +583,22 @@ _HTML_TEMPLATE = r"""<!doctype html>
     .drop-zone { margin-top:13px; border:1px dashed #91a3b8; border-radius:8px; padding:17px; color:var(--muted); text-align:center; background:#f7f9fc; }
     .drop-zone.dragging { border-color:var(--blue); color:var(--info); background:var(--info-bg); }
     .intake-status { margin-top:8px; color:var(--muted); font-size:13px; white-space:pre-line; }
+    .intake-review { position:fixed; inset:0; z-index:30; display:grid; place-items:center; padding:20px; background:rgba(23,35,50,.55); }
+    .intake-review-card { width:min(1120px,100%); max-height:92vh; overflow:auto; padding:22px; border:1px solid var(--line); border-radius:12px; background:var(--paper); box-shadow:var(--shadow); }
+    .intake-review-card h2 { margin:0 0 6px; color:var(--navy-dark); }
+    .intake-review-card>p { margin:0 0 14px; color:var(--muted); }
+    .intake-review-items { display:grid; gap:12px; }
+    .intake-review-item { padding:14px; border:1px solid var(--line); border-radius:9px; background:#f8fafc; }
+    .intake-review-item h3 { margin:0 0 8px; font-size:15px; overflow-wrap:anywhere; }
+    .intake-review-meta { color:var(--muted); font-size:13px; white-space:pre-line; }
+    .intake-review-controls { display:grid; grid-template-columns:minmax(180px,260px) 1fr; gap:12px; margin-top:10px; }
+    .intake-review-controls label { display:grid; gap:5px; font-size:13px; font-weight:700; }
+    .intake-review-controls select { min-height:38px; padding:7px; border:1px solid #aebccd; border-radius:7px; background:white; }
+    .intake-target-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:6px 12px; max-height:170px; overflow:auto; padding:8px; border:1px solid #c4cfdb; border-radius:7px; background:white; }
+    .intake-target-list label { display:flex; align-items:flex-start; gap:7px; font-weight:400; }
+    .intake-review-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
+    #confirmIntake { border:1px solid var(--navy); border-radius:7px; padding:9px 13px; color:white; background:var(--navy); cursor:pointer; font-weight:700; }
+    #confirmIntake:disabled { opacity:.6; cursor:wait; }
     .toolbar {
       display: flex;
       gap: 12px;
@@ -800,6 +816,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       .toolbar { align-items: stretch; flex-direction: column; }
       .intake-heading { align-items:stretch; flex-direction:column; }
       .intake-actions { flex-wrap:wrap; }
+      .intake-review-controls { grid-template-columns:1fr; }
       .search { width: 100%; }
       .table-wrap { max-height: none; }
       table { font-size: 10px; }
@@ -823,9 +840,18 @@ _HTML_TEMPLATE = r"""<!doctype html>
   </header>
   <main>
     <section class="workspace intake-panel" aria-label="文件输入">
-      <div class="intake-heading"><div><h2>文件输入与识别</h2><p>选择或拖入申请材料、人员名单和审批 PDF。文件先进入本地 _input；识别归档后可在待审核页面复核。</p><a href="/待人工审核匹配PDF.html">打开待人工审核页面</a></div><div class="intake-actions"><label class="choose-files" for="intakeFiles">选择文件</label><input id="intakeFiles" type="file" multiple><button id="processFiles" type="button">识别并归档</button></div></div>
+      <div class="intake-heading"><div><h2>文件输入与识别</h2><p>选择或拖入文件，点击 AI 识别后先人工复核分类和案卷归属。确认前文件只在临时区，不写入正式资料。</p><a href="/待人工审核匹配PDF.html">打开待人工审核页面</a></div><div class="intake-actions"><label class="choose-files" for="intakeFiles">选择文件</label><input id="intakeFiles" type="file" multiple><button id="recognizeFiles" type="button">AI 识别</button></div></div>
       <div id="dropZone" class="drop-zone" tabindex="0">支持多文件：可一次拖入多个文件，也可分批拖入</div>
       <div id="intakeStatus" class="intake-status" role="status">仅本机页面可以提交文件。识别和归档由本地程序执行。</div>
+    </section>
+    <section id="intakeReview" class="intake-review" hidden aria-modal="true" role="dialog" aria-labelledby="intakeReviewTitle">
+      <div class="intake-review-card">
+        <h2 id="intakeReviewTitle">识别结果人工确认</h2>
+        <p>请核对 AI/OCR 分类和目标案卷。确认前文件仅保留在临时暂存区，不会写入资料目录或正式 JSON。</p>
+        <div id="intakeReviewItems" class="intake-review-items"></div>
+        <div id="intakeReviewStatus" class="intake-status" role="status"></div>
+        <div class="intake-review-actions"><button id="discardIntake" type="button" class="choose-files">取消并清除暂存</button><button id="confirmIntake" type="button">确认并归档</button></div>
+      </div>
     </section>
     <section class="metrics" aria-label="汇总指标">
       <div class="metric"><strong id="totalMetric">0</strong><span>案卷总数</span></div>
@@ -1301,6 +1327,18 @@ _HTML_TEMPLATE = r"""<!doctype html>
     const dropZone = byId("dropZone");
     const intakeStatus = byId("intakeStatus");
     const selectedIntakeFiles = new Map();
+    const intakeRoleLabels = {
+      signed_application: "手签申请单",
+      worker_list: "施工人员名单（可关联本批多个申请）",
+      confined_space: "有限空间申请",
+      high_altitude: "高处作业申请",
+      special_work: "专项作业材料",
+      word: "质保申请单",
+      approval_pdf: "审批 PDF",
+      application_material: "其他申请材料 PDF",
+    };
+    const imageRoles = ["signed_application", "worker_list", "confined_space", "high_altitude", "special_work"];
+    let intakeReviewState = null;
     const intakeFileKey = (file) => `${file.name}\u0000${file.size}\u0000${file.lastModified}`;
     function selectIntakeFiles(files) {
       for (const file of files) selectedIntakeFiles.set(intakeFileKey(file), file);
@@ -1325,59 +1363,156 @@ _HTML_TEMPLATE = r"""<!doctype html>
       });
     }
     dropZone.addEventListener("drop", (event) => selectIntakeFiles(event.dataTransfer.files));
-    byId("processFiles").addEventListener("click", async () => {
+    function renderIntakeReview(review) {
+      intakeReviewState = review;
+      const list = byId("intakeReviewItems");
+      list.replaceChildren();
+      for (const item of review.files) {
+        const card = text("article", "", "intake-review-item");
+        card.dataset.fileName = item.name;
+        card.append(text("h3", item.name));
+        const recognition = item.error ? `识别提示：${item.error}` : `AI 建议：${intakeRoleLabels[item.role] || "未能自动分类"}`;
+        card.append(text("div", `${recognition}${item.reason ? `\n依据：${item.reason}` : ""}\n${item.text || "无可显示的识别文字"}`, "intake-review-meta"));
+        if (item.business && Object.keys(item.business).length) {
+          card.append(text("div", `申请字段：${Object.entries(item.business).map(([key, value]) => `${key}：${value || ""}`).join("；")}`, "intake-review-meta"));
+        }
+        const controls = text("div", "", "intake-review-controls");
+        const roleLabel = text("label", "材料类型");
+        const roleSelect = document.createElement("select");
+        const choices = item.kind === "docx"
+          ? ["word"]
+          : item.kind === "pdf"
+            ? ["approval_pdf", "application_material"]
+            : imageRoles;
+        for (const role of choices) {
+          const option = text("option", intakeRoleLabels[role]);
+          option.value = role;
+          roleSelect.append(option);
+        }
+        if (choices.includes(item.role)) roleSelect.value = item.role;
+        item.reviewRole = roleSelect.value;
+        roleSelect.addEventListener("change", () => { item.reviewRole = roleSelect.value; });
+        roleLabel.append(roleSelect);
+        controls.append(roleLabel);
+        if (item.kind === "image") {
+          const targetsLabel = text("label", "归属本批施工申请（名单可多选共用）");
+          const targets = text("div", "", "intake-target-list");
+          if (!review.targets.length) {
+            targets.append(text("div", "本批次未包含施工申请 Word，图片材料无法归档。"));
+          }
+          for (const target of review.targets) {
+            const label = document.createElement("label");
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.value = target.token;
+            label.append(checkbox, text("span", target.name));
+            targets.append(label);
+          }
+          targetsLabel.append(targets);
+          controls.append(targetsLabel);
+        }
+        card.append(controls);
+        list.append(card);
+      }
+      byId("intakeReviewStatus").textContent = "逐项确认分类和本批申请归属；工人名单可以关联本批多个施工申请。不会匹配现存案卷。确认后才会写入正式资料。";
+      byId("intakeReview").hidden = false;
+    }
+    async function postJson(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok) throw new Error(result.error || "请求失败");
+      return result;
+    }
+    byId("recognizeFiles").addEventListener("click", async () => {
       if (location.protocol === "file:") {
         intakeStatus.textContent = "请使用本项目 main.py 启动本地 HTML 工作台后再提交文件。";
         return;
       }
-      const button = byId("processFiles");
+      if (!selectedIntakeFiles.size) {
+        intakeStatus.textContent = "请先拖入或选择一个或多个文件。";
+        return;
+      }
+      const button = byId("recognizeFiles");
+      button.disabled = true;
+      let activeBatchId = "";
+      try {
+        const batch = [...selectedIntakeFiles.values()];
+        const batchId = crypto.randomUUID();
+        activeBatchId = batchId;
+        intakeStatus.textContent = `正在临时暂存 ${batch.length} 个文件，随后调用 AI 识别…`;
+        const outcomes = await Promise.allSettled(batch.map(async (file) => {
+          const response = await fetch(`/api/intake-stage-file?batch_id=${encodeURIComponent(batchId)}&name=${encodeURIComponent(file.name)}`, {
+            method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: file,
+          });
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error(result.error || `${file.name} 暂存失败`);
+          return result.file_name;
+        }));
+        const failed = outcomes.flatMap((result, index) => result.status === "rejected" ? [`${batch[index].name}: ${result.reason?.message || "暂存失败"}`] : []);
+        if (failed.length) throw new Error(failed.join("\n"));
+        intakeFiles.value = "";
+        intakeStatus.textContent = "正在识别文件内容，请稍候…";
+        const review = await postJson("/api/intake-recognize", {batch_id: batchId});
+        intakeReviewState = {batchId, files: review.files, targets: review.targets};
+        renderIntakeReview(intakeReviewState);
+      } catch (error) {
+        if (activeBatchId) {
+          try { await postJson("/api/intake-discard", {batch_id: activeBatchId}); } catch (_) {}
+        }
+        intakeStatus.textContent = error.message || "识别失败，请重试。";
+      } finally {
+        button.disabled = false;
+      }
+    });
+    byId("discardIntake").addEventListener("click", async () => {
+      if (!intakeReviewState) return;
+      const button = byId("discardIntake");
       button.disabled = true;
       try {
-        let uploadFailures = [];
-        if (selectedIntakeFiles.size) {
-          const batch = [...selectedIntakeFiles.entries()];
-          intakeStatus.textContent = `正在上传 ${batch.length} 个文件…`;
-          const results = new Array(batch.length);
-          let nextUpload = 0;
-          const uploadNext = async () => {
-            while (nextUpload < batch.length) {
-              const index = nextUpload++;
-              const [key, file] = batch[index];
-              try {
-                const response = await fetch(`/api/input-file?name=${encodeURIComponent(file.name)}`, {
-                  method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: file,
-                });
-                const result = await response.json();
-                if (!response.ok || !result.ok) throw new Error(result.error || `${file.name} 上传失败`);
-                selectedIntakeFiles.delete(key);
-                results[index] = {status: "fulfilled"};
-              } catch (reason) {
-                results[index] = {status: "rejected", reason};
-              }
-            }
-          };
-          await Promise.all(Array.from({length: Math.min(4, batch.length)}, uploadNext));
-          uploadFailures = results.flatMap((result, index) => result.status === "rejected"
-            ? [`${batch[index][1].name}: ${result.reason?.message || "上传失败"}`]
-            : []);
-          intakeFiles.value = "";
-          if (selectedIntakeFiles.size) {
-            intakeStatus.textContent = `已上传 ${batch.length - uploadFailures.length} 个；失败 ${uploadFailures.length} 个，失败文件保留在队列中。\n${uploadFailures.join("\n")}`;
-          }
-          if (batch.length === uploadFailures.length) throw new Error(uploadFailures.join("\n"));
-        }
-        intakeStatus.textContent = "正在进行 AI 识别和归档，请稍候…";
-        const response = await fetch("/api/process-input", {method: "POST"});
-        const result = await response.json();
-        if (!response.ok || !result.ok) throw new Error(result.error || "处理失败");
-        if (uploadFailures.length) {
-          intakeStatus.textContent = `${result.message}\n以下文件上传失败，仍保留在队列中；请处理后重试。\n${uploadFailures.join("\n")}\n请刷新页面查看归档结果。`;
-        } else {
-          intakeStatus.textContent = `${result.message}\n页面即将刷新。请在待人工审核页面处理未自动匹配的审批 PDF。`;
-          window.setTimeout(() => location.reload(), 1200);
-        }
+        await postJson("/api/intake-discard", {batch_id: intakeReviewState.batchId});
+        intakeReviewState = null;
+        byId("intakeReview").hidden = true;
+        intakeStatus.textContent = "已取消；文件仍在浏览器选择队列中，没有归档。";
       } catch (error) {
-        intakeStatus.textContent = error.message || "提交失败，请查看程序日志。";
+        byId("intakeReviewStatus").textContent = error.message || "清除暂存失败。";
+      } finally {
+        button.disabled = false;
+      }
+    });
+    byId("confirmIntake").addEventListener("click", async () => {
+      if (!intakeReviewState) return;
+      const button = byId("confirmIntake");
+      const decisions = [];
+      for (const card of byId("intakeReviewItems").querySelectorAll(".intake-review-item")) {
+        const item = intakeReviewState.files.find((candidate) => candidate.name === card.dataset.fileName);
+        const role = card.querySelector("select").value;
+        const targets = [...card.querySelectorAll(".intake-target-list input:checked")].map((node) => node.value);
+        if (item.kind === "image" && !targets.length) {
+          byId("intakeReviewStatus").textContent = intakeReviewState.targets.length
+            ? `请先为“${item.name}”选择本批次的施工申请。`
+            : `本批次没有施工申请 Word，不能归档图片“${item.name}”。`;
+          return;
+        }
+        if (item.kind === "image" && role !== "worker_list" && targets.length !== 1) {
+          byId("intakeReviewStatus").textContent = `“${item.name}”只能关联一个案卷。`;
+          return;
+        }
+        decisions.push({name: item.name, role, targets});
+      }
+      button.disabled = true;
+      byId("intakeReviewStatus").textContent = "正在按人工确认结果归档…";
+      try {
+        const result = await postJson("/api/intake-confirm", {batch_id: intakeReviewState.batchId, decisions});
+        selectedIntakeFiles.clear();
+        intakeReviewState = null;
+        byId("intakeReviewStatus").textContent = `${result.message} 页面即将刷新。`;
+        window.setTimeout(() => location.reload(), 1200);
+      } catch (error) {
+        byId("intakeReviewStatus").textContent = error.message || "归档失败，请检查后重试。";
       } finally {
         button.disabled = false;
       }

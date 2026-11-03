@@ -850,6 +850,77 @@ def _archive_material_once(
     return True
 
 
+def archive_reviewed_image(
+    dataset: dict[str, Any],
+    source: Path,
+    original_name: str,
+    role: str,
+    applications: list[dict[str, Any]],
+    root: Path,
+) -> int:
+    """Copy one human-reviewed image into each selected application case."""
+    if role not in {
+        SIGNED_APPLICATION_ROLE,
+        WORKER_LIST_ROLE,
+        CONFINED_SPACE_ROLE,
+        HIGH_ALTITUDE_ROLE,
+        SPECIAL_WORK_ROLE,
+    }:
+        raise ValueError(f"不支持的图片材料类型: {role}")
+    source = source.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"待审核图片不存在: {source}")
+    root = root.resolve()
+    fingerprint = sha256_file(source)
+    copied = 0
+    for application in applications:
+        if application.get("status") == "terminated":
+            raise ValueError("不能将施工人员名单等材料归入已终止案卷")
+        if _application_contains_hash(application, fingerprint):
+            continue
+        materials = application.setdefault("materials", {})
+        role_files = materials.setdefault(role, [])
+        index = len(role_files) + 1
+        case_name = str(application.get("case_name") or "")
+        target = (
+            root
+            / str(application.get("case_directory") or "")
+            / material_file_name(case_name, role, index, source.suffix)
+        )
+        target = ensure_within(target, root / CASES_DIR_NAME)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise FileExistsError(f"案卷目标文件已存在: {target}")
+        shutil.copy2(source, target)
+        if sha256_file(target) != fingerprint:
+            target.unlink(missing_ok=True)
+            raise RuntimeError(f"人工确认材料复制校验失败: {target}")
+        record = file_record(
+            target,
+            target,
+            root,
+            role,
+            fingerprint=fingerprint,
+        )
+        record["original_name"] = original_name
+        role_files.append(record)
+        dataset.setdefault("changes", []).append(
+            {
+                "action": "copy_after_human_review",
+                "source": original_name,
+                "target": relative_posix(target, root),
+                "role": role,
+                "case_id": str(application.get("case_id") or ""),
+                "sha256": fingerprint,
+                "result": "completed",
+                "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+        _refresh_status(application)
+        copied += 1
+    return copied
+
+
 def _applications_missing_worker_list(
     applications: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1306,6 +1377,8 @@ def route_input_files(
     repo_root: Path,
     checkpoint: Callable[[dict[str, Any]], None] | None = None,
     input_batch_id: str = "",
+    human_reviewed_intake: bool = False,
+    reviewed_input_roles: dict[str, str] | None = None,
 ) -> dict[str, int]:
     """Classify the public _input drop zone before business workflows run."""
     root = root.resolve()
@@ -1344,7 +1417,11 @@ def route_input_files(
             root,
         )
     )
-    if named_worker_list_count != input_word_count and not replacement_only:
+    if (
+        named_worker_list_count != input_word_count
+        and not replacement_only
+        and not human_reviewed_intake
+    ):
         message = (
             "_input 中工人名单与质保单数量不一致，已停止文件保存和 JSON "
             f"入库：工人名单={named_worker_list_count}；"
@@ -1352,6 +1429,8 @@ def route_input_files(
         )
         LOGGER.error(message)
         raise ValueError(message)
+    if human_reviewed_intake and named_worker_list_count != input_word_count:
+        LOGGER.info("人工审核批次由审核清单确定施工人员名单归属，跳过旧版数量一一对应限制")
     if replacement_only:
         LOGGER.info(
             "_input 中 %d 份质保单均命中已有申请，按覆盖更新批次处理",
@@ -1370,33 +1449,39 @@ def route_input_files(
             reason = "Word 或图片进入申请材料流程"
             recognition_method = ""
             if source.suffix.lower() == PDF_SUFFIX:
-                LOGGER.info("开始判断 _input PDF 类型: %s", source.name)
-                is_approval, reason = _is_approval_pdf(source, "")
-                if is_approval:
-                    recognition_method = "filename"
+                reviewed_role = (reviewed_input_roles or {}).get(source.name)
+                if reviewed_role in {APPROVAL_PDF_ROLE, "application_material"}:
+                    is_approval = reviewed_role == APPROVAL_PDF_ROLE
+                    reason = "人工确认 PDF 分类"
+                    recognition_method = "human_review"
                 else:
-                    try:
-                        text = recognition.pdf_text(source)
-                    except Exception as exc:
-                        LOGGER.warning(
-                            "_input PDF 类型识别失败，保留在 _input: %s (%s)",
-                            source.name,
-                            exc,
+                    LOGGER.info("开始判断 _input PDF 类型: %s", source.name)
+                    is_approval, reason = _is_approval_pdf(source, "")
+                    if is_approval:
+                        recognition_method = "filename"
+                    else:
+                        try:
+                            text = recognition.pdf_text(source)
+                        except Exception as exc:
+                            LOGGER.warning(
+                                "_input PDF 类型识别失败，保留在 _input: %s (%s)",
+                                source.name,
+                                exc,
+                            )
+                            continue
+                        if checkpoint:
+                            checkpoint(dataset)
+                        is_approval, reason = _is_approval_pdf(
+                            source,
+                            text,
                         )
-                        continue
-                    if checkpoint:
-                        checkpoint(dataset)
-                    is_approval, reason = _is_approval_pdf(
-                        source,
-                        text,
-                    )
-                    recognition_method = str(
-                        (
-                            (dataset.get("recognition_cache") or {})
-                            .get(fingerprint, {})
-                            .get("method", "unknown")
+                        recognition_method = str(
+                            (
+                                (dataset.get("recognition_cache") or {})
+                                .get(fingerprint, {})
+                                .get("method", "unknown")
+                            )
                         )
-                    )
                 route_kind = (
                     APPROVAL_PDF_ROUTE
                     if is_approval

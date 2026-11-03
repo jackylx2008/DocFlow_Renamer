@@ -8,6 +8,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -32,24 +33,259 @@ from ..modules.constants import (
     APPROVAL_REVIEW_LAUNCHER_FILE_NAME,
     APPROVAL_REVIEW_MACOS_LAUNCHER_FILE_NAME,
     INTERNAL_DIR_NAME,
+    APPROVAL_PDF_ROLE,
+    CONFINED_SPACE_ROLE,
+    HIGH_ALTITUDE_ROLE,
     LEGACY_APPROVAL_REVIEW_EXCEL_FILE_NAME,
     RETIRED_APPROVAL_REVIEW_EXCEL_FILE_NAME,
+    SIGNED_APPLICATION_ROLE,
+    SPECIAL_WORK_ROLE,
     SUMMARY_HTML_FILE_NAME,
     TRASH_DIR_NAME,
+    WORD_ROLE,
+    WORKER_LIST_ROLE,
 )
-from ..modules.file_utils import atomic_replace_text, ensure_within
+from ..modules.file_utils import atomic_replace_text, ensure_within, sha256_file
 from ..modules.browser_window import open_page_on_primary_monitor
 from ..modules.launchers import write_page_launchers
+from ..modules import legacy
 from ..modules.repository import JsonRepository
 from ..modules.summary_html import export_summary_html
-from .archive_flow import append_run, archive_reviewed_approval_pdf
+from ..modules.recognition import RecognitionService
+from .archive_flow import (
+    _classify_recognized_image,
+    _is_approval_pdf,
+    _matching_duplicate_applications,
+    append_run,
+    archive_reviewed_approval_pdf,
+    archive_reviewed_image,
+)
 from .migration_flow import apply_migration_plan, build_migration_plan, verify_backup
 
 
 LOGGER = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_APPROVAL_PDF_BYTES = 50 * 1024 * 1024
+INTAKE_IMAGE_ROLES = {
+    SIGNED_APPLICATION_ROLE,
+    WORKER_LIST_ROLE,
+    CONFINED_SPACE_ROLE,
+    HIGH_ALTITUDE_ROLE,
+    SPECIAL_WORK_ROLE,
+}
 _MIGRATION_SETUP_HTML = r'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>初始化归档资料</title><style>body{margin:0;background:#edf2f7;color:#182536;font:16px "Microsoft YaHei UI",sans-serif}main{max-width:900px;margin:7vh auto;padding:28px;background:white;border:1px solid #afbdcc;border-radius:12px}h1{margin-top:0;color:#354357}p{color:#627287;line-height:1.7}button,input{font:inherit;padding:10px 13px;border:1px solid #9aabbe;border-radius:7px}button{background:#44546a;color:white;cursor:pointer}input{width:min(100%,600px)}pre{white-space:pre-wrap;color:#354357;background:#f5f8fb;padding:14px;border-radius:8px}</style><main><h1>旧目录迁移</h1><p>先生成并检查迁移计划。执行前需准备与当前资料目录内容一致的备份，并填写备份目录路径。程序会核验文件大小和 SHA-256 后才开始迁移。</p><button id="preview">生成迁移计划</button><pre id="result">尚未生成计划。</pre><label>备份目录路径<br><input id="backup" placeholder="例如 D:\\ArchiveBackup"></label><p><button id="apply" disabled>校验备份并执行迁移</button></p><script>let ready=false;const out=document.querySelector("#result");document.querySelector("#preview").onclick=async()=>{out.textContent="正在解析旧目录…";try{let r=await fetch("/api/migration-plan",{method:"POST"}),d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||"生成计划失败");ready=true;document.querySelector("#apply").disabled=false;out.textContent=`案卷：${d.applications}\n待匹配文件：${d.unmatched_files}\n文件操作：${d.operations}\n警告：\n${d.warnings.join("\n")||"无"}`}catch(e){out.textContent=e.message}};document.querySelector("#apply").onclick=async()=>{if(!ready)return;let backup_dir=document.querySelector("#backup").value.trim();if(!backup_dir||!confirm("确认使用该备份执行迁移？文件将按计划移动。"))return;out.textContent="正在校验备份并迁移…";try{let r=await fetch("/api/migration-apply",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({backup_dir})}),d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||"迁移失败");out.textContent="迁移完成，正在打开汇总页面…";location.href="/质保作业申请汇总.html"}catch(e){out.textContent=e.message}};</script></main></html>'''
+
+
+def _safe_intake_batch_id(value: object) -> str:
+    try:
+        return str(uuid.UUID(str(value)))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError("输入批次无效，请重新拖入文件") from exc
+
+
+def _recognize_intake_batch(
+    root: Path,
+    repo_root: Path,
+    batch_dir: Path,
+) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    incoming_words: list[dict[str, Any]] = []
+    with RecognitionService({"recognition_cache": {}}, repo_root) as recognition:
+        for path in sorted(batch_dir.iterdir(), key=lambda item: item.name.casefold()):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            item: dict[str, Any] = {
+                "name": path.name,
+                "sha256": sha256_file(path),
+                "kind": "image" if suffix in {".jpg", ".jpeg", ".png"} else suffix.lstrip("."),
+                "role": "",
+                "text": "",
+                "business": {},
+                "error": "",
+            }
+            try:
+                if suffix == ".docx":
+                    parsed = legacy.parse_document(path)
+                    item["role"] = WORD_ROLE
+                    item["business"] = {
+                        key: parsed.get(key, "")
+                        for key in ("施工开始时间", "施工结束时间", "施工内容", "施工区域")
+                    }
+                    incoming_words.append({
+                        "token": f"incoming:{path.name}",
+                        "name": f"本批申请：{parsed.get('施工开始时间', '')} {parsed.get('施工内容', '')}",
+                        "business": item["business"],
+                    })
+                    item["text"] = "申请单字段已解析，可人工核对。"
+                elif suffix == ".pdf":
+                    text = recognition.pdf_text(path)
+                    is_approval, reason = _is_approval_pdf(path, text)
+                    item["role"] = APPROVAL_PDF_ROLE if is_approval else "application_material"
+                    item["text"] = text[:2400]
+                    item["reason"] = reason
+                else:
+                    text = recognition.image_text(path)
+                    item["role"] = _classify_recognized_image(text) or ""
+                    item["text"] = text[:2400]
+            except Exception as exc:
+                LOGGER.warning("输入文件识别失败，等待人工分类: %s (%s)", path.name, exc)
+                item["error"] = str(exc)
+            files.append(item)
+
+    return {"files": files, "targets": incoming_words}
+
+
+def _apply_intake_review(
+    root: Path,
+    repo_root: Path,
+    batch_dir: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    decisions = payload.get("decisions")
+    if not isinstance(decisions, list) or not decisions:
+        raise ValueError("没有待确认文件")
+    staged = {path.name: path for path in batch_dir.iterdir() if path.is_file()}
+    submitted = {
+        str(item.get("name") or ""): item
+        for item in decisions
+        if isinstance(item, dict)
+    }
+    if set(submitted) != set(staged):
+        raise ValueError("审核列表与暂存文件不一致，请重新识别")
+
+    input_dir = root / "_input"
+    current_dataset = JsonRepository(root).load()
+    word_targets = {
+        name: legacy.parse_document(path)
+        for name, path in staged.items()
+        if path.suffix.lower() == ".docx"
+    }
+    reviewed_pdf_roles = {
+        name: str(decision.get("role") or "")
+        for name, decision in submitted.items()
+        if staged[name].suffix.lower() == ".pdf"
+    }
+    image_decisions = {
+        name: decision
+        for name, decision in submitted.items()
+        if staged[name].suffix.lower() in {".jpg", ".jpeg", ".png"}
+    }
+    batch_word_names = set(word_targets)
+    if image_decisions and not batch_word_names:
+        raise ValueError("本批次没有施工申请 Word，图片材料无法归档")
+
+    image_word_targets: set[str] = set()
+    for decision in image_decisions.values():
+        targets = decision.get("targets")
+        if isinstance(targets, list):
+            image_word_targets.update(str(token) for token in targets)
+    targeted_word_names = {
+        token[len("incoming:"):]
+        for token in image_word_targets
+        if token.startswith("incoming:")
+    }
+    targeted_business_keys: dict[tuple[str, str, str, str], str] = {}
+    for word_name in targeted_word_names:
+        parsed = word_targets.get(word_name)
+        if parsed is None:
+            continue
+        matching_existing = _matching_duplicate_applications(
+            parsed,
+            current_dataset.get("applications") or [],
+        )
+        if matching_existing:
+            raise ValueError(
+                f"本批申请“{word_name}”与现存案卷重复，不能把本批图片关联到现存案卷"
+            )
+        key = tuple(
+            str(parsed.get(field) or "")
+            for field in ("施工开始时间", "施工结束时间", "施工内容", "施工区域")
+        )
+        previous = targeted_business_keys.get(key)
+        if previous is not None:
+            raise ValueError(
+                f"本批申请“{previous}”和“{word_name}”字段相同，无法区分图片归属"
+            )
+        targeted_business_keys[key] = word_name
+
+    for name, path in staged.items():
+        role = str(submitted[name].get("role") or "")
+        suffix = path.suffix.lower()
+        if suffix == ".docx" and role != WORD_ROLE:
+            raise ValueError(f"Word 申请单类型不能更改：{name}")
+        if suffix == ".pdf" and role not in {APPROVAL_PDF_ROLE, "application_material"}:
+            raise ValueError(f"PDF 类型无效：{name}")
+        if suffix in {".jpg", ".jpeg", ".png"} and role not in INTAKE_IMAGE_ROLES:
+            raise ValueError(f"请确认图片材料类型：{name}")
+        if suffix not in {".docx", ".pdf", ".jpg", ".jpeg", ".png"}:
+            raise ValueError(f"不支持的归档文件类型：{name}")
+        if suffix in {".docx", ".pdf"} and (input_dir / name).exists():
+            raise FileExistsError(f"_input 已有同名文件，未执行归档：{name}")
+        if suffix in {".jpg", ".jpeg", ".png"}:
+            targets = submitted[name].get("targets")
+            if not isinstance(targets, list) or not targets:
+                raise ValueError(f"请为图片选择本批次的施工申请：{name}")
+            target_tokens = [str(token) for token in targets]
+            if role != WORKER_LIST_ROLE and len(targets) != 1:
+                raise ValueError(f"只有施工人员名单允许关联本批多个申请：{name}")
+            if role == WORKER_LIST_ROLE and len(set(target_tokens)) != len(target_tokens):
+                raise ValueError(f"施工人员名单的本批申请目标重复：{name}")
+            for token in target_tokens:
+                if not token.startswith("incoming:") or token[len("incoming:"):] not in word_targets:
+                    raise ValueError(f"图片只能关联本批次的施工申请 Word，不能选现存案卷：{name}")
+
+    input_dir.mkdir(parents=True, exist_ok=True)
+    for name, path in staged.items():
+        if path.suffix.lower() in {".docx", ".pdf"}:
+            shutil.move(str(path), str(input_dir / name))
+
+    if any(path.suffix.lower() in {".docx", ".pdf"} for path in staged.values()):
+        from .application_flow import run_archive
+
+        run_archive(
+            root,
+            human_reviewed_intake=True,
+            reviewed_input_roles=reviewed_pdf_roles,
+        )
+
+    repository = JsonRepository(root)
+    data = repository.load()
+    applications = list(data.get("applications") or [])
+    attached = 0
+    for name, decision in submitted.items():
+        source = staged[name]
+        if source.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            continue
+        targets: list[dict[str, Any]] = []
+        for raw_token in decision.get("targets") or []:
+            token = str(raw_token)
+            parsed = word_targets[token[len("incoming:"):]]
+            keys = ("施工开始时间", "施工结束时间", "施工内容", "施工区域")
+            expected = tuple(str(parsed.get(key) or "") for key in keys)
+            matches = [
+                app for app in applications
+                if tuple(str((app.get("application") or {}).get(key) or "") for key in keys) == expected
+            ]
+            if len(matches) != 1:
+                raise ValueError(f"目标案卷不存在或不唯一，请重新审核：{name}")
+            targets.extend(matches)
+        attached += archive_reviewed_image(
+            data, source, name, str(decision["role"]), targets, root
+        )
+
+    if attached:
+        data["dataset_revision"] = int(data.get("dataset_revision") or 0) + 1
+        append_run(data, "apply-human-reviewed-intake", {"images_attached": attached})
+        repository.save(data)
+        export_summary_html(data, root)
+        review_repository = ApprovalReviewRepository(root)
+        review = build_approval_review(data, root, repo_root, existing=review_repository.load())
+        repository.save(data)
+        review_repository.save(review)
+        export_approval_review_html(review, root)
+    shutil.rmtree(batch_dir, ignore_errors=True)
+    return {"message": "人工确认完成，文件已归档。", "images_attached": attached}
 CF_HDROP = 15
 GMEM_MOVEABLE_ZEROINIT = 0x0042
 
@@ -576,6 +812,8 @@ def serve_approval_review(
         else Path(__file__).resolve().parents[3]
     )
     lock = threading.Lock()
+    intake_stage_root = Path(tempfile.mkdtemp(prefix="DocFlowRenamer-intake-review-"))
+    intake_sessions: dict[str, Path] = {}
 
     class ReviewHandler(BaseHTTPRequestHandler):
         server_version = "WarrantyApprovalReview/1.0"
@@ -680,11 +918,62 @@ def serve_approval_review(
                 "/api/process-input",
                 "/api/migration-plan",
                 "/api/migration-apply",
+                "/api/intake-stage-file",
+                "/api/intake-recognize",
+                "/api/intake-confirm",
+                "/api/intake-discard",
             }:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
+                if request_path == "/api/intake-stage-file":
+                    if length <= 0 or length > MAX_APPROVAL_PDF_BYTES:
+                        raise ValueError("文件大小无效（单个文件上限 50 MB）")
+                    query = parse_qs(parsed_request.query)
+                    batch_id = _safe_intake_batch_id((query.get("batch_id") or [""])[0])
+                    submitted_name = str((query.get("name") or [""])[0]).strip()
+                    safe_name = Path(submitted_name.replace("\\", "/")).name
+                    allowed = {".docx", ".pdf", ".jpg", ".jpeg", ".png"}
+                    if not safe_name or Path(safe_name).suffix.lower() not in allowed:
+                        raise ValueError("支持 Word、PDF、JPG、JPEG、PNG 文件")
+                    with lock:
+                        intake_stage_root.mkdir(parents=True, exist_ok=True)
+                        batch_dir = ensure_within(intake_stage_root / batch_id, intake_stage_root)
+                        batch_dir.mkdir(parents=True, exist_ok=True)
+                        target = ensure_within(batch_dir / safe_name, batch_dir)
+                        if target.exists():
+                            raise FileExistsError(f"本批次有重名文件：{safe_name}")
+                        target.write_bytes(self.rfile.read(length))
+                        intake_sessions[batch_id] = batch_dir
+                    self._send_json({"ok": True, "file_name": safe_name})
+                    return
+                if request_path in {"/api/intake-recognize", "/api/intake-confirm", "/api/intake-discard"}:
+                    if length <= 0 or length > MAX_REQUEST_BYTES:
+                        raise ValueError("输入审核请求大小无效")
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("输入审核请求格式错误")
+                    batch_id = _safe_intake_batch_id(payload.get("batch_id"))
+                    batch_dir = intake_sessions.get(batch_id)
+                    if batch_dir is None or not batch_dir.is_dir():
+                        raise ValueError("暂存文件已过期，请重新拖入文件")
+                    if request_path == "/api/intake-recognize":
+                        with lock:
+                            result = _recognize_intake_batch(root, repo_root, batch_dir)
+                        self._send_json({"ok": True, "batch_id": batch_id, **result})
+                        return
+                    if request_path == "/api/intake-discard":
+                        with lock:
+                            shutil.rmtree(batch_dir, ignore_errors=True)
+                            intake_sessions.pop(batch_id, None)
+                        self._send_json({"ok": True, "message": "暂存文件已清除"})
+                        return
+                    with lock:
+                        result = _apply_intake_review(root, repo_root, batch_dir, payload)
+                        intake_sessions.pop(batch_id, None)
+                    self._send_json({"ok": True, **result})
+                    return
                 if request_path == "/api/process-input":
                     with lock:
                         from .application_flow import run_archive
@@ -872,6 +1161,7 @@ def serve_approval_review(
         LOGGER.info("人工审核服务已停止")
     finally:
         server.server_close()
+        shutil.rmtree(intake_stage_root, ignore_errors=True)
 
 
 _HTML_TEMPLATE = r"""<!doctype html>

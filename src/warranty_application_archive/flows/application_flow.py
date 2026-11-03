@@ -155,7 +155,12 @@ def _log_workflow_summary(
         LOGGER.info("待人工审核页面: %s", review_html)
 
 
-def run_archive(input_dir: Path | None = None) -> int:
+def run_archive(
+    input_dir: Path | None = None,
+    *,
+    human_reviewed_intake: bool = False,
+    reviewed_input_roles: dict[str, str] | None = None,
+) -> int:
     repo_root, config, repository, review_repository = _open_runtime(
         input_dir
     )
@@ -177,6 +182,8 @@ def run_archive(input_dir: Path | None = None) -> int:
         repo_root,
         checkpoint=repository.save,
         input_batch_id=input_batch_id,
+        human_reviewed_intake=human_reviewed_intake,
+        reviewed_input_roles=reviewed_input_roles,
     )
     intake_stats: dict[str, int] = {}
     application_count = intake_applications(
