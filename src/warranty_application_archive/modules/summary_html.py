@@ -824,7 +824,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <main>
     <section class="workspace intake-panel" aria-label="文件输入">
       <div class="intake-heading"><div><h2>文件输入与识别</h2><p>选择或拖入申请材料、人员名单和审批 PDF。文件先进入本地 _input；识别归档后可在待审核页面复核。</p><a href="/待人工审核匹配PDF.html">打开待人工审核页面</a></div><div class="intake-actions"><label class="choose-files" for="intakeFiles">选择文件</label><input id="intakeFiles" type="file" multiple><button id="processFiles" type="button">识别并归档</button></div></div>
-      <div id="dropZone" class="drop-zone" tabindex="0">拖动文件到此处，或点击“选择文件”</div>
+      <div id="dropZone" class="drop-zone" tabindex="0">支持多文件：可一次拖入多个文件，也可分批拖入</div>
       <div id="intakeStatus" class="intake-status" role="status">仅本机页面可以提交文件。识别和归档由本地程序执行。</div>
     </section>
     <section class="metrics" aria-label="汇总指标">
@@ -1300,11 +1300,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
     const intakeFiles = byId("intakeFiles");
     const dropZone = byId("dropZone");
     const intakeStatus = byId("intakeStatus");
-    let selectedIntakeFiles = [];
+    const selectedIntakeFiles = new Map();
+    const intakeFileKey = (file) => `${file.name}\u0000${file.size}\u0000${file.lastModified}`;
     function selectIntakeFiles(files) {
-      selectedIntakeFiles = [...files];
-      intakeStatus.textContent = selectedIntakeFiles.length
-        ? `已选择 ${selectedIntakeFiles.length} 个文件：\n${selectedIntakeFiles.map((file) => file.name).join("\n")}`
+      for (const file of files) selectedIntakeFiles.set(intakeFileKey(file), file);
+      intakeStatus.textContent = selectedIntakeFiles.size
+        ? `已选择 ${selectedIntakeFiles.size} 个文件：\n${[...selectedIntakeFiles.values()].map((file) => file.name).join("\n")}`
         : "尚未选择文件。";
     }
     intakeFiles.addEventListener("change", () => selectIntakeFiles(intakeFiles.files));
@@ -1312,12 +1313,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
     for (const eventName of ["dragenter", "dragover"]) {
       dropZone.addEventListener(eventName, (event) => {
         event.preventDefault();
+        event.stopPropagation();
         dropZone.classList.add("dragging");
       });
     }
     for (const eventName of ["dragleave", "drop"]) {
       dropZone.addEventListener(eventName, (event) => {
         event.preventDefault();
+        event.stopPropagation();
         dropZone.classList.remove("dragging");
       });
     }
@@ -1330,24 +1333,49 @@ _HTML_TEMPLATE = r"""<!doctype html>
       const button = byId("processFiles");
       button.disabled = true;
       try {
-        if (selectedIntakeFiles.length) {
-          for (const file of selectedIntakeFiles) {
-            intakeStatus.textContent = `正在放入本地输入区：${file.name}`;
-            const response = await fetch(`/api/input-file?name=${encodeURIComponent(file.name)}`, {
-              method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: file,
-            });
-            const result = await response.json();
-            if (!response.ok || !result.ok) throw new Error(result.error || `${file.name} 上传失败`);
-          }
-          selectedIntakeFiles = [];
+        let uploadFailures = [];
+        if (selectedIntakeFiles.size) {
+          const batch = [...selectedIntakeFiles.entries()];
+          intakeStatus.textContent = `正在上传 ${batch.length} 个文件…`;
+          const results = new Array(batch.length);
+          let nextUpload = 0;
+          const uploadNext = async () => {
+            while (nextUpload < batch.length) {
+              const index = nextUpload++;
+              const [key, file] = batch[index];
+              try {
+                const response = await fetch(`/api/input-file?name=${encodeURIComponent(file.name)}`, {
+                  method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: file,
+                });
+                const result = await response.json();
+                if (!response.ok || !result.ok) throw new Error(result.error || `${file.name} 上传失败`);
+                selectedIntakeFiles.delete(key);
+                results[index] = {status: "fulfilled"};
+              } catch (reason) {
+                results[index] = {status: "rejected", reason};
+              }
+            }
+          };
+          await Promise.all(Array.from({length: Math.min(4, batch.length)}, uploadNext));
+          uploadFailures = results.flatMap((result, index) => result.status === "rejected"
+            ? [`${batch[index][1].name}: ${result.reason?.message || "上传失败"}`]
+            : []);
           intakeFiles.value = "";
+          if (selectedIntakeFiles.size) {
+            intakeStatus.textContent = `已上传 ${batch.length - uploadFailures.length} 个；失败 ${uploadFailures.length} 个，失败文件保留在队列中。\n${uploadFailures.join("\n")}`;
+          }
+          if (batch.length === uploadFailures.length) throw new Error(uploadFailures.join("\n"));
         }
         intakeStatus.textContent = "正在进行 AI 识别和归档，请稍候…";
         const response = await fetch("/api/process-input", {method: "POST"});
         const result = await response.json();
         if (!response.ok || !result.ok) throw new Error(result.error || "处理失败");
-        intakeStatus.textContent = `${result.message}\n页面即将刷新。请在待人工审核页面处理未自动匹配的审批 PDF。`;
-        window.setTimeout(() => location.reload(), 1200);
+        if (uploadFailures.length) {
+          intakeStatus.textContent = `${result.message}\n以下文件上传失败，仍保留在队列中；请处理后重试。\n${uploadFailures.join("\n")}\n请刷新页面查看归档结果。`;
+        } else {
+          intakeStatus.textContent = `${result.message}\n页面即将刷新。请在待人工审核页面处理未自动匹配的审批 PDF。`;
+          window.setTimeout(() => location.reload(), 1200);
+        }
       } catch (error) {
         intakeStatus.textContent = error.message || "提交失败，请查看程序日志。";
       } finally {
