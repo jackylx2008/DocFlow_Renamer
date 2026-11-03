@@ -1,6 +1,6 @@
-"""质保作业申请增量归档入口。
+"""质保作业申请本地 HTML 工作台启动入口。
 
-Python 源码默认运行命令行归档；--gui 或打包后的 EXE 显示图形控制窗口。
+默认启动本机 HTML 服务。归档、迁移与审核操作由页面发起；--gui 可打开兼容的桌面控制窗口。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from tkinter import Button, Frame, Label, StringVar, Tk, messagebox
 from urllib.parse import quote
 from urllib.request import urlopen
 
-from logging_config import setup_logger
+from warranty_application_archive.logging_config import setup_logger
 
 
 if not getattr(sys, "frozen", False):
@@ -31,6 +31,7 @@ from warranty_application_archive.config_loader import (  # noqa: E402
 
 from warranty_application_archive.flows.application_flow import (  # noqa: E402
     run_archive,
+    serve_archive_pages,
 )
 from warranty_application_archive.flows.approval_review_web_flow import (  # noqa: E402
     serve_approval_review,
@@ -223,6 +224,8 @@ def run_gui(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", type=Path, help="临时指定资料根目录")
+    parser.add_argument("--page", choices=("review", "summary"), help="启动本地 HTML 页面")
+    parser.add_argument("--port", type=int, default=8765, help="本地服务端口；0 表示自动选择")
     parser.add_argument("--gui", action="store_true", help="启动图形归档窗口")
     parser.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
     parser.add_argument("--skip-archive", action="store_true", help="只打开现有页面")
@@ -234,6 +237,13 @@ def main() -> int:
         help="执行归档和页面自检后退出",
     )
     args = parser.parse_args()
+    if args.page:
+        return serve_archive_pages(
+            input_dir=args.input_dir,
+            page=args.page,
+            port=args.port,
+            open_browser=not args.no_open,
+        )
     if not getattr(sys, "frozen", False) and not any(
         (
             args.gui,
@@ -244,7 +254,12 @@ def main() -> int:
             args.self_test_archive,
         )
     ):
-        return run_archive(args.input_dir)
+        return serve_archive_pages(
+            input_dir=args.input_dir,
+            page="summary",
+            port=0,
+            open_browser=not args.no_open,
+        )
     os.chdir(PROJECT_ROOT)
     try:
         config = AppConfig.resolve(PROJECT_ROOT, args.input_dir)

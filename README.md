@@ -4,8 +4,8 @@
 
 最近更新见 [更新记录](docs/CHANGELOG.md)。Windows 可直接运行
 `build/delivery/质保作业申请归档.exe`；源码运行
-`python serve_archive_review.py --page summary` 启动本地 HTML 工作台，或运行
-`python run_archive.py --gui` 启动图形控制窗口。
+`python main.py --page summary` 启动本地 HTML 工作台，或运行
+`python main.py --gui` 启动图形控制窗口。
 
 ## 核心原则
 
@@ -52,7 +52,7 @@
 
 ## 本地 HTML 工作流
 
-1. 启动 `python serve_archive_review.py --page summary`，浏览器打开本机工作台。
+1. 启动 `python main.py --page summary`，浏览器打开本机工作台。
 2. 在“文件输入与识别”区域选择或拖入文件，再点击“识别并归档”。服务只监听本机回环地址；单文件上限为 50 MB，同名文件不会覆盖。
 3. 程序使用现有 AI/OCR 识别和归档规则处理 `_input` 中的文件。自动唯一匹配的材料进入案卷；无法确定的审批 PDF 留在待审核队列。
 4. 打开“待人工审核匹配PDF”页面，检查候选、修正决定并保存。审核结果写入正式 JSON 并刷新汇总页面。
@@ -160,42 +160,30 @@ INPUT_PATH=${CLOUDSTATION_ROOT}/sample/project/input
 也可以使用 `--input-dir` 指定：
 
 ```powershell
-python run_archive.py --input-dir "sample/project/input"
+python main.py --input-dir "sample/project/input"
 ```
 
 ## 旧目录迁移
 
-旧版平铺目录必须先演练。演练只生成计划，不移动资料：
-
-```powershell
-python migrate_archive.py
-```
-
-确认计划后，执行迁移时必须提供内容一致的备份目录：
-
-```powershell
-python migrate_archive.py `
-  --apply `
-  --backup-dir "sample/project/input_backup"
-```
-
-执行前会逐文件比较正式目录与备份的大小和 SHA-256。任何差异都会阻止迁移。迁移时还会在每次移动前后再次校验哈希。
+旧版平铺目录迁移从 HTML 工作台启动。若尚无正式 JSON，运行 `python main.py` 会打开迁移页面。先查看迁移计划，再填写备份目录并确认执行；正式迁移前会逐文件比较资料目录与备份的大小和 SHA-256。任何差异都会阻止迁移，执行时还会在每次移动前后再次校验哈希。
 
 旧版 Excel 只在首次迁移时读取已有 PDF 对应关系，随后归档到 `.docflow/legacy`。迁移完成后 Excel 不再作为缓存或数据输入。
 
 ## 日常命令
 
-执行完整增量流程：
+启动本机 HTML 工作台：
 
 ```powershell
-python run_archive.py
+python main.py
 ```
 
-Windows 图形模式使用同一个 `run_archive.py` 入口。启动后先执行增量归档，再显示本地服务控制
+工作台从页面选择或拖入文件，再点击“识别并归档”。没有正式 JSON 时，页面提供旧目录迁移计划与执行表单。
+
+Windows 图形模式使用同一个 `main.py` 入口。启动后先执行增量归档，再显示本地服务控制
 窗口，可打开汇总页、人工审核页，或点击“更新归档”再次处理 `_input`：
 
 ```powershell
-python run_archive.py --gui
+python main.py --gui
 ```
 
 项目图标位于 `assets/docflow_archive.png`，Windows 图标位于
@@ -215,18 +203,16 @@ python -m pip install -r requirements-build.txt
 `.jpg`、`.jpeg`、`.png` 和 `.pdf`。PDF 分类结果保存在正式 JSON 的
 `input_routes` 中，识别文本按 SHA-256 缓存。
 
-申请材料、施工人员名单、审批 PDF、人工审核数据和汇总 HTML 均由这个入口
-按顺序处理。各支流程属于内部业务编排，统一位于
+申请材料、施工人员名单、审批 PDF、人工审核数据和汇总 HTML 的操作入口均位于
+本地 HTML 工作台。各支流程属于内部业务编排，统一位于
 `src/warranty_application_archive/flows/`，不再为每个内部步骤在项目根目录
 增加启动脚本。所有处理均写入正式 JSON 的 `changes` 和 `runs`，终端同时
 显示带时间戳的中文处理日志。
 
 ## 日志输出
 
-所有入口统一使用项目根目录的 `logging_config.py`，同时输出控制台日志和
-滚动文件日志。日志目录由 `config.yaml` 的 `app.log_dir` 配置，文件名根据
-实际入口生成，例如 `run_archive.log`、`migrate_archive.log` 和
-`serve_archive_review.log`。单个日志文件最大 10 MB，保留 5 份备份。
+归档流程使用统一的 `src/warranty_application_archive/logging_config.py`，同时输出控制台日志和
+滚动文件日志。日志目录由 `config.yaml` 的 `app.log_dir` 配置；单个日志文件最大 10 MB，保留 5 份备份。
 
 `setup_logger()` 的文件参数为 `log_file`，调用方应传入包含文件名的完整路径；
 业务代码不再传递旧版的 `log_dir` 或 `entry_name` 参数，也不在业务模块中
@@ -244,11 +230,11 @@ HTML 页面；“保存并执行审核结果”固定更新同目录的
 也可以从命令行启动：
 
 ```powershell
-python serve_archive_review.py
+python main.py
 ```
 
 正常使用网页时不需要第二个根目录命令；审核结果保存、正式 JSON 回写和页面
-刷新由 `serve_archive_review.py` 对应的服务流程完成。如果正式 JSON 在审核
+刷新由 `main.py` 对应的服务流程完成。如果正式 JSON 在审核
 页面生成后发生过版本变化，页面会拒绝过期结果，须先重新执行完整归档流程。
 
 ## HTML 人工审查视图
@@ -345,25 +331,16 @@ macOS 启动器不会保存 Windows 绝对路径。资料目录自动取 `.comma
 - PDF 没有足够的内嵌文字时，程序调用本地 AI OCR，并在审核产物中
   记录识别方式；已有 SHA-256 识别缓存会直接复用。
 
-## 独立入口
+## 项目入口
 
-项目根目录按工作流提供独立 Python 入口：
-
-```powershell
-python run_archive.py
-python migrate_archive.py
-python serve_archive_review.py
-```
-
-根目录只保留以上三个实际操作入口。每个入口文件头部均说明用途、配置、
-参数和输出；公共能力位于 `modules/`，所有业务步骤和完整流程编排均位于
-`flows/`。不再保留统一子命令兼容入口，也不为内部支流程创建根目录脚本。
-
-最常用的完整增量处理命令是：
+项目根目录只保留一个 Python 启动入口：
 
 ```powershell
-python run_archive.py
+python main.py
 ```
+
+启动后在 HTML 页面完成文件输入、识别归档、旧目录迁移和人工审核；`main.py`
+负责启动本机服务。业务逻辑保留在 `src/warranty_application_archive/flows/`。
 
 处理完成后的主要成果包括：
 
@@ -376,12 +353,10 @@ python run_archive.py
 ## 项目结构
 
 ```text
-run_archive.py                     # 完整增量归档入口；--gui 打开图形窗口
-build/build_run_archive_exe.ps1    # Windows EXE 构建脚本
-assets/                            # PNG 与 ICO 项目图标
-migrate_archive.py                 # 旧目录迁移入口
-serve_archive_review.py            # 本地审核/汇总页面服务
-logging_config.py                  # 统一控制台与滚动文件日志
+main.py                                  # 唯一 Python 启动入口
+build/build_run_archive_exe.ps1          # Windows EXE 构建脚本
+assets/                                  # PNG 与 ICO 项目图标
+src/warranty_application_archive/logging_config.py                  # 统一控制台与滚动文件日志
 config.yaml                        # app 与 flows 分层配置
 common.env.example                 # 脱敏的本机配置模板
 docs/                              # 架构、部署和开发文档
@@ -405,7 +380,7 @@ src/warranty_application_archive/
 ## 开发验证
 
 ```powershell
-python -m compileall -q src tests logging_config.py run_archive.py migrate_archive.py serve_archive_review.py
+python -m compileall -q src tests main.py
 python -m pytest -q
-python -m flake8 logging_config.py run_archive.py migrate_archive.py serve_archive_review.py src tests
+python -m flake8 src tests main.py
 ```

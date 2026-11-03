@@ -8,12 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_root_python_files_are_only_operator_interfaces() -> None:
     root_python_files = {path.name for path in ROOT.glob("*.py")}
-    assert root_python_files == {
-        "logging_config.py",
-        "migrate_archive.py",
-        "run_archive.py",
-        "serve_archive_review.py",
-    }
+    assert root_python_files == {"main.py"}
 
 
 def test_business_flows_live_under_package_flows() -> None:

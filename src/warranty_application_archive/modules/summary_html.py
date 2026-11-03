@@ -477,7 +477,7 @@ def export_summary_html(data: dict[str, Any], root: Path) -> Path:
     if not getattr(sys, "frozen", False):
         entry_point = (
             Path(__file__).resolve().parents[3]
-            / "serve_archive_review.py"
+            / "main.py"
         )
         write_page_launchers(
             root,
@@ -1324,7 +1324,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     dropZone.addEventListener("drop", (event) => selectIntakeFiles(event.dataTransfer.files));
     byId("processFiles").addEventListener("click", async () => {
       if (location.protocol === "file:") {
-        intakeStatus.textContent = "请使用启动器或 serve_archive_review.py 打开页面后再提交文件。";
+        intakeStatus.textContent = "请使用本项目 main.py 启动本地 HTML 工作台后再提交文件。";
         return;
       }
       const button = byId("processFiles");

@@ -32,7 +32,7 @@ New-Item -ItemType Directory -Path $distDir -Force | Out-Null
     --distpath $distDir `
     --workpath (Join-Path $projectRoot "build\run_archive") `
     --specpath (Join-Path $projectRoot "build") `
-    (Join-Path $projectRoot "run_archive.py")
+    (Join-Path $projectRoot "main.py")
 if ($LASTEXITCODE -ne 0) {
     throw "EXE 构建失败，退出代码: $LASTEXITCODE"
 }

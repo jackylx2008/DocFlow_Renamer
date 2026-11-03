@@ -2009,7 +2009,7 @@ class MigrationTest(unittest.TestCase):
             launcher = primary / APPROVAL_REVIEW_LAUNCHER_FILE_NAME
             self.assertTrue(launcher.is_file())
             self.assertIn(
-                "serve_archive_review.py",
+                "main.py",
                 launcher.read_text(encoding="utf-8"),
             )
             self.assertIn(

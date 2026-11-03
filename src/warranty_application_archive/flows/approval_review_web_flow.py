@@ -43,11 +43,13 @@ from ..modules.launchers import write_page_launchers
 from ..modules.repository import JsonRepository
 from ..modules.summary_html import export_summary_html
 from .archive_flow import append_run, archive_reviewed_approval_pdf
+from .migration_flow import apply_migration_plan, build_migration_plan, verify_backup
 
 
 LOGGER = logging.getLogger(__name__)
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_APPROVAL_PDF_BYTES = 50 * 1024 * 1024
+_MIGRATION_SETUP_HTML = r'''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>初始化归档资料</title><style>body{margin:0;background:#edf2f7;color:#182536;font:16px "Microsoft YaHei UI",sans-serif}main{max-width:900px;margin:7vh auto;padding:28px;background:white;border:1px solid #afbdcc;border-radius:12px}h1{margin-top:0;color:#354357}p{color:#627287;line-height:1.7}button,input{font:inherit;padding:10px 13px;border:1px solid #9aabbe;border-radius:7px}button{background:#44546a;color:white;cursor:pointer}input{width:min(100%,600px)}pre{white-space:pre-wrap;color:#354357;background:#f5f8fb;padding:14px;border-radius:8px}</style><main><h1>旧目录迁移</h1><p>先生成并检查迁移计划。执行前需准备与当前资料目录内容一致的备份，并填写备份目录路径。程序会核验文件大小和 SHA-256 后才开始迁移。</p><button id="preview">生成迁移计划</button><pre id="result">尚未生成计划。</pre><label>备份目录路径<br><input id="backup" placeholder="例如 D:\\ArchiveBackup"></label><p><button id="apply" disabled>校验备份并执行迁移</button></p><script>let ready=false;const out=document.querySelector("#result");document.querySelector("#preview").onclick=async()=>{out.textContent="正在解析旧目录…";try{let r=await fetch("/api/migration-plan",{method:"POST"}),d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||"生成计划失败");ready=true;document.querySelector("#apply").disabled=false;out.textContent=`案卷：${d.applications}\n待匹配文件：${d.unmatched_files}\n文件操作：${d.operations}\n警告：\n${d.warnings.join("\n")||"无"}`}catch(e){out.textContent=e.message}};document.querySelector("#apply").onclick=async()=>{if(!ready)return;let backup_dir=document.querySelector("#backup").value.trim();if(!backup_dir||!confirm("确认使用该备份执行迁移？文件将按计划移动。"))return;out.textContent="正在校验备份并迁移…";try{let r=await fetch("/api/migration-apply",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({backup_dir})}),d=await r.json();if(!r.ok||!d.ok)throw Error(d.error||"迁移失败");out.textContent="迁移完成，正在打开汇总页面…";location.href="/质保作业申请汇总.html"}catch(e){out.textContent=e.message}};</script></main></html>'''
 CF_HDROP = 15
 GMEM_MOVEABLE_ZEROINIT = 0x0042
 
@@ -263,7 +265,7 @@ def export_approval_review_html(
     if not getattr(sys, "frozen", False):
         entry_point = (
             Path(__file__).resolve().parents[3]
-            / "serve_archive_review.py"
+            / "main.py"
         )
         write_page_launchers(
             root,
@@ -612,6 +614,15 @@ def serve_approval_review(
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
+            if parsed.path == "/" and initial_page == "setup":
+                body = _MIGRATION_SETUP_HTML.encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if parsed.path in {"/", f"/{APPROVAL_REVIEW_HTML_FILE_NAME}"}:
                 default_name = (
                     SUMMARY_HTML_FILE_NAME
@@ -667,6 +678,8 @@ def serve_approval_review(
                 "/api/summary-approval-pdf",
                 "/api/input-file",
                 "/api/process-input",
+                "/api/migration-plan",
+                "/api/migration-apply",
             }:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -678,6 +691,34 @@ def serve_approval_review(
 
                         run_archive(root)
                     self._send_json({"ok": True, "message": "AI 识别和归档完成。"})
+                    return
+                if request_path == "/api/migration-plan":
+                    with lock:
+                        plan = build_migration_plan(root)
+                    self._send_json({
+                        "ok": True,
+                        "applications": len(plan.applications),
+                        "unmatched_files": len(plan.unmatched_files),
+                        "operations": len(plan.operations),
+                        "warnings": plan.warnings,
+                    })
+                    return
+                if request_path == "/api/migration-apply":
+                    if length <= 0 or length > MAX_REQUEST_BYTES:
+                        raise ValueError("迁移请求大小无效")
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("迁移请求格式错误")
+                    backup_value = str(payload.get("backup_dir") or "").strip()
+                    if not backup_value:
+                        raise ValueError("请填写备份目录路径")
+                    with lock:
+                        plan = build_migration_plan(root)
+                        verify_backup(root, Path(backup_value))
+                        dataset = apply_migration_plan(plan)
+                        JsonRepository(root).save(dataset)
+                        export_summary_html(dataset, root)
+                    self._send_json({"ok": True, "message": "旧目录迁移完成"})
                     return
                 if request_path == "/api/input-file":
                     if length <= 0 or length > MAX_APPROVAL_PDF_BYTES:

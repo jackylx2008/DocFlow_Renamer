@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from logging_config import setup_logger
+from .logging_config import setup_logger
 
 from .config_loader import AppConfig
 

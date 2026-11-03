@@ -31,12 +31,12 @@
 
 ## 项目结构
 
-项目采用 `src` 布局承载包代码，入口脚本放在项目根目录。推荐结构如下：
+项目采用 `src` 布局承载包代码，根目录仅保留统一启动脚本；对外业务操作优先由本地 HTML 工作台承接。推荐结构如下：
 
-- `logging_config.py`
+- `main.py`
 - `config.yaml`
 - `common.env.example`
-- `example.py`
+- `src/<project_prefix>/logging_config.py`
 - `src/<project_prefix>/modules/`
 - `src/<project_prefix>/flows/`
 - `docs/`
@@ -46,7 +46,7 @@
 建议保留的基础模块类型包括：
 
 - `logging_config.py`
-  - 必须存在于项目根目录
+  - 放在 `src/<project_prefix>/` 包目录内
   - 提供统一日志初始化和 logger 获取能力
 - `config_loader.py`
   - 位于 `src/<project_prefix>/`
@@ -290,8 +290,8 @@ local_excel:
 
 ## 日志约定
 
-项目必须在项目根目录下提供 `logging_config.py`，并统一通过该文件初始化日志。
-`logging_config.py` 不放入包目录、`src/` 目录或入口脚本旁的子目录，避免不同入口脚本各自维护日志配置。
+项目必须提供统一的 `logging_config.py`，并由统一启动入口或应用编排层调用。
+采用 `src` 布局时，将它放在项目包内，避免在根目录增加额外 Python 模块。
 
 当前公开接口可包括：
 
@@ -317,7 +317,7 @@ local_excel:
 推荐模式：
 
 ```python
-from logging_config import get_logger, setup_logger
+from <project_prefix>.logging_config import get_logger, setup_logger
 
 setup_logger(log_level="INFO")
 logger = get_logger(__name__)

@@ -6,7 +6,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from logging_config import setup_logger
+from ..logging_config import setup_logger
 
 from ..config_loader import AppConfig, runtime_project_root
 from ..modules.repository import JsonRepository
@@ -162,7 +162,7 @@ def run_archive(input_dir: Path | None = None) -> int:
     data = repository.load()
     if not repository.path.is_file():
         raise FileNotFoundError(
-            "尚未建立 JSON 数据，请先执行 migrate_archive.py 并确认迁移计划"
+            "尚未建立 JSON 数据，请先在本地 HTML 工作台完成旧目录迁移"
         )
 
     duplicate_application_count = deduplicate_applications(
@@ -305,10 +305,19 @@ def serve_archive_pages(
     open_browser: bool = True,
 ) -> int:
     _, config, repository, review_repository = _open_runtime(input_dir)
+    if page == "summary" and not repository.path.is_file():
+        serve_approval_review(
+            config.data_root,
+            host=host,
+            port=port,
+            open_browser=open_browser,
+            initial_page="setup",
+        )
+        return 0
     if page == "review":
         if not review_repository.path.is_file():
             raise FileNotFoundError(
-                "尚未生成审核 JSON，请先运行 run_archive.py"
+                "尚未生成审核 JSON，请先在本地 HTML 工作台运行归档"
             )
         export_approval_review_html(
             review_repository.load(),

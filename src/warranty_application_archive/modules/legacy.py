@@ -2039,7 +2039,7 @@ def resolve_log_dir(repo_root: Path) -> Path:
 
 
 def setup_logging(repo_root: Path, script_name: str | None = None) -> Path:
-    from logging_config import setup_logger
+    from ..logging_config import setup_logger
 
     from ..config_loader import AppConfig
 

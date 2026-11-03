@@ -36,6 +36,11 @@ and review artifacts. The standalone apply command remains as a compatibility
 path for decisions saved by older review pages. Human delete decisions are
 recoverable moves to `_trash`, not filesystem deletion.
 
+When the formal JSON does not exist, the root `main.py` opens a migration setup
+page instead of requiring a separate migration script. The page previews the
+plan, requires a backup path, verifies the backup against the source, and then
+applies the migration.
+
 The summary page presents archive counts, case status, approval progress,
 material completeness, file evidence, search and filters. It is regenerated
 from the formal JSON after archive or review writes. The browser is a local
@@ -79,9 +84,10 @@ moved to quarantine rather than deleted.
   recognition, rendering, validation, and filesystem adapters.
 - `src/warranty_application_archive/flows/`: archive intake, migration,
   approval review, and local review-page orchestration.
-- root `run_archive.py`, `migrate_archive.py`, and
-  `serve_archive_review.py`: the only operator-facing Python entries.
-- `logging_config.py`: the only logging-handler configuration point; rolling
+- root `main.py`: the only Python startup entry; operational actions are
+  available through the local HTML workbench.
+- `src/warranty_application_archive/logging_config.py`: the only
+  logging-handler configuration point; rolling
   log files are written to `logs/`.
 - `config_loader.py` and `context.py`: centralized configuration, path
   expansion, and shared entry/flow context.
