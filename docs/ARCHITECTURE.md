@@ -3,7 +3,12 @@
 ## Boundaries
 
 The application uses independent root entry scripts, a `flows/` orchestration
-layer, and reusable capabilities under `modules/`. The main business flows are:
+layer, and reusable capabilities under `modules/`. The local HTML workbench is
+the primary intake and review surface. Its warm white, blue-gray card and table
+styling follows this project's existing summary page; the B24DesignArchiver
+reference informs dashboard interactions and information hierarchy.
+
+The main business flows are:
 
 1. Application-material intake.
 2. Worker-list intake.
@@ -13,7 +18,11 @@ All subworkflows operate on the same JSON repository and recognition cache.
 The summary HTML is an output adapter and is never read as business data.
 Legacy Excel is read only during the one-time migration.
 
-`_input` is the only user-facing drop zone. The input router moves Word and
+`_input` is the only user-facing drop zone. The summary page accepts selected or
+dragged Word, PDF, and common image files through a loopback-only HTTP endpoint;
+the service writes each file without overwriting an existing name. The
+"recognize and archive" action runs the existing archive orchestration. The
+input router moves Word and
 image files to the application-material workflow. It recognizes each PDF once,
 routes approval forms to approved-PDF intake, and marks other PDFs as
 application material so they cannot be consumed by the approval workflow.
@@ -26,6 +35,11 @@ decision, and then refreshes the authoritative dataset, formal summary HTML,
 and review artifacts. The standalone apply command remains as a compatibility
 path for decisions saved by older review pages. Human delete decisions are
 recoverable moves to `_trash`, not filesystem deletion.
+
+The summary page presents archive counts, case status, approval progress,
+material completeness, file evidence, search and filters. It is regenerated
+from the formal JSON after archive or review writes. The browser is a local
+operator interface and does not become a second source of record data.
 
 ## Data authority
 

@@ -665,11 +665,41 @@ def serve_approval_review(
                 "/api/open-path",
                 "/api/summary-action",
                 "/api/summary-approval-pdf",
+                "/api/input-file",
+                "/api/process-input",
             }:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
+                if request_path == "/api/process-input":
+                    with lock:
+                        from .application_flow import run_archive
+
+                        run_archive(root)
+                    self._send_json({"ok": True, "message": "AI 识别和归档完成。"})
+                    return
+                if request_path == "/api/input-file":
+                    if length <= 0 or length > MAX_APPROVAL_PDF_BYTES:
+                        raise ValueError("文件大小无效（单个文件上限 50 MB）")
+                    query = parse_qs(parsed_request.query)
+                    submitted_name = str((query.get("name") or [""])[0]).strip()
+                    safe_name = Path(submitted_name.replace("\\", "/")).name
+                    if not safe_name or safe_name in {".", ".."} or "\x00" in safe_name:
+                        raise ValueError("文件名无效")
+                    allowed_suffixes = {".docx", ".doc", ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+                    if Path(safe_name).suffix.lower() not in allowed_suffixes:
+                        raise ValueError("仅支持 Word、PDF 和常见图片文件")
+                    input_dir = root / "_input"
+                    input_dir.mkdir(parents=True, exist_ok=True)
+                    target = ensure_within(input_dir / safe_name, input_dir)
+                    if target.exists():
+                        raise FileExistsError(f"_input 中已存在同名文件：{safe_name}")
+                    content = self.rfile.read(length)
+                    with target.open("xb") as output:
+                        output.write(content)
+                    self._send_json({"ok": True, "file_name": safe_name})
+                    return
                 request_limit = (
                     MAX_APPROVAL_PDF_BYTES
                     if request_path == "/api/summary-approval-pdf"

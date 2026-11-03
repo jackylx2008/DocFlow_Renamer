@@ -571,6 +571,18 @@ _HTML_TEMPLATE = r"""<!doctype html>
       background: var(--paper);
       box-shadow: var(--shadow);
     }
+    .intake-panel { margin-bottom:16px; padding:16px; }
+    .intake-heading { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    .intake-heading h2 { margin:0 0 5px; font-size:18px; }
+    .intake-heading p { margin:0; color:var(--muted); font-size:13px; }
+    .intake-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+    .choose-files, #processFiles { border:1px solid var(--navy); border-radius:7px; padding:9px 13px; color:white; background:var(--navy); cursor:pointer; font-weight:700; }
+    .choose-files { color:var(--navy); background:white; }
+    #intakeFiles { display:none; }
+    #processFiles:disabled { opacity:.6; cursor:wait; }
+    .drop-zone { margin-top:13px; border:1px dashed #91a3b8; border-radius:8px; padding:17px; color:var(--muted); text-align:center; background:#f7f9fc; }
+    .drop-zone.dragging { border-color:var(--blue); color:var(--info); background:var(--info-bg); }
+    .intake-status { margin-top:8px; color:var(--muted); font-size:13px; white-space:pre-line; }
     .toolbar {
       display: flex;
       gap: 12px;
@@ -786,6 +798,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
       .metric:nth-child(2) { border-right: 0; }
       .metric:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
       .toolbar { align-items: stretch; flex-direction: column; }
+      .intake-heading { align-items:stretch; flex-direction:column; }
+      .intake-actions { flex-wrap:wrap; }
       .search { width: 100%; }
       .table-wrap { max-height: none; }
       table { font-size: 10px; }
@@ -808,6 +822,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <p id="subtitle"></p>
   </header>
   <main>
+    <section class="workspace intake-panel" aria-label="文件输入">
+      <div class="intake-heading"><div><h2>文件输入与识别</h2><p>选择或拖入申请材料、人员名单和审批 PDF。文件先进入本地 _input；识别归档后可在待审核页面复核。</p><a href="/待人工审核匹配PDF.html">打开待人工审核页面</a></div><div class="intake-actions"><label class="choose-files" for="intakeFiles">选择文件</label><input id="intakeFiles" type="file" multiple><button id="processFiles" type="button">识别并归档</button></div></div>
+      <div id="dropZone" class="drop-zone" tabindex="0">拖动文件到此处，或点击“选择文件”</div>
+      <div id="intakeStatus" class="intake-status" role="status">仅本机页面可以提交文件。识别和归档由本地程序执行。</div>
+    </section>
     <section class="metrics" aria-label="汇总指标">
       <div class="metric"><strong id="totalMetric">0</strong><span>案卷总数</span></div>
       <div class="metric"><strong id="approvedMetric">0</strong><span>审批完成</span></div>
@@ -1276,6 +1295,63 @@ _HTML_TEMPLATE = r"""<!doctype html>
         showCopyMessage(`已复制文件：${result.file_name}`);
       } catch (error) {
         showCopyMessage(error.message || "复制失败，请查看程序日志", true);
+      }
+    });
+    const intakeFiles = byId("intakeFiles");
+    const dropZone = byId("dropZone");
+    const intakeStatus = byId("intakeStatus");
+    let selectedIntakeFiles = [];
+    function selectIntakeFiles(files) {
+      selectedIntakeFiles = [...files];
+      intakeStatus.textContent = selectedIntakeFiles.length
+        ? `已选择 ${selectedIntakeFiles.length} 个文件：\n${selectedIntakeFiles.map((file) => file.name).join("\n")}`
+        : "尚未选择文件。";
+    }
+    intakeFiles.addEventListener("change", () => selectIntakeFiles(intakeFiles.files));
+    dropZone.addEventListener("click", () => intakeFiles.click());
+    for (const eventName of ["dragenter", "dragover"]) {
+      dropZone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropZone.classList.add("dragging");
+      });
+    }
+    for (const eventName of ["dragleave", "drop"]) {
+      dropZone.addEventListener(eventName, (event) => {
+        event.preventDefault();
+        dropZone.classList.remove("dragging");
+      });
+    }
+    dropZone.addEventListener("drop", (event) => selectIntakeFiles(event.dataTransfer.files));
+    byId("processFiles").addEventListener("click", async () => {
+      if (location.protocol === "file:") {
+        intakeStatus.textContent = "请使用启动器或 serve_archive_review.py 打开页面后再提交文件。";
+        return;
+      }
+      const button = byId("processFiles");
+      button.disabled = true;
+      try {
+        if (selectedIntakeFiles.length) {
+          for (const file of selectedIntakeFiles) {
+            intakeStatus.textContent = `正在放入本地输入区：${file.name}`;
+            const response = await fetch(`/api/input-file?name=${encodeURIComponent(file.name)}`, {
+              method: "POST", headers: {"Content-Type": "application/octet-stream"}, body: file,
+            });
+            const result = await response.json();
+            if (!response.ok || !result.ok) throw new Error(result.error || `${file.name} 上传失败`);
+          }
+          selectedIntakeFiles = [];
+          intakeFiles.value = "";
+        }
+        intakeStatus.textContent = "正在进行 AI 识别和归档，请稍候…";
+        const response = await fetch("/api/process-input", {method: "POST"});
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || "处理失败");
+        intakeStatus.textContent = `${result.message}\n页面即将刷新。请在待人工审核页面处理未自动匹配的审批 PDF。`;
+        window.setTimeout(() => location.reload(), 1200);
+      } catch (error) {
+        intakeStatus.textContent = error.message || "提交失败，请查看程序日志。";
+      } finally {
+        button.disabled = false;
       }
     });
     byId("totalMetric").textContent = data.metrics.total;
