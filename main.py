@@ -18,12 +18,10 @@ from tkinter import Button, Frame, Label, StringVar, Tk, messagebox
 from urllib.parse import quote
 from urllib.request import urlopen
 
-from warranty_application_archive.logging_config import setup_logger
-
-
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from warranty_application_archive.logging_config import setup_logger  # noqa: E402
 from warranty_application_archive.config_loader import (  # noqa: E402
     AppConfig,
     runtime_project_root,
