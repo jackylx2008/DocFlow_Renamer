@@ -6,6 +6,7 @@
 - 将日志配置移入 `src/warranty_application_archive/`，服务启动器和生成的 Windows/macOS 页面启动脚本统一调用 `main.py`。
 - 没有正式 JSON 时，`python main.py` 打开旧目录迁移页面；用户可以先预览迁移计划，再填写备份路径并确认执行。
 - 更新项目布局、构建入口和 README。
+- Windows 启动 HTML 时使用独立 Chrome 窗口，并将本次页面窗口移动到主显示器工作区后最大化；未安装 Chrome 时回退到默认浏览器。
 
 ## 2026-11-03
 

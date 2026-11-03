@@ -11,7 +11,6 @@ import sys
 import threading
 import time
 import uuid
-import webbrowser
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +38,7 @@ from ..modules.constants import (
     TRASH_DIR_NAME,
 )
 from ..modules.file_utils import atomic_replace_text, ensure_within
+from ..modules.browser_window import open_page_on_primary_monitor
 from ..modules.launchers import write_page_launchers
 from ..modules.repository import JsonRepository
 from ..modules.summary_html import export_summary_html
@@ -857,7 +857,15 @@ def serve_approval_review(
     if initial_page == "review":
         LOGGER.info("审核结果将保存到: %s", review_repository.path)
     if open_browser:
-        webbrowser.open(url)
+        open_page_on_primary_monitor(
+            url,
+            title_markers=(
+                "质保作业申请汇总",
+                "待人工审核匹配 PDF",
+                "初始化归档资料",
+            ),
+            logger=LOGGER,
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

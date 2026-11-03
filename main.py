@@ -11,7 +11,6 @@ import os
 import queue
 import sys
 import threading
-import webbrowser
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tkinter import Button, Frame, Label, StringVar, Tk, messagebox
@@ -36,6 +35,9 @@ from warranty_application_archive.flows.approval_review_web_flow import (  # noq
 )
 from warranty_application_archive.modules.constants import (  # noqa: E402
     APPROVAL_REVIEW_HTML_FILE_NAME,
+)
+from warranty_application_archive.modules.browser_window import (  # noqa: E402
+    open_page_on_primary_monitor,
 )
 
 
@@ -89,11 +91,15 @@ def run_gui(
 
     def open_summary() -> None:
         if url:
-            webbrowser.open(url)
+            open_page_on_primary_monitor(url, logger=LOGGER)
 
     def open_review() -> None:
         if url:
-            webbrowser.open(url + quote(APPROVAL_REVIEW_HTML_FILE_NAME))
+            open_page_on_primary_monitor(
+                url + quote(APPROVAL_REVIEW_HTML_FILE_NAME),
+                title_markers=("待人工审核匹配 PDF",),
+                logger=LOGGER,
+            )
 
     def server_ready(value: ThreadingHTTPServer, address_url: str) -> None:
         events.put(("server_ready", (value, address_url)))

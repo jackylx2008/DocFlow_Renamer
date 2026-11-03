@@ -340,7 +340,7 @@ python main.py
 ```
 
 启动后在 HTML 页面完成文件输入、识别归档、旧目录迁移和人工审核；`main.py`
-负责启动本机服务。业务逻辑保留在 `src/warranty_application_archive/flows/`。
+负责启动本机服务。Windows 上会在 Chrome 新窗口打开页面，并移动到主显示器后最大化；未安装 Chrome 时使用默认浏览器。业务逻辑保留在 `src/warranty_application_archive/flows/`。
 
 处理完成后的主要成果包括：
 
